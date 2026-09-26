@@ -5,33 +5,74 @@ const WebSocket = require("ws");
 const app = express();
 const server = http.createServer(app);
 
-const PORT = process.env.PORT || 10000;
-
 const wss = new WebSocket.Server({
     server,
     path: "/ws"
 });
 
-app.get("/", (req, res) => {
-    res.send("Car relay online");
+const rooms = new Map();
+
+app.get("/", (_, res) => {
+    res.send("Relay online");
 });
 
 wss.on("connection", (ws) => {
-    console.log("Client connected");
 
-    ws.on("message", (message) => {
-        for (const client of wss.clients) {
-            if (client !== ws && client.readyState === WebSocket.OPEN) {
-                client.send(message.toString());
-            }
+    ws.uid = null;
+    ws.job = null;
+
+    ws.on("message", raw => {
+
+        let data;
+
+        try {
+            data = JSON.parse(raw);
+        } catch {
+            return;
         }
+
+        if (data.type === "join") {
+
+            ws.uid = data.uid;
+            ws.job = data.job;
+
+            if (!rooms.has(ws.job))
+                rooms.set(ws.job, new Map());
+
+            rooms.get(ws.job).set(ws.uid, ws);
+
+            return;
+        }
+
+        if (!ws.job) return;
+
+        const room = rooms.get(ws.job);
+        if (!room) return;
+
+        for (const [uid, client] of room) {
+
+            if (client !== ws && client.readyState === WebSocket.OPEN)
+                client.send(raw);
+
+        }
+
     });
 
     ws.on("close", () => {
-        console.log("Client disconnected");
+
+        if (!ws.job) return;
+
+        const room = rooms.get(ws.job);
+
+        if (!room) return;
+
+        room.delete(ws.uid);
+
+        if (room.size === 0)
+            rooms.delete(ws.job);
+
     });
+
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on port ${PORT}`);
-});
+server.listen(process.env.PORT || 10000, "0.0.0.0");
