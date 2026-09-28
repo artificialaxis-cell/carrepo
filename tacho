@@ -1,1 +1,443 @@
+local Players = game:GetService("Players")
 
+local Tacho = {}
+Tacho.Gui = nil
+
+local minrot = -35
+local maxrot = 215
+local rotrange = maxrot - minrot
+
+local needlerate = 16
+local speedrate = 14
+
+local gearrate = 9
+local gearpop = 0.16
+local geardip = 0.55
+
+local redlinecolor = Color3.fromRGB(255, 55, 45)
+local redlinehz = 4.5
+local redlinehyst = 0.01
+local redlinemax = 0.9
+
+local revattack = 8
+local revcoast = 0.45
+local revbrake = 7
+
+local springstiff = 220
+local springdamp = 18
+local maxoffset = 14
+local accelgain = 0.11
+local accelrate = 10
+local maxaccel = 160
+local bumpgain = 9
+local bumpdeadzone = 0.6
+local bumpmax = 90
+
+local maxdt = 0.05
+local bindretry = 0.5
+
+local gui, frame, bgimage, redlineimage, revimage, needle, speedlabel, gearlabel
+local basepos, gearpos, gearsize, bgbasecolor
+local visible = true
+local nextbind = 0
+
+local function newstate()
+	return {
+		rpm = 0,
+		maxrpm = 8000,
+		redlinerpm = math.huge,
+		needlefrac = 0,
+
+		speedshown = 0,
+		speedtarget = 0,
+		speedtext = nil,
+
+		geartext = nil,
+		gearshift = 0,
+
+		atredline = false,
+		redblend = 0,
+		redphase = 0,
+		redactive = true,
+
+		revlevel = 0,
+
+		offx = 0,
+		offy = 0,
+		velx = 0,
+		vely = 0,
+		appliedx = math.huge,
+		appliedy = math.huge,
+		accel = Vector3.zero,
+		lastvel = nil,
+		lastclock = nil,
+	}
+end
+
+local state = newstate()
+
+local function num(value, fallback)
+	if type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge then
+		return value
+	end
+	return fallback
+end
+
+local function smooth(rate, dt)
+	return 1 - math.exp(-rate * dt)
+end
+
+local function validvector(vec)
+	return typeof(vec) == "Vector3" and vec.Magnitude < 1e6
+end
+
+local function gearlabeltext(gear)
+	if type(gear) == "number" then
+		if gear < 0 then
+			return "R"
+		end
+		if gear == 0 then
+			return "N"
+		end
+		return tostring(math.floor(gear))
+	end
+	if type(gear) == "string" then
+		return gear
+	end
+	return nil
+end
+
+local function release()
+	gui, frame, bgimage, redlineimage, revimage, needle, speedlabel, gearlabel = nil, nil, nil, nil, nil, nil, nil, nil
+end
+
+local function findgui()
+	if Tacho.Gui and Tacho.Gui.Parent then
+		return Tacho.Gui
+	end
+	local player = Players.LocalPlayer
+	local playergui = player and player:FindFirstChildOfClass("PlayerGui")
+	return playergui and playergui:FindFirstChild("TachoUI")
+end
+
+local function bind(target)
+	local tachoframe = target:FindFirstChild("TachoFrame")
+	if not tachoframe then
+		return false
+	end
+
+	local bgfound = tachoframe:FindFirstChild("BG")
+	local redlinefound = tachoframe:FindFirstChild("Redline")
+	local revfound = tachoframe:FindFirstChild("Rev")
+	local needlefound = tachoframe:FindFirstChild("Needle")
+	local speedfound = tachoframe:FindFirstChild("Speed")
+	local gearfound = tachoframe:FindFirstChild("Gear")
+
+	if not (bgfound and redlinefound and revfound and needlefound and speedfound and gearfound) then
+		return false
+	end
+
+	gui = target
+	frame = tachoframe
+	bgimage = bgfound
+	redlineimage = redlinefound
+	revimage = revfound
+	needle = needlefound
+	speedlabel = speedfound
+	gearlabel = gearfound
+
+	basepos = frame.Position
+	gearpos = gearlabel.Position
+	gearsize = gearlabel.Size
+	bgbasecolor = bgimage.ImageColor3
+
+	state.speedtext = nil
+	state.geartext = nil
+	state.gearshift = 0
+	state.redactive = true
+	state.appliedx = math.huge
+	state.appliedy = math.huge
+
+	gui.Enabled = visible
+	return true
+end
+
+local function ready()
+	if gui and gui.Parent then
+		return true
+	end
+
+	release()
+
+	local now = os.clock()
+	if now < nextbind then
+		return false
+	end
+	nextbind = now + bindretry
+
+	local found = findgui()
+	return found ~= nil and bind(found)
+end
+
+local function updateneedle(dt)
+	local st = state
+	local target = math.clamp(st.rpm / st.maxrpm, 0, 1)
+	st.needlefrac += (target - st.needlefrac) * smooth(needlerate, dt)
+
+	local rot = minrot + rotrange * st.needlefrac
+	if math.abs(needle.Rotation - rot) > 0.02 then
+		needle.Rotation = rot
+	end
+end
+
+local function updateredline(dt)
+	local st = state
+
+	local wasat = st.atredline
+	local limit = st.redlinerpm
+	if wasat then
+		limit -= st.maxrpm * redlinehyst
+	end
+	st.atredline = st.rpm >= limit
+
+	if st.atredline and not wasat then
+		st.redphase = 0
+	end
+
+	local target = st.atredline and 1 or 0
+	local rate = target > st.redblend and 30 or 8
+	st.redblend += (target - st.redblend) * smooth(rate, dt)
+
+	if st.redblend < 0.003 and not st.atredline then
+		st.redblend = 0
+		if st.redactive then
+			st.redactive = false
+			bgimage.ImageColor3 = bgbasecolor
+			redlineimage.ImageTransparency = 1
+		end
+		return
+	end
+
+	st.redactive = true
+	st.redphase = (st.redphase + dt * redlinehz * math.pi * 2) % (math.pi * 2)
+
+	local pulse = 0.5 + 0.5 * math.cos(st.redphase)
+	local blend = st.redblend
+
+	bgimage.ImageColor3 = bgbasecolor:Lerp(redlinecolor, blend * (0.35 + 0.65 * pulse))
+	redlineimage.ImageTransparency = 1 - blend * pulse * redlinemax
+end
+
+local function updaterev(dt, throttle, brake)
+	local st = state
+	local level = st.revlevel
+
+	if throttle > level then
+		level = math.min(throttle, level + revattack * dt)
+	else
+		local fall = revcoast + brake * revbrake
+		level = math.max(throttle, level - fall * dt)
+	end
+	st.revlevel = level
+
+	local rpmfrac = math.clamp(st.rpm / st.maxrpm, 0, 1)
+	local shaped = level * level * (3 - 2 * level)
+	local strength = shaped * (0.65 + 0.35 * rpmfrac)
+
+	revimage.ImageTransparency = 1 - strength
+end
+
+local function stepspring(pos, vel, target, dt)
+	vel += ((target - pos) * springstiff - vel * springdamp) * dt
+	pos += vel * dt
+
+	if pos > maxoffset then
+		pos, vel = maxoffset, 0
+	elseif pos < -maxoffset then
+		pos, vel = -maxoffset, 0
+	end
+
+	return pos, vel
+end
+
+local function updatemotion(dt, vel)
+	local st = state
+	local bump = 0
+
+	if validvector(vel) then
+		local last = st.lastvel
+		if last then
+			local delta = (vel - last) / dt
+			if delta.Magnitude > maxaccel then
+				delta = delta.Unit * maxaccel
+			end
+			st.accel = st.accel:Lerp(delta, smooth(accelrate, dt))
+
+			local jolt = vel.Y - last.Y
+			if math.abs(jolt) > bumpdeadzone then
+				bump = math.clamp(jolt * bumpgain, -bumpmax, bumpmax)
+			end
+		end
+		st.lastvel = vel
+	else
+		st.lastvel = nil
+		st.accel = st.accel:Lerp(Vector3.zero, smooth(accelrate, dt))
+	end
+
+	local softlimit = maxoffset * 0.7
+	local targetx = math.clamp(-st.accel.X * accelgain, -softlimit, softlimit)
+	local targety = math.clamp(-st.accel.Z * accelgain, -softlimit, softlimit)
+
+	st.vely += bump
+	st.offx, st.velx = stepspring(st.offx, st.velx, targetx, dt)
+	st.offy, st.vely = stepspring(st.offy, st.vely, targety, dt)
+
+	if math.abs(st.offx - st.appliedx) > 0.03 or math.abs(st.offy - st.appliedy) > 0.03 then
+		st.appliedx = st.offx
+		st.appliedy = st.offy
+		frame.Position = UDim2.new(
+			basepos.X.Scale, basepos.X.Offset + st.offx,
+			basepos.Y.Scale, basepos.Y.Offset + st.offy
+		)
+	end
+end
+
+local function updatespeed(dt, kmh)
+	local st = state
+	st.speedshown += (kmh - st.speedshown) * smooth(speedrate, dt)
+	if math.abs(kmh - st.speedshown) < 0.05 then
+		st.speedshown = kmh
+	end
+
+	local rounded = math.floor(st.speedshown + 0.5)
+	if rounded ~= st.speedtext then
+		st.speedtext = rounded
+		speedlabel.Text = tostring(rounded)
+	end
+end
+
+local function updategear(dt, gear)
+	local st = state
+
+	local text = gearlabeltext(gear)
+	if text and text ~= st.geartext then
+		if st.geartext then
+			st.gearshift = 1
+		end
+		st.geartext = text
+		gearlabel.Text = text
+	end
+
+	if st.gearshift <= 0 then
+		return
+	end
+
+	st.gearshift *= math.exp(-gearrate * dt)
+	if st.gearshift < 0.003 then
+		st.gearshift = 0
+	end
+
+	local pop = st.gearshift
+	local scale = 1 + gearpop * pop
+	local grow = (scale - 1) / 2
+
+	gearlabel.Size = UDim2.new(
+		gearsize.X.Scale * scale, gearsize.X.Offset * scale,
+		gearsize.Y.Scale * scale, gearsize.Y.Offset * scale
+	)
+	gearlabel.Position = UDim2.new(
+		gearpos.X.Scale - gearsize.X.Scale * grow, gearpos.X.Offset - gearsize.X.Offset * grow,
+		gearpos.Y.Scale - gearsize.Y.Scale * grow, gearpos.Y.Offset - gearsize.Y.Offset * grow
+	)
+	gearlabel.TextTransparency = geardip * pop
+end
+
+local function grab(url)
+	local ok, src = pcall(game.HttpGet, game, url)
+	if not ok then error("couldn't fetch " .. url .. ": " .. tostring(src)) end
+
+	local chunk, err = loadstring(src)
+	if not chunk then error("bad chunk from " .. url .. ": " .. tostring(err)) end
+
+	local ok2, mod = pcall(chunk)
+	if not ok2 then error("module blew up (" .. url .. "): " .. tostring(mod)) end
+	return mod
+end
+
+function Tacho:Create()
+	local UIJson = [[{"version":1,"root":{"attrs":[],"refs":[],"name":"TachoUI","tags":[],"id":1,"class":"ScreenGui","children":[{"attrs":[],"refs":[],"name":"TachoFrame","tags":[],"id":2,"class":"Frame","children":[{"attrs":[],"refs":[],"name":"BG","tags":[],"id":3,"class":"ImageLabel","children":[],"props":{"Visible":true,"SelectionBehaviorLeft":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"Interactable":true,"SizeConstraint":{"v":["SizeConstraint","RelativeXY"],"t":"EnumItem"},"ZIndex":1,"BorderSizePixel":0,"SliceCenter":{"v":[0,0,0,0],"t":"Rect"},"ScaleType":{"v":["ScaleType","Stretch"],"t":"EnumItem"},"AutoLocalize":true,"BackgroundColor3":{"v":[1,1,1],"t":"Color3"},"ImageTransparency":0,"Selectable":false,"AnchorPoint":{"v":[0,0],"t":"Vector2"},"Image":"rbxassetid://117126163235141","TileSize":{"v":[1,0,1,0],"t":"UDim2"},"ImageRectSize":{"v":[0,0],"t":"Vector2"},"SelectionBehaviorDown":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"AutomaticSize":{"v":["AutomaticSize","None"],"t":"EnumItem"},"Size":{"v":[1,0,1,0],"t":"UDim2"},"SliceScale":1,"LayoutOrder":0,"SelectionBehaviorUp":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"BorderColor3":{"v":[0,0,0],"t":"Color3"},"BorderMode":{"v":["BorderMode","Outline"],"t":"EnumItem"},"ResampleMode":{"v":["ResamplerMode","Default"],"t":"EnumItem"},"ImageColor3":{"v":[1,1,1],"t":"Color3"},"Rotation":0,"ImageRectOffset":{"v":[0,0],"t":"Vector2"},"BackgroundTransparency":1,"Position":{"v":[0,0,0,0],"t":"UDim2"},"SelectionBehaviorRight":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"ClipsDescendants":false,"SelectionGroup":false,"Active":false}},{"attrs":[],"refs":[],"name":"Redline","tags":[],"id":4,"class":"ImageLabel","children":[],"props":{"Visible":true,"SelectionBehaviorLeft":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"Interactable":true,"SizeConstraint":{"v":["SizeConstraint","RelativeXY"],"t":"EnumItem"},"ZIndex":1,"BorderSizePixel":0,"SliceCenter":{"v":[0,0,0,0],"t":"Rect"},"ScaleType":{"v":["ScaleType","Stretch"],"t":"EnumItem"},"AutoLocalize":true,"BackgroundColor3":{"v":[1,1,1],"t":"Color3"},"ImageTransparency":1,"Selectable":false,"AnchorPoint":{"v":[0,0],"t":"Vector2"},"Image":"rbxassetid://132072454229509","TileSize":{"v":[1,0,1,0],"t":"UDim2"},"ImageRectSize":{"v":[0,0],"t":"Vector2"},"SelectionBehaviorDown":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"AutomaticSize":{"v":["AutomaticSize","None"],"t":"EnumItem"},"Size":{"v":[1,0,1,0],"t":"UDim2"},"SliceScale":1,"LayoutOrder":0,"SelectionBehaviorUp":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"BorderColor3":{"v":[0,0,0],"t":"Color3"},"BorderMode":{"v":["BorderMode","Outline"],"t":"EnumItem"},"ResampleMode":{"v":["ResamplerMode","Default"],"t":"EnumItem"},"ImageColor3":{"v":[1,1,1],"t":"Color3"},"Rotation":0,"ImageRectOffset":{"v":[0,0],"t":"Vector2"},"BackgroundTransparency":1,"Position":{"v":[0,0,0,0],"t":"UDim2"},"SelectionBehaviorRight":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"ClipsDescendants":false,"SelectionGroup":false,"Active":false}},{"attrs":[],"refs":[],"name":"Numbers","tags":[],"id":5,"class":"ImageLabel","children":[],"props":{"Visible":true,"SelectionBehaviorLeft":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"Interactable":true,"SizeConstraint":{"v":["SizeConstraint","RelativeXY"],"t":"EnumItem"},"ZIndex":1,"BorderSizePixel":0,"SliceCenter":{"v":[0,0,0,0],"t":"Rect"},"ScaleType":{"v":["ScaleType","Stretch"],"t":"EnumItem"},"AutoLocalize":true,"BackgroundColor3":{"v":[1,1,1],"t":"Color3"},"ImageTransparency":0,"Selectable":false,"AnchorPoint":{"v":[0,0],"t":"Vector2"},"Image":"rbxassetid://118768962512213","TileSize":{"v":[1,0,1,0],"t":"UDim2"},"ImageRectSize":{"v":[0,0],"t":"Vector2"},"SelectionBehaviorDown":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"AutomaticSize":{"v":["AutomaticSize","None"],"t":"EnumItem"},"Size":{"v":[1,0,1,0],"t":"UDim2"},"SliceScale":1,"LayoutOrder":0,"SelectionBehaviorUp":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"BorderColor3":{"v":[0,0,0],"t":"Color3"},"BorderMode":{"v":["BorderMode","Outline"],"t":"EnumItem"},"ResampleMode":{"v":["ResamplerMode","Default"],"t":"EnumItem"},"ImageColor3":{"v":[1,1,1],"t":"Color3"},"Rotation":0,"ImageRectOffset":{"v":[0,0],"t":"Vector2"},"BackgroundTransparency":1,"Position":{"v":[0,0,0,0],"t":"UDim2"},"SelectionBehaviorRight":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"ClipsDescendants":false,"SelectionGroup":false,"Active":false}},{"attrs":[],"refs":[],"name":"Rev","tags":[],"id":6,"class":"ImageLabel","children":[],"props":{"Visible":true,"SelectionBehaviorLeft":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"Interactable":true,"SizeConstraint":{"v":["SizeConstraint","RelativeXY"],"t":"EnumItem"},"ZIndex":1,"BorderSizePixel":0,"SliceCenter":{"v":[0,0,0,0],"t":"Rect"},"ScaleType":{"v":["ScaleType","Stretch"],"t":"EnumItem"},"AutoLocalize":true,"BackgroundColor3":{"v":[1,1,1],"t":"Color3"},"ImageTransparency":1,"Selectable":false,"AnchorPoint":{"v":[0,0],"t":"Vector2"},"Image":"rbxassetid://80824879680733","TileSize":{"v":[1,0,1,0],"t":"UDim2"},"ImageRectSize":{"v":[0,0],"t":"Vector2"},"SelectionBehaviorDown":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"AutomaticSize":{"v":["AutomaticSize","None"],"t":"EnumItem"},"Size":{"v":[1,0,1,0],"t":"UDim2"},"SliceScale":1,"LayoutOrder":0,"SelectionBehaviorUp":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"BorderColor3":{"v":[0,0,0],"t":"Color3"},"BorderMode":{"v":["BorderMode","Outline"],"t":"EnumItem"},"ResampleMode":{"v":["ResamplerMode","Default"],"t":"EnumItem"},"ImageColor3":{"v":[1,1,1],"t":"Color3"},"Rotation":0,"ImageRectOffset":{"v":[0,0],"t":"Vector2"},"BackgroundTransparency":1,"Position":{"v":[0,0,0,0],"t":"UDim2"},"SelectionBehaviorRight":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"ClipsDescendants":false,"SelectionGroup":false,"Active":false}},{"attrs":[],"refs":[],"name":"Needle","tags":[],"id":7,"class":"Frame","children":[{"attrs":[],"refs":[],"name":"ImageLabel","tags":[],"id":8,"class":"ImageLabel","children":[],"props":{"Visible":true,"SelectionBehaviorLeft":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"Interactable":true,"SizeConstraint":{"v":["SizeConstraint","RelativeXY"],"t":"EnumItem"},"ZIndex":2,"BorderSizePixel":0,"SliceCenter":{"v":[0,0,0,0],"t":"Rect"},"ScaleType":{"v":["ScaleType","Stretch"],"t":"EnumItem"},"AutoLocalize":true,"BackgroundColor3":{"v":[1,1,1],"t":"Color3"},"ImageTransparency":0,"Selectable":false,"AnchorPoint":{"v":[0,0],"t":"Vector2"},"Image":"rbxassetid://96693246189394","TileSize":{"v":[1,0,1,0],"t":"UDim2"},"ImageRectSize":{"v":[0,0],"t":"Vector2"},"SelectionBehaviorDown":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"AutomaticSize":{"v":["AutomaticSize","None"],"t":"EnumItem"},"Size":{"v":[21.53333282470703,0,11.698644638061524,0],"t":"UDim2"},"SliceScale":1,"LayoutOrder":0,"SelectionBehaviorUp":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"BorderColor3":{"v":[0,0,0],"t":"Color3"},"BorderMode":{"v":["BorderMode","Outline"],"t":"EnumItem"},"ResampleMode":{"v":["ResamplerMode","Default"],"t":"EnumItem"},"ImageColor3":{"v":[1,1,1],"t":"Color3"},"Rotation":0,"ImageRectOffset":{"v":[0,0],"t":"Vector2"},"BackgroundTransparency":1,"Position":{"v":[-16.266666412353517,0,-5.349322319030762,0],"t":"UDim2"},"SelectionBehaviorRight":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"ClipsDescendants":false,"SelectionGroup":false,"Active":false}}],"props":{"LayoutOrder":0,"BorderMode":{"v":["BorderMode","Outline"],"t":"EnumItem"},"Interactable":true,"AnchorPoint":{"v":[0,0],"t":"Vector2"},"SelectionBehaviorDown":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"ZIndex":2,"AutomaticSize":{"v":["AutomaticSize","None"],"t":"EnumItem"},"Size":{"v":[0.03311258181929588,0,0.03311258181929588,0],"t":"UDim2"},"Visible":true,"SizeConstraint":{"v":["SizeConstraint","RelativeXY"],"t":"EnumItem"},"AutoLocalize":true,"ClipsDescendants":false,"BorderColor3":{"v":[0,0,0],"t":"Color3"},"Active":false,"SelectionBehaviorLeft":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"SelectionBehaviorUp":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"Rotation":-35,"BorderSizePixel":0,"BackgroundTransparency":1,"Position":{"v":[0.4834437072277069,0,0.4834437072277069,0],"t":"UDim2"},"SelectionBehaviorRight":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"Selectable":false,"SelectionGroup":false,"BackgroundColor3":{"v":[1,1,1],"t":"Color3"}}},{"attrs":[],"refs":[],"name":"Speed","tags":[],"id":9,"class":"TextLabel","children":[{"attrs":[],"refs":[],"name":"Display","tags":[],"id":10,"class":"TextLabel","children":[],"props":{"Visible":true,"TextWrapped":true,"TextDirection":{"v":["TextDirection","Auto"],"t":"EnumItem"},"SelectionBehaviorLeft":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"Interactable":true,"TextStrokeTransparency":1,"TextTruncate":{"v":["TextTruncate","None"],"t":"EnumItem"},"SizeConstraint":{"v":["SizeConstraint","RelativeXY"],"t":"EnumItem"},"ZIndex":3,"BorderSizePixel":0,"RichText":false,"AutoLocalize":true,"TextYAlignment":{"v":["TextYAlignment","Center"],"t":"EnumItem"},"TextScaled":true,"BackgroundColor3":{"v":[1,1,1],"t":"Color3"},"FontFace":{"v":["rbxassetid://12187375422","Medium","Normal"],"t":"Font"},"BorderMode":{"v":["BorderMode","Outline"],"t":"EnumItem"},"Selectable":false,"AnchorPoint":{"v":[0,0],"t":"Vector2"},"TextXAlignment":{"v":["TextXAlignment","Center"],"t":"EnumItem"},"SelectionBehaviorDown":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"TextTransparency":0,"AutomaticSize":{"v":["AutomaticSize","None"],"t":"EnumItem"},"Size":{"v":[0.5364780426025391,0,0.5364791750907898,0],"t":"UDim2"},"TextStrokeColor3":{"v":[0,0,0],"t":"Color3"},"TextSize":14,"LayoutOrder":0,"SelectionBehaviorUp":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"BorderColor3":{"v":[0,0,0],"t":"Color3"},"Text":"km/h","LineHeight":1,"TextColor3":{"v":[1,1,1],"t":"Color3"},"Rotation":0,"Active":false,"BackgroundTransparency":1,"Position":{"v":[0.2426101565361023,0,0.7749999761581421,0],"t":"UDim2"},"SelectionBehaviorRight":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"MaxVisibleGraphemes":-1,"SelectionGroup":false,"ClipsDescendants":false}}],"props":{"Visible":true,"TextWrapped":true,"TextDirection":{"v":["TextDirection","Auto"],"t":"EnumItem"},"SelectionBehaviorLeft":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"Interactable":true,"TextStrokeTransparency":1,"TextTruncate":{"v":["TextTruncate","None"],"t":"EnumItem"},"SizeConstraint":{"v":["SizeConstraint","RelativeXY"],"t":"EnumItem"},"ZIndex":3,"BorderSizePixel":0,"RichText":false,"AutoLocalize":true,"TextYAlignment":{"v":["TextYAlignment","Center"],"t":"EnumItem"},"TextScaled":true,"BackgroundColor3":{"v":[1,1,1],"t":"Color3"},"FontFace":{"v":["rbxassetid://12187375422","Medium","Normal"],"t":"Font"},"BorderMode":{"v":["BorderMode","Outline"],"t":"EnumItem"},"Selectable":false,"AnchorPoint":{"v":[0,0],"t":"Vector2"},"TextXAlignment":{"v":["TextXAlignment","Center"],"t":"EnumItem"},"SelectionBehaviorDown":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"TextTransparency":0,"AutomaticSize":{"v":["AutomaticSize","None"],"t":"EnumItem"},"Size":{"v":[0.11867551505565644,0,0.08830022066831589,0],"t":"UDim2"},"TextStrokeColor3":{"v":[0,0,0],"t":"Color3"},"TextSize":14,"LayoutOrder":0,"SelectionBehaviorUp":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"BorderColor3":{"v":[0,0,0],"t":"Color3"},"Text":"100","LineHeight":1,"TextColor3":{"v":[1,1,1],"t":"Color3"},"Rotation":0,"Active":false,"BackgroundTransparency":1,"Position":{"v":[0.4386754333972931,0,0.6114790439605713,0],"t":"UDim2"},"SelectionBehaviorRight":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"MaxVisibleGraphemes":-1,"SelectionGroup":false,"ClipsDescendants":false}},{"attrs":[],"refs":[],"name":"Gear","tags":[],"id":11,"class":"TextLabel","children":[],"props":{"Visible":true,"TextWrapped":true,"TextDirection":{"v":["TextDirection","Auto"],"t":"EnumItem"},"SelectionBehaviorLeft":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"Interactable":true,"TextStrokeTransparency":1,"TextTruncate":{"v":["TextTruncate","None"],"t":"EnumItem"},"SizeConstraint":{"v":["SizeConstraint","RelativeXY"],"t":"EnumItem"},"ZIndex":4,"BorderSizePixel":0,"RichText":false,"AutoLocalize":true,"TextYAlignment":{"v":["TextYAlignment","Center"],"t":"EnumItem"},"TextScaled":true,"BackgroundColor3":{"v":[1,1,1],"t":"Color3"},"FontFace":{"v":["rbxassetid://12187375422","Medium","Normal"],"t":"Font"},"BorderMode":{"v":["BorderMode","Outline"],"t":"EnumItem"},"Selectable":false,"AnchorPoint":{"v":[0,0],"t":"Vector2"},"TextXAlignment":{"v":["TextXAlignment","Center"],"t":"EnumItem"},"SelectionBehaviorDown":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"TextTransparency":0,"AutomaticSize":{"v":["AutomaticSize","None"],"t":"EnumItem"},"Size":{"v":[0.06793603301048279,0,0.094922736287117,0],"t":"UDim2"},"TextStrokeColor3":{"v":[0,0,0],"t":"Color3"},"TextSize":14,"LayoutOrder":0,"SelectionBehaviorUp":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"BorderColor3":{"v":[0,0,0],"t":"Color3"},"Text":"1","LineHeight":1,"TextColor3":{"v":[1,1,1],"t":"Color3"},"Rotation":0,"Active":false,"BackgroundTransparency":1,"Position":{"v":[0.48720821738243105,0,0.5298013091087341,0],"t":"UDim2"},"SelectionBehaviorRight":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"MaxVisibleGraphemes":-1,"SelectionGroup":false,"ClipsDescendants":false}},{"attrs":[],"refs":[],"name":"UIAspectRatioConstraint","tags":[],"id":12,"class":"UIAspectRatioConstraint","children":[],"props":{"AspectRatio":0.9999999403953552,"DominantAxis":{"v":["DominantAxis","Height"],"t":"EnumItem"},"AspectType":{"v":["AspectType","ScaleWithParentSize"],"t":"EnumItem"}}}],"props":{"LayoutOrder":0,"BorderMode":{"v":["BorderMode","Outline"],"t":"EnumItem"},"Interactable":true,"AnchorPoint":{"v":[0,0],"t":"Vector2"},"SelectionBehaviorDown":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"ZIndex":1,"AutomaticSize":{"v":["AutomaticSize","None"],"t":"EnumItem"},"Size":{"v":[0.3481937050819397,0,0.5698113441467285,0],"t":"UDim2"},"Visible":true,"SizeConstraint":{"v":["SizeConstraint","RelativeXY"],"t":"EnumItem"},"AutoLocalize":true,"ClipsDescendants":false,"BorderColor3":{"v":[1,1,1],"t":"Color3"},"Active":false,"SelectionBehaviorLeft":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"SelectionBehaviorUp":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"Rotation":0,"BorderSizePixel":0,"BackgroundTransparency":1,"Position":{"v":[0.7148347496986389,0,0.5751123428344727,0],"t":"UDim2"},"SelectionBehaviorRight":{"v":["SelectionBehavior","Escape"],"t":"EnumItem"},"Selectable":false,"SelectionGroup":false,"BackgroundColor3":{"v":[1,1,1],"t":"Color3"}}}],"props":{"Enabled":true,"ZIndexBehavior":{"v":["ZIndexBehavior","Sibling"],"t":"EnumItem"},"SafeAreaCompatibility":{"v":["SafeAreaCompatibility","FullscreenExtension"],"t":"EnumItem"},"ClipToDeviceSafeArea":true,"ResetOnSpawn":true,"IgnoreGuiInset":false,"ScreenInsets":{"v":["ScreenInsets","CoreUISafeInsets"],"t":"EnumItem"},"DisplayOrder":0}}}]]
+
+	local UiBuilder
+
+	if game.RunService:IsStudio() then
+		UiBuilder = require(workspace.uibuilder)
+	else
+		UiBuilder = grab("https://raw.githubusercontent.com/artificialaxis-cell/carrepo/refs/heads/main/uibuilder")
+	end
+
+	local UI = UiBuilder:Build(UIJson)
+	
+	bind(UI)
+end
+
+function Tacho:Update(stats)
+	if type(stats) ~= "table" then
+		return
+	end
+	if not ready() then
+		return
+	end
+
+	local st = state
+
+	if not visible then
+		st.lastclock = nil
+		st.lastvel = nil
+		return
+	end
+
+	local now = os.clock()
+	local dt = st.lastclock and (now - st.lastclock) or 1 / 60
+	if dt < 0.002 then
+		return
+	end
+	dt = math.min(dt, maxdt)
+	st.lastclock = now
+
+	st.rpm = num(stats.RPM, st.rpm)
+	st.maxrpm = math.max(num(stats.MaxRPM, st.maxrpm), 1)
+	st.redlinerpm = num(stats.RedlineRPM, st.redlinerpm)
+	st.speedtarget = num(stats.KMH, st.speedtarget)
+
+	local throttle = math.clamp(num(stats.Throttle, 0), 0, 1)
+	local brake = math.clamp(num(stats.Brake, 0), 0, 1)
+
+	updateneedle(dt)
+	updateredline(dt)
+	updaterev(dt, throttle, brake)
+	updatemotion(dt, stats.Velocity)
+	updatespeed(dt, st.speedtarget)
+	updategear(dt, stats.Gear)
+end
+
+function Tacho:Visability(show)
+	visible = show == true
+	if gui then
+		gui.Enabled = visible
+	end
+end
+
+function Tacho:Clear()
+	local target = gui or Tacho.Gui
+	if target then
+		target:Destroy()
+	end
+
+	release()
+	state = newstate()
+	Tacho.Gui = nil
+	visible = true
+	nextbind = 0
+end
+
+return Tacho
