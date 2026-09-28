@@ -1,0 +1,160 @@
+local httpservice = game:GetService("HttpService")
+local collectionservice = game:GetService("CollectionService")
+
+local uibuilder = {}
+
+local function decodenumber(n)
+	if n == "inf" then
+		return math.huge
+	elseif n == "-inf" then
+		return -math.huge
+	elseif n == "nan" then
+		return 0 / 0
+	end
+	return n
+end
+
+local function unpacknums(list)
+	local out = {}
+	for index, n in ipairs(list) do
+		out[index] = decodenumber(n)
+	end
+	return unpack(out)
+end
+
+local decoders = {
+	number = function(v)
+		return decodenumber(v)
+	end,
+	Color3 = function(v)
+		return Color3.new(unpacknums(v))
+	end,
+	UDim2 = function(v)
+		return UDim2.new(unpacknums(v))
+	end,
+	UDim = function(v)
+		return UDim.new(unpacknums(v))
+	end,
+	Vector2 = function(v)
+		return Vector2.new(unpacknums(v))
+	end,
+	Vector3 = function(v)
+		return Vector3.new(unpacknums(v))
+	end,
+	Rect = function(v)
+		return Rect.new(unpacknums(v))
+	end,
+	NumberRange = function(v)
+		return NumberRange.new(unpacknums(v))
+	end,
+	NumberSequence = function(v)
+		local points = {}
+		for _, point in ipairs(v) do
+			table.insert(points, NumberSequenceKeypoint.new(unpacknums(point)))
+		end
+		return NumberSequence.new(points)
+	end,
+	ColorSequence = function(v)
+		local points = {}
+		for _, point in ipairs(v) do
+			local time, r, g, b = unpacknums(point)
+			table.insert(points, ColorSequenceKeypoint.new(time, Color3.new(r, g, b)))
+		end
+		return ColorSequence.new(points)
+	end,
+	Font = function(v)
+		return Font.new(v[1], Enum.FontWeight[v[2]], Enum.FontStyle[v[3]])
+	end,
+	EnumItem = function(v)
+		return Enum[v[1]][v[2]]
+	end,
+	BrickColor = function(v)
+		return BrickColor.new(v)
+	end,
+	CFrame = function(v)
+		return CFrame.new(unpacknums(v))
+	end,
+}
+
+local function decodevalue(value)
+	if type(value) == "table" then
+		return decoders[value.t](value.v)
+	end
+	return value
+end
+
+local function buildnode(node, context)
+	local inst = Instance.new(node.class)
+	inst.Name = node.name
+	context.nodemap[node.id] = inst
+
+	for propname, encoded in pairs(node.props) do
+		local ok = pcall(function()
+			inst[propname] = decodevalue(encoded)
+		end)
+		if not ok then
+			context.failed[node.class .. "." .. propname] = true
+		end
+	end
+
+	for attrname, encoded in pairs(node.attrs) do
+		inst:SetAttribute(attrname, decodevalue(encoded))
+	end
+
+	for _, tag in ipairs(node.tags) do
+		collectionservice:AddTag(inst, tag)
+	end
+
+	for propname, id in pairs(node.refs) do
+		table.insert(context.pendingrefs, {inst = inst, prop = propname, id = id})
+	end
+
+	if node.source then
+		local ok = pcall(function()
+			inst.Source = node.source
+		end)
+		if not ok then
+			context.failed[node.class .. ".Source"] = true
+		end
+	end
+
+	for _, childnode in ipairs(node.children) do
+		local child = buildnode(childnode, context)
+		child.Parent = inst
+	end
+
+	return inst
+end
+
+function uibuilder:Build(jsonstring)
+	assert(type(jsonstring) == "string", "uibuilder:Build expects a json string")
+
+	local data = httpservice:JSONDecode(jsonstring)
+	local context = {nodemap = {}, pendingrefs = {}, failed = {}}
+
+	local root = buildnode(data.root, context)
+
+	for _, pending in ipairs(context.pendingrefs) do
+		local refinst = context.nodemap[pending.id]
+		if refinst then
+			pcall(function()
+				pending.inst[pending.prop] = refinst
+			end)
+		end
+	end
+
+	local failedlist = {}
+	for entry in pairs(context.failed) do
+		table.insert(failedlist, entry)
+	end
+
+	if #failedlist > 0 then
+		warn("could not set: " .. table.concat(failedlist, ", "))
+	end
+
+	root.Parent = game.Players.LocalPlayer.PlayerGui
+
+	return root
+end
+
+return uibuilder
