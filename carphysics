@@ -1,0 +1,2258 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+local CONFIG = {
+	EnterKey = Enum.KeyCode.E,
+	EnterGamepadKey = Enum.KeyCode.ButtonX,
+	ExitKey = Enum.KeyCode.F,
+	ThrottleKey = Enum.KeyCode.W,
+	BrakeKey = Enum.KeyCode.S,
+	ClutchKey = Enum.KeyCode.LeftShift,
+	SteerLeftKey = Enum.KeyCode.A,
+	SteerRightKey = Enum.KeyCode.D,
+	GearUpKey = Enum.KeyCode.E,
+	GearDownKey = Enum.KeyCode.Q,
+	MouseSteerKey = Enum.KeyCode.M,
+	RestartEngineKey = Enum.KeyCode.R,
+	HandbrakeKey = Enum.KeyCode.Space,
+	HandbrakeGamepadKey = Enum.KeyCode.ButtonY,
+
+	PromptActionText = "Drive",
+	PromptDistance = 12,
+
+	EnterInputGuard = 0.25,
+	ExitSideClearance = 3,
+	ExitHeight = 2,
+	StartDelay = 0.5,
+
+	AutoFirstGearOnEnter = true,
+}
+
+local CHASSIS_REPLICATION = {
+	Enabled = true,
+	BodyOffset = CFrame.new(0, 0.19, 0.582),
+	WheelToLimb = {
+		FR = "Right Arm",
+		RR = "Right Leg",
+		FL = "Left Arm",
+		RL = "Left Leg",
+	},
+}
+
+local SND_CFG = {
+	Idle = { minRPM = 950, maxRPM = 3200, minVolume = 0.03, maxVolume = 0.55, smoothing = 9 },
+	Rev = {
+		minRPM = 950, maxRPM = 7800, minPlayback = 0.55, maxPlayback = 1.6, playbackCurve = 0.8,
+		baseVolume = 0.4, maxVolume = 1.7, loadVolumeBoost = 0.7, accelPlaybackBoost = 0.035,
+		smoothing = 6, rpmSmoothing = 14,
+	},
+	Whine = {
+		minSpeed = 0, maxSpeed = 200, minPlayback = 0.75, maxPlayback = 2, baseVolume = 0.4,
+		maxVolume = 0.7, loadVolume = 0.45, clutchRelease = 0.12, smoothing = 10, driveSpeedScale = 0.16,
+	},
+	Throttle = { smoothing = 16 },
+	Load = { smoothing = 5 },
+	ShiftReactionTime = 0.14,
+	ShiftDipStrength = 0.5,
+	FadeOutTime = 0.6,
+}
+
+local WHEEL_SPEED_ATTRIBUTES = {
+	FR = "frontRws",
+	FL = "frontLws",
+	RR = "rearRws",
+	RL = "rearLws",
+}
+
+local REQUIRED_CHILDREN = { "Wheels", "Mass", "Primary", "Throttle", "Brake", "Clutch", "Steer" }
+local REQUIRED_ATTRIBUTES = { "psi", "damper", "tirestart", "tireend" }
+
+local Units = {}
+Units.StudsToMeters = 0.28
+Units.MetersToStuds = 1 / Units.StudsToMeters
+
+Units.MassScale = 2853 / 1500
+Units.ForceScale = Units.MassScale / Units.StudsToMeters
+
+function Units.RobloxForceToNewtons(robloxForce)
+	return robloxForce / Units.ForceScale
+end
+
+function Units.RadPerSecToRPM(omega)
+	return omega * 60 / (2 * math.pi)
+end
+
+function Units.RPMToRadPerSec(rpm)
+	return rpm * 2 * math.pi / 60
+end
+
+function Units.MpsToStudsPerSec(mps)
+	return mps * Units.MetersToStuds
+end
+
+function Units.StudsPerSecToMps(sps)
+	return sps * Units.StudsToMeters
+end
+
+local function lerp(a, b, t)
+	return a + (b - a) * math.clamp(t, 0, 1)
+end
+
+local function smoothTo(current, target, rate, dt)
+	local alpha = 1 - math.exp(-math.max(rate, 0) * dt)
+	return current + (target - current) * alpha
+end
+
+local function flatten(vector, fallback)
+	local flat = Vector3.new(vector.X, 0, vector.Z)
+	if flat.Magnitude < 0.01 then
+		return fallback
+	end
+	return flat.Unit
+end
+
+local function approach(current, target, speed, dt)
+	if current < target then
+		return math.min(current + speed * dt, target)
+	elseif current > target then
+		return math.max(current - speed * dt, target)
+	end
+	return current
+end
+
+local Engine = {}
+Engine.__index = Engine
+
+function Engine.new(config)
+	local self = setmetatable({}, Engine)
+
+	self.idleRPM = config.idleRPM or 900
+	self.redlineRPM = config.redlineRPM or 7000
+	self.inertia = config.inertia or 0.15
+
+	self.torqueCurve = config.torqueCurve
+	self.torquePoints = {}
+	for rpm in pairs(self.torqueCurve) do
+		table.insert(self.torquePoints, rpm)
+	end
+	table.sort(self.torquePoints)
+	assert(#self.torquePoints >= 2, "Engine requires at least 2 torqueCurve points")
+
+	local friction = config.friction or {}
+
+	self.staticFriction = friction.static or 12
+
+	self.viscous = friction.viscous or 0.010
+
+	self.pumpingLossCoefficient = friction.pumpingLossCoefficient or 0.0009
+
+	self.accessoryTorque = config.accessoryTorque or 6
+
+	self.idleControl = config.idleControl or {}
+	if self.idleControl.enabled == nil then
+		self.idleControl.enabled = true
+	end
+	self.idleControl.targetRPM = self.idleControl.targetRPM or self.idleRPM
+	self.idleControl.authority = self.idleControl.authority or 0.55
+	self.idleControl.stallRPM = self.idleControl.stallRPM or (self.idleRPM * 0.35)
+
+	self.revLimiter = config.revLimiter or {}
+	self.revLimiter.rpm = self.revLimiter.rpm or self.redlineRPM
+	self.revLimiter.cut = self.revLimiter.cut or 1.0
+	self.revLimiter.hysteresis = self.revLimiter.hysteresis or 120
+
+	self.omega = Units.RPMToRadPerSec(self.idleRPM)
+	self.stalled = false
+	self.limiterActive = false
+	self.lastCombustionTorque = 0
+	self.lastNetTorque = 0
+
+	return self
+end
+
+function Engine:_combustionTorqueAt(rpm, throttle)
+	local points = self.torquePoints
+	local curve = self.torqueCurve
+	local maxTorque
+
+	if rpm <= points[1] then
+		maxTorque = curve[points[1]]
+	elseif rpm >= points[#points] then
+		maxTorque = curve[points[#points]]
+	else
+		maxTorque = curve[points[#points]]
+		for i = 1, #points - 1 do
+			local lo, hi = points[i], points[i + 1]
+			if rpm >= lo and rpm <= hi then
+				local alpha = (rpm - lo) / (hi - lo)
+				maxTorque = curve[lo] + (curve[hi] - curve[lo]) * alpha
+				break
+			end
+		end
+	end
+
+	return maxTorque * math.clamp(throttle, 0, 1)
+end
+
+function Engine:Update(dt, throttle, loadTorque)
+	loadTorque = loadTorque or 0
+	local rpm = self:GetRPM()
+
+	local idleThrottle = 0
+	if self.idleControl.enabled and rpm < self.idleControl.targetRPM * 1.05 then
+		local deficit = (self.idleControl.targetRPM - rpm) / self.idleControl.targetRPM
+		idleThrottle = math.clamp(deficit * self.idleControl.authority, 0, 1)
+	end
+	local effectiveThrottle = math.max(math.clamp(throttle, 0, 1), idleThrottle)
+
+	if rpm >= self.revLimiter.rpm then
+		self.limiterActive = true
+	elseif rpm < self.revLimiter.rpm - self.revLimiter.hysteresis then
+		self.limiterActive = false
+	end
+	if self.limiterActive then
+		effectiveThrottle = effectiveThrottle * (1 - self.revLimiter.cut)
+	end
+
+	local combustionTorque = self:_combustionTorqueAt(rpm, effectiveThrottle)
+	local frictionTorque = self.staticFriction + self.viscous * self.omega
+	local throttleRestriction = 1 - effectiveThrottle
+	local pumpingLoss = self.pumpingLossCoefficient * throttleRestriction * self.omega * self.omega
+
+	if self.stalled then
+		combustionTorque = 0
+	end
+
+	local netTorque = combustionTorque - frictionTorque - pumpingLoss - self.accessoryTorque - loadTorque
+
+	if not self.stalled and rpm < self.idleControl.stallRPM and netTorque < 0 then
+		self.stalled = true
+		combustionTorque = 0
+		netTorque = -frictionTorque - pumpingLoss - loadTorque
+	end
+
+	local angularAcceleration = netTorque / self.inertia
+	self.omega = math.max(self.omega + angularAcceleration * dt, 0)
+
+	self.lastCombustionTorque = combustionTorque
+	self.lastNetTorque = netTorque
+
+	return self.omega
+end
+
+function Engine:Restart()
+	if self.omega < Units.RPMToRadPerSec(self.idleControl.stallRPM) then
+		self.omega = Units.RPMToRadPerSec(self.idleRPM)
+	end
+	self.stalled = false
+end
+
+function Engine:GetRPM()
+	return Units.RadPerSecToRPM(self.omega)
+end
+
+function Engine:GetAngularVelocity()
+	return self.omega
+end
+
+function Engine:IsStalled()
+	return self.stalled
+end
+
+local Clutch = {}
+Clutch.__index = Clutch
+
+function Clutch.new(config)
+	local self = setmetatable({}, Clutch)
+	self.maxTorque = config.maxTorque or 380
+	self.slip = 0
+	self.lastTorque = 0
+	return self
+end
+
+function Clutch:Update(dt, engineOmega, engineInertia, transInputOmega, reflectedInertia, pedal)
+	local capacity = self.maxTorque * math.clamp(1 - pedal, 0, 1)
+	self.slip = engineOmega - transInputOmega
+
+	if capacity <= 0.001 or reflectedInertia <= 0 or engineInertia <= 0 then
+		self.lastTorque = 0
+		return 0
+	end
+
+	local combinedInertia = (engineInertia * reflectedInertia) / (engineInertia + reflectedInertia)
+	local syncTorque = self.slip * combinedInertia / math.max(dt, 1 / 480)
+
+	local torque = math.clamp(syncTorque, -capacity, capacity)
+
+	self.lastTorque = torque
+	return torque
+end
+
+function Clutch:GetSlip()
+	return self.slip
+end
+
+local Gearbox = {}
+Gearbox.__index = Gearbox
+
+function Gearbox.new(config)
+	local self = setmetatable({}, Gearbox)
+	self.gears = config.gears
+	self.finalDrive = config.finalDrive or 3.9
+	self.efficiency = config.efficiency or 0.94
+	self.shiftTime = config.shiftTime or 0.18
+	self.currentGear = 0
+	self.pendingGear = 0
+	self.shifting = false
+	self.shiftTimer = 0
+	return self
+end
+
+function Gearbox:GetGear()
+	return self.currentGear
+end
+
+function Gearbox:GetRatio(gear)
+	return self.gears[gear or self.currentGear] or 0
+end
+
+function Gearbox:IsShifting()
+	return self.shifting
+end
+
+function Gearbox:RequestShift(gear)
+	if self.gears[gear] == nil or self.shifting or gear == self.currentGear then
+		return false
+	end
+	self.pendingGear = gear
+	self.shifting = true
+	self.shiftTimer = self.shiftTime
+	return true
+end
+
+function Gearbox:Update(dt)
+	if self.shifting then
+		self.shiftTimer -= dt
+		if self.shiftTimer <= 0 then
+			self.currentGear = self.pendingGear
+			self.shifting = false
+		end
+	end
+end
+
+function Gearbox:GetOutputTorque(inputTorque)
+	if self.shifting then
+		return 0
+	end
+	return inputTorque * self:GetRatio() * self.finalDrive * self.efficiency
+end
+
+function Gearbox:GetTotalRatio()
+	return self:GetRatio() * self.finalDrive
+end
+
+function Gearbox:RequiredInputOmega(driveshaftOmega)
+	local totalRatio = self:GetTotalRatio()
+	if totalRatio == 0 then
+		return 0
+	end
+	return driveshaftOmega * totalRatio
+end
+
+local Diff = {}
+Diff.__index = Diff
+
+function Diff.new(config)
+	local self = setmetatable({}, Diff)
+	self.type = (config.type or "OPEN"):upper()
+	self.preload = config.preload or 15
+	self.powerLock = config.powerLock or 0.35
+	self.coastLock = config.coastLock or 0.15
+	self.maxBias = config.maxBias or 3
+	return self
+end
+
+function Diff:Distribute(dt, inputTorque, omegaA, omegaB, inertiaA, inertiaB)
+	local half = inputTorque * 0.5
+
+	if self.type == "OPEN" then
+		return half, half
+	end
+
+	local omegaDiff = omegaA - omegaB
+	local biasCap = math.abs(inputTorque) * (self.maxBias - 1) * 0.5
+
+	if self.type == "LOCKED" or self.type == "WELDED" then
+		local Ia = math.max(inertiaA or 1, 0.01)
+		local Ib = math.max(inertiaB or 1, 0.01)
+		local combinedInertia = (Ia * Ib) / (Ia + Ib)
+		local syncTorque = omegaDiff * combinedInertia / math.max(dt, 1 / 480)
+		local lockTorque = math.clamp(syncTorque, -biasCap, biasCap)
+		return half - lockTorque, half + lockTorque
+	end
+
+	if self.type == "LIMITED" or self.type == "TORSEN" or self.type == "CLUTCH_LSD" then
+		local underPower = inputTorque >= 0
+		local lockFraction = underPower and self.powerLock or self.coastLock
+		local speedTerm = math.clamp(omegaDiff * 6, -1, 1)
+		local biasTorque = (math.abs(inputTorque) * lockFraction + self.preload) * speedTerm
+		biasTorque = math.clamp(biasTorque, -biasCap, biasCap)
+		return half - biasTorque, half + biasTorque
+	end
+
+	return half, half
+end
+
+local WheelPhysics = {}
+WheelPhysics.__index = WheelPhysics
+
+function WheelPhysics.new(config)
+	local self = setmetatable({}, WheelPhysics)
+	self.inertia = config.inertia or 1.1
+	self.radius = config.radius or 0.32
+	self.rollingResistanceCoefficient = config.rollingResistanceCoefficient or 0.015
+	self.omega = 0
+	return self
+end
+
+function WheelPhysics:Update(dt, driveTorque, brakeTorque, tireForceNewtons, tireStiffness, normalLoadNewtons, grounded)
+	dt = math.max(dt, 1 / 480)
+	driveTorque = driveTorque or 0
+	brakeTorque = math.max(brakeTorque or 0, 0)
+
+	local reactionTorqueAtCurrentOmega = grounded and (tireForceNewtons * self.radius) or 0
+
+	local reactionDampingNmPerOmega = 0
+	if grounded and tireStiffness and tireStiffness > 0 then
+		local dForceDOmega = tireStiffness * self.radius * Units.MetersToStuds
+		reactionDampingNmPerOmega = dForceDOmega * self.radius
+	end
+
+	local rollingResistanceTorque = 0
+	if grounded and math.abs(self.omega) > 0.01 then
+		local sign = self.omega > 0 and 1 or -1
+		rollingResistanceTorque = self.rollingResistanceCoefficient * normalLoadNewtons * self.radius * sign
+	end
+
+	local netOtherTorque = driveTorque - reactionTorqueAtCurrentOmega - rollingResistanceTorque
+	local denom = self.inertia / dt + reactionDampingNmPerOmega
+
+	if brakeTorque > 0.01 then
+		local requiredHoldTorque = -(netOtherTorque + self.omega * denom)
+		if math.abs(requiredHoldTorque) <= brakeTorque then
+			self.omega = 0
+			return self.omega
+		end
+
+		local sign = requiredHoldTorque >= 0 and 1 or -1
+		netOtherTorque += sign * brakeTorque
+	end
+
+	self.omega += netOtherTorque / denom
+
+	return self.omega
+end
+
+function WheelPhysics:GetSurfaceSpeed()
+	return self.omega * self.radius
+end
+
+function WheelPhysics:GetRPM()
+	return Units.RadPerSecToRPM(self.omega)
+end
+
+local function aeroDragForce(speedMps, aero)
+	return 0.5 * aero.rho * aero.Cd * aero.area * speedMps * math.abs(speedMps)
+end
+
+local TireContact = {}
+
+local SAMPLE_RADII = { 0.1, 0.2, 0.3, 0.4 }
+local DIAGONAL = math.sqrt(0.5)
+local SAMPLE_OFFSETS = {}
+local smoothedLoad = { FR = 0, FL = 0, RR = 0, RL = 0 }
+local tireLoad = { FR = 0, FL = 0, RR = 0, RL = 0 }
+local tireSlipLag = { FR = {x=0,y=0}, FL = {x=0,y=0}, RR = {x=0,y=0}, RL = {x=0,y=0} }
+
+for _, radius in ipairs(SAMPLE_RADII) do
+	table.insert(SAMPLE_OFFSETS, { radius, 0 })
+	table.insert(SAMPLE_OFFSETS, { -radius, 0 })
+	table.insert(SAMPLE_OFFSETS, { 0, radius })
+	table.insert(SAMPLE_OFFSETS, { 0, -radius })
+end
+
+for _, radius in ipairs(SAMPLE_RADII) do
+	local diagonal = radius * DIAGONAL
+	table.insert(SAMPLE_OFFSETS, { diagonal, diagonal })
+	table.insert(SAMPLE_OFFSETS, { diagonal, -diagonal })
+	table.insert(SAMPLE_OFFSETS, { -diagonal, diagonal })
+	table.insert(SAMPLE_OFFSETS, { -diagonal, -diagonal })
+end
+
+local function findContactPoint(tire, origin, rayLength, raycastParams)
+	local cframe = tire.CFrame
+	local right = cframe.RightVector
+	local forward = cframe.LookVector
+	local direction = -cframe.UpVector * rayLength
+
+	local hitPoints = {}
+	local normals = {}
+	local materialCounts = {}
+	local hitCount = 0
+
+	local function cast(rayOrigin)
+		local result = workspace:Raycast(rayOrigin, direction, raycastParams)
+		if result then
+			hitCount += 1
+			hitPoints[hitCount] = result.Position
+			normals[hitCount] = result.Normal
+			materialCounts[result.Material] = (materialCounts[result.Material] or 0) + 1
+		end
+	end
+
+	cast(origin)
+	for _, offset in ipairs(SAMPLE_OFFSETS) do
+		cast(origin + right * offset[1] + forward * offset[2])
+	end
+
+	if hitCount == 0 then
+		return nil
+	end
+
+	local highestY = -math.huge
+	for i = 1, hitCount do
+		highestY = math.max(highestY, hitPoints[i].Y)
+	end
+
+	local positionSum = Vector3.zero
+	local normalSum = Vector3.zero
+	local keptCount = 0
+
+	for i = 1, hitCount do
+		if highestY - hitPoints[i].Y <= 0.05 then
+			positionSum += hitPoints[i]
+			normalSum += normals[i]
+			keptCount += 1
+		end
+	end
+
+	local averageNormal = if normalSum.Magnitude > 1e-6 then normalSum.Unit else Vector3.yAxis
+
+	local commonMaterial
+	local highestCount = 0
+	for material, count in pairs(materialCounts) do
+		if count > highestCount then
+			commonMaterial = material
+			highestCount = count
+		end
+	end
+
+	return positionSum / keptCount, averageNormal, commonMaterial
+end
+
+function TireContact.Update(car, wheel, raycastParams)
+	local springStrength = car:GetAttribute("psi") * 300
+	local damper = car:GetAttribute("damper")
+	local tireStart = car:GetAttribute("tirestart")
+	local tireEnd = car:GetAttribute("tireend")
+	local contactRadius = tireEnd + 0.35 - tireStart
+
+	local tire = wheel.Bounds
+	local up = tire.CFrame.UpVector
+
+	local startPosition = tire.Position - up * tireStart
+	tire.TIRESTART.WorldPosition = startPosition
+	tire.TIREEND.WorldPosition = tire.Position - up * tireEnd
+
+	local tireForce = tire.TireForce
+	local frictionForce = tire.FrictionForce
+
+	local contactPosition, groundNormal, groundMaterial = findContactPoint(tire, startPosition, contactRadius, raycastParams)
+
+	if not contactPosition then
+		tireForce.Force = Vector3.zero
+		frictionForce.Force = Vector3.zero
+		return nil
+	end
+
+	tire.ForceAtt.WorldPosition = contactPosition
+
+	local suspensionLength = (startPosition - contactPosition):Dot(up)
+	local compression = suspensionLength - contactRadius
+
+	local springForce = -springStrength * compression
+	local suspensionVelocity = tire.AssemblyLinearVelocity:Dot(up)
+	local damperForce = -damper * suspensionVelocity
+
+	local normalForce = springForce + damperForce
+	tireForce.Force = groundNormal * normalForce
+
+	return {
+		folder = wheel,
+		tire = tire,
+		CPos = contactPosition,
+		car = car,
+		grM = groundMaterial,
+		normalLoadRoblox = math.max(normalForce, 0),
+	}
+end
+
+local Grip = {}
+
+local MU_LOOKUP = {
+	[Enum.Material.Asphalt] = 1.3, [Enum.Material.Concrete] = 1.3, [Enum.Material.Pavement] = 1.1,
+	[Enum.Material.Grass] = 0.7, [Enum.Material.Mud] = 0.25, [Enum.Material.Sand] = 0.4,
+	[Enum.Material.Snow] = 0.2, [Enum.Material.Ice] = 0.08, [Enum.Material.Ground] = 1.0,
+	[Enum.Material.Rock] = 0.9, [Enum.Material.Salt] = 0.7, [Enum.Material.Basalt] = 0.95,
+	[Enum.Material.LeafyGrass] = 0.35, [Enum.Material.CrackedLava] = 0.15, [Enum.Material.Glacier] = 0.1,
+	[Enum.Material.Plastic] = 0.7, [Enum.Material.SmoothPlastic] = 0.6, [Enum.Material.Granite] = 0.95,
+	[Enum.Material.Slate] = 0.9, [Enum.Material.Wood] = 0.6, [Enum.Material.WoodPlanks] = 0.65,
+	[Enum.Material.CorrodedMetal] = 0.9, [Enum.Material.DiamondPlate] = 1.0, [Enum.Material.Metal] = 0.65,
+	[Enum.Material.Foil] = 0.15, [Enum.Material.Marble] = 0.45, [Enum.Material.Glass] = 0.05,
+	[Enum.Material.Pebble] = 0.5, [Enum.Material.Fabric] = 0.7, [Enum.Material.Neon] = 0.3,
+	[Enum.Material.ForceField] = 0.0,
+}
+
+local LONGITUDINAL = {
+	Fz0 = 3000,          
+	muLoadSensitivity = 0.15,    
+	stiffnessPerNewton = 12.5,  
+	stiffnessLoadSensitivity = 0.25,
+	C = 1.7,
+	E = -0.1,                     
+	relaxationLength = 0.35,    
+	maxSlip = 1.0,
+}
+
+local LATERAL = {
+	Fz0 = 3000,
+	muLoadSensitivity = 0.22,    
+	stiffnessPerNewton = 10.0,
+	stiffnessLoadSensitivity = 0.30,
+	C = 1.38,
+	E = -0.35,                   
+	relaxationLength = 0.6,
+	maxSlip = math.rad(32),
+}
+
+local LOW_SPEED_REFERENCE = 2.5
+local STATIONARY_THRESHOLD = 0.75
+local STATIC_DAMPING = 220
+local SLIP_SMOKE_START = 0.35
+
+local function pacejkaCoeffs(axis, roadMu, Fz)
+	local loadRatio = Fz / axis.Fz0
+
+	local mu = roadMu * (1 - axis.muLoadSensitivity * (loadRatio - 1))
+	local D = math.max(mu, 0) * Fz
+
+	local stiffnessPerNewton = axis.stiffnessPerNewton * (1 - axis.stiffnessLoadSensitivity * (loadRatio - 1))
+	local BCD = math.max(stiffnessPerNewton, 0) * Fz
+
+	local C = axis.C
+	local B = BCD / math.max(C * D, 1e-6)
+
+	return B, C, D, axis.E
+end
+
+local function pacejkaForce(slip, axis, B, C, D, E)
+	local clampedSlip = math.clamp(slip, -axis.maxSlip, axis.maxSlip)
+	local Bx = B * clampedSlip
+	return D * math.sin(C * math.atan(Bx - E * (Bx - math.atan(Bx))))
+end
+
+local RELAX_FLOOR_MPS = 0.6 
+
+local function relaxedSlip(lagState, key, targetSlip, speedMps, relaxationLength, dt)
+	local rate = math.max(math.abs(speedMps), RELAX_FLOOR_MPS) / relaxationLength
+	lagState[key] = smoothTo(lagState[key] or 0, targetSlip, rate, dt)
+	return lagState[key]
+end
+
+local function tireCurve(slip, params)
+	local clampedSlip = math.clamp(slip, -params.maxSlip, params.maxSlip)
+	local bx = params.B * clampedSlip
+	return math.sin(params.C * math.atan(bx - params.E * (bx - math.atan(bx))))
+end
+
+function Grip.Update(tireInfo, surfaceSpeedStuds, smoothedLoad, dt, axleLoadDeltaNewtons)
+	local tire = tireInfo.tire
+	local car = tireInfo.car
+	local folder = tireInfo.folder
+	local contactPosition = tireInfo.CPos
+	local groundMaterial = tireInfo.grM
+
+	local forwardDir = tire.CFrame.LookVector
+	forwardDir = Vector3.new(forwardDir.X, 0, forwardDir.Z).Unit
+	local rightDir = tire.CFrame.RightVector
+	rightDir = Vector3.new(rightDir.X, 0, rightDir.Z).Unit
+
+	local staticLoadNewtons = ((car.Mass.AssemblyMass) * workspace.Gravity / Units.ForceScale) / 4
+	local targetLoadNewtons = math.max(staticLoadNewtons + (axleLoadDeltaNewtons or 0), 0)
+
+	local wheelName = folder.Name
+	smoothedLoad[wheelName] = smoothTo(smoothedLoad[wheelName], targetLoadNewtons, 12, dt)
+	local verticalLoadNewtons = smoothedLoad[wheelName]
+
+	local roadMu = MU_LOOKUP[groundMaterial] or 0.6
+
+	local contactOffset = contactPosition - tire.Position
+	local velocityAtContact = tire.AssemblyLinearVelocity + tire.AssemblyAngularVelocity:Cross(contactOffset)
+
+	local longitudinalVelStuds = velocityAtContact:Dot(forwardDir)
+	local lateralVelStuds = velocityAtContact:Dot(rightDir)
+
+	local referenceSpeed = math.max(
+		math.abs(longitudinalVelStuds),
+		math.abs(surfaceSpeedStuds),
+		LOW_SPEED_REFERENCE
+	)
+
+	local slipRatio = (surfaceSpeedStuds - longitudinalVelStuds) / referenceSpeed
+	local slipAngle = math.atan2(
+		lateralVelStuds,
+		math.max(math.abs(longitudinalVelStuds), LOW_SPEED_REFERENCE)
+	)
+
+	slipRatio = math.clamp(slipRatio, -LONGITUDINAL.maxSlip, LONGITUDINAL.maxSlip)
+	slipAngle = math.clamp(slipAngle, -LATERAL.maxSlip, LATERAL.maxSlip)
+
+	local isStationary = math.abs(longitudinalVelStuds) < STATIONARY_THRESHOLD
+		and math.abs(surfaceSpeedStuds) < STATIONARY_THRESHOLD
+		and math.abs(lateralVelStuds) < STATIONARY_THRESHOLD
+
+	local longitudinalSpeedMps = Units.StudsPerSecToMps(longitudinalVelStuds)
+
+	local Bx, Cx, Dx, Ex = pacejkaCoeffs(LONGITUDINAL, roadMu, verticalLoadNewtons)
+	local By, Cy, Dy, Ey = pacejkaCoeffs(LATERAL, roadMu, verticalLoadNewtons)
+
+	if Dx <= 0 or Dy <= 0 then
+		tire.FrictionForce.Force = Vector3.zero
+		return 0, 0, 0
+	end
+
+	local frictionForceNewtons
+
+	if isStationary then
+		local driveSlip = math.clamp(surfaceSpeedStuds / LOW_SPEED_REFERENCE, -1, 1)
+
+		local driveFx = pacejkaForce(driveSlip, LONGITUDINAL, Bx, Cx, Dx, Ex)
+		local holdFx = -longitudinalVelStuds * roadMu * STATIC_DAMPING
+		local holdFy = -lateralVelStuds * roadMu * STATIC_DAMPING
+
+		local totalFx = driveFx + holdFx
+		local totalFy = holdFy
+
+		local ellipse = math.sqrt((totalFx / Dx)^2 + (totalFy / Dy)^2)
+		if ellipse > 1 then
+			totalFx /= ellipse
+			totalFy /= ellipse
+		end
+
+		frictionForceNewtons = forwardDir * totalFx + rightDir * totalFy
+	else
+		tireSlipLag[wheelName] = tireSlipLag[wheelName] or { x = 0, y = 0 }
+
+		local lagX = relaxedSlip(
+			tireSlipLag[wheelName],
+			"x",
+			slipRatio,
+			longitudinalSpeedMps,
+			LONGITUDINAL.relaxationLength,
+			dt
+		)
+
+		local lagY = relaxedSlip(
+			tireSlipLag[wheelName],
+			"y",
+			slipAngle,
+			longitudinalSpeedMps,
+			LATERAL.relaxationLength,
+			dt
+		)
+
+		local Fx = pacejkaForce(lagX, LONGITUDINAL, Bx, Cx, Dx, Ex)
+		local Fy = pacejkaForce(lagY, LATERAL, By, Cy, Dy, Ey)
+
+		local ellipse = math.sqrt((Fx / Dx)^2 + (Fy / Dy)^2)
+		if ellipse > 1 then
+			Fx /= ellipse
+			Fy /= ellipse
+		end
+
+		frictionForceNewtons = forwardDir * Fx - rightDir * Fy
+	end
+
+	tire.FrictionForce.Force = frictionForceNewtons * Units.ForceScale
+
+	local normalizedSlipAngle = math.abs(slipAngle) / LATERAL.maxSlip
+	local totalSlip = math.sqrt(slipRatio * slipRatio + normalizedSlipAngle * normalizedSlipAngle)
+
+	local forceAttachment = tire:FindFirstChild("ForceAtt")
+	if forceAttachment then
+		local smoke = forceAttachment:FindFirstChild("TireSmoke")
+		local skid = forceAttachment:FindFirstChild("Skid")
+		local slipping = totalSlip > SLIP_SMOKE_START and tire.AssemblyLinearVelocity.Magnitude > 1
+
+		if smoke then
+			smoke.Rate = slipping and (50 * math.min(totalSlip, 2)) or 0
+		end
+
+		if skid then
+			skid.Volume = slipping and (0.5 * totalSlip) or 0
+			skid.PlaybackSpeed = slipping and (0.85 + 0.4 * totalSlip) or 0
+		end
+	end
+
+	car:SetAttribute(wheelName .. "totalSlip", totalSlip)
+
+	local stiffnessReference = isStationary and LOW_SPEED_REFERENCE or referenceSpeed
+	local longitudinalStiffness = Dx * (Bx * Cx) / math.max(stiffnessReference, 0.01)
+
+	local forwardForceNewtons = frictionForceNewtons:Dot(forwardDir)
+
+	return forwardForceNewtons, verticalLoadNewtons, longitudinalStiffness
+end
+
+local RenameTable = {
+	["ForceAtt"] = { "ForceAtt_2", "ForceAtt_3", "ForceAtt_4" },
+	["SteerSlide"] = { "SteerSlide_2" },
+	["TIREEND"] = { "TIREEND_2", "TIREEND_3", "TIREEND_4" },
+	["TIRESTART"] = { "TIRESTART_2", "TIRESTART_3", "TIRESTART_4" },
+	["SpinAtt"] = { "SpinAtt_2", "SpinAtt_3", "SpinAtt_4" },
+}
+
+local function RenameClones(parent)
+	for originalName, clones in pairs(RenameTable) do
+		for _, cloneName in ipairs(clones) do
+			local child = parent:FindFirstChild(cloneName, true)
+			if child then
+				child.Name = originalName
+			end
+		end
+	end
+end
+
+local function validateCar(car)
+	for _, name in ipairs(REQUIRED_CHILDREN) do
+		if not car:FindFirstChild(name) then
+			warn(string.format("CarController: %s is missing '%s'", car:GetFullName(), name))
+			return nil
+		end
+	end
+
+	for _, name in ipairs(REQUIRED_ATTRIBUTES) do
+		if typeof(car:GetAttribute(name)) ~= "number" then
+			warn(string.format("CarController: %s is missing numeric attribute '%s'", car:GetFullName(), name))
+			return nil
+		end
+	end
+
+	RenameClones(car)
+
+	local mass = car.Mass
+	local primary = car.Primary
+
+	if not (mass:IsA("BasePart") and primary:IsA("BasePart")) then
+		warn(string.format("CarController: %s has Mass or Primary of the wrong type", car:GetFullName()))
+		return nil
+	end
+
+	local driverMass = car:FindFirstChild("DriverMass")
+	if driverMass and not driverMass:IsA("BasePart") then
+		driverMass = nil
+	end
+
+	local drag = mass:FindFirstChild("Drag")
+	if drag and not drag:IsA("VectorForce") then
+		drag = nil
+	end
+
+	local steerSlide = primary:FindFirstChild("SteerSlide")
+	if steerSlide and not steerSlide:IsA("Attachment") then
+		steerSlide = nil
+	end
+
+	return {
+		wheels = car.Wheels,
+		mass = mass,
+		primary = primary,
+		throttleValue = car.Throttle,
+		brakeValue = car.Brake,
+		clutchValue = car.Clutch,
+		steerValue = car.Steer,
+		driverMass = driverMass,
+		drag = drag,
+		steerSlide = steerSlide,
+	}
+end
+
+local function toggleCollisions(targetCharacter, enabled, cache)
+	if not targetCharacter then
+		return
+	end
+
+	if enabled then
+		for part, originalValue in pairs(cache) do
+			if part.Parent then
+				part.CanCollide = originalValue
+			end
+		end
+		table.clear(cache)
+	else
+		for _, part in ipairs(targetCharacter:GetDescendants()) do
+			if part:IsA("BasePart") then
+				cache[part] = part.CanCollide
+				part.CanCollide = false
+			end
+		end
+	end
+end
+
+local function findLimbJoint(character, limbName)
+	local torso = character:FindFirstChild("Torso")
+	if not torso then
+		return nil
+	end
+	for _, joint in ipairs(torso:GetChildren()) do
+		if joint:IsA("Motor6D") and joint.Part1 and joint.Part1.Name == limbName then
+			return joint
+		end
+	end
+	return nil
+end
+
+local function findRootJoint(character)
+	local hrp = character:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		return nil
+	end
+	for _, joint in ipairs(hrp:GetChildren()) do
+		if joint:IsA("Motor6D") then
+			return joint
+		end
+	end
+	return nil
+end
+
+local Hud = {}
+
+local function makePedalBar(parent, color, position, size, label)
+	local container = Instance.new("Frame")
+	container.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
+	container.BorderSizePixel = 0
+	container.Position = position
+	container.Size = size
+	container.Parent = parent
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 4)
+	corner.Parent = container
+
+	local fill = Instance.new("Frame")
+	fill.BackgroundColor3 = color
+	fill.BorderSizePixel = 0
+	fill.Size = UDim2.new(0, 0, 1, 0)
+	fill.Parent = container
+
+	local fillCorner = Instance.new("UICorner")
+	fillCorner.CornerRadius = UDim.new(0, 4)
+	fillCorner.Parent = fill
+
+	local caption = Instance.new("TextLabel")
+	caption.BackgroundTransparency = 1
+	caption.Text = label
+	caption.Font = Enum.Font.GothamBold
+	caption.TextColor3 = Color3.fromRGB(200, 200, 206)
+	caption.TextSize = 11
+	caption.TextXAlignment = Enum.TextXAlignment.Left
+	caption.Position = UDim2.new(0, 6, 0, -15)
+	caption.Size = UDim2.new(1, -12, 0, 14)
+	caption.Parent = container
+
+	return fill
+end
+
+function Hud.Build()
+	if Hud.built then
+		return
+	end
+	Hud.built = true
+
+	local player = Players.LocalPlayer
+	local playerGui = player:WaitForChild("PlayerGui")
+
+	local existing = playerGui:FindFirstChild("DrivingHUD")
+	if existing then
+		existing:Destroy()
+	end
+
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "DrivingHUD"
+	screenGui.ResetOnSpawn = false
+	screenGui.IgnoreGuiInset = true
+	screenGui.DisplayOrder = 50
+	screenGui.Enabled = false
+	screenGui.Parent = playerGui
+
+	local root = Instance.new("Frame")
+	root.AnchorPoint = Vector2.new(0.5, 1)
+	root.Position = UDim2.new(0.5, 0, 1, -24)
+	root.Size = UDim2.new(0, 560, 0, 150)
+	root.BackgroundColor3 = Color3.fromRGB(18, 18, 20)
+	root.BackgroundTransparency = 0.12
+	root.BorderSizePixel = 0
+	root.Parent = screenGui
+
+	local rootCorner = Instance.new("UICorner")
+	rootCorner.CornerRadius = UDim.new(0, 10)
+	rootCorner.Parent = root
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(60, 60, 66)
+	stroke.Thickness = 1
+	stroke.Parent = root
+
+	local gearFrame = Instance.new("Frame")
+	gearFrame.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+	gearFrame.Position = UDim2.new(0, 14, 0, 14)
+	gearFrame.Size = UDim2.new(0, 84, 0, 84)
+	gearFrame.Parent = root
+
+	local gearCorner = Instance.new("UICorner")
+	gearCorner.CornerRadius = UDim.new(0, 8)
+	gearCorner.Parent = gearFrame
+
+	local gearLabel = Instance.new("TextLabel")
+	gearLabel.BackgroundTransparency = 1
+	gearLabel.Font = Enum.Font.GothamBlack
+	gearLabel.Text = "N"
+	gearLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	gearLabel.TextSize = 42
+	gearLabel.Size = UDim2.new(1, 0, 1, 0)
+	gearLabel.Parent = gearFrame
+
+	local gearCaption = Instance.new("TextLabel")
+	gearCaption.BackgroundTransparency = 1
+	gearCaption.Font = Enum.Font.GothamBold
+	gearCaption.Text = "GEAR"
+	gearCaption.TextColor3 = Color3.fromRGB(140, 140, 148)
+	gearCaption.TextSize = 12
+	gearCaption.Position = UDim2.new(0, 0, 1, 2)
+	gearCaption.Size = UDim2.new(1, 0, 0, 14)
+	gearCaption.Parent = gearFrame
+
+	local speedLabel = Instance.new("TextLabel")
+	speedLabel.BackgroundTransparency = 1
+	speedLabel.Font = Enum.Font.GothamBlack
+	speedLabel.Text = "0"
+	speedLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	speedLabel.TextSize = 34
+	speedLabel.TextXAlignment = Enum.TextXAlignment.Left
+	speedLabel.Position = UDim2.new(0, 112, 0, 12)
+	speedLabel.Size = UDim2.new(0, 120, 0, 40)
+	speedLabel.Parent = root
+
+	local speedUnit = Instance.new("TextLabel")
+	speedUnit.BackgroundTransparency = 1
+	speedUnit.Font = Enum.Font.GothamBold
+	speedUnit.Text = "km/h"
+	speedUnit.TextColor3 = Color3.fromRGB(140, 140, 148)
+	speedUnit.TextSize = 13
+	speedUnit.TextXAlignment = Enum.TextXAlignment.Left
+	speedUnit.Position = UDim2.new(0, 112, 0, 50)
+	speedUnit.Size = UDim2.new(0, 120, 0, 16)
+	speedUnit.Parent = root
+
+	local rpmContainer = Instance.new("Frame")
+	rpmContainer.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+	rpmContainer.Position = UDim2.new(0, 112, 0, 70)
+	rpmContainer.Size = UDim2.new(0, 434, 0, 16)
+	rpmContainer.Parent = root
+
+	local rpmCorner = Instance.new("UICorner")
+	rpmCorner.CornerRadius = UDim.new(0, 6)
+	rpmCorner.Parent = rpmContainer
+
+	local rpmFill = Instance.new("Frame")
+	rpmFill.BackgroundColor3 = Color3.fromRGB(70, 200, 120)
+	rpmFill.BorderSizePixel = 0
+	rpmFill.Size = UDim2.new(0, 0, 1, 0)
+	rpmFill.Parent = rpmContainer
+
+	local rpmFillCorner = Instance.new("UICorner")
+	rpmFillCorner.CornerRadius = UDim.new(0, 6)
+	rpmFillCorner.Parent = rpmFill
+
+	local rpmGradient = Instance.new("UIGradient")
+	rpmGradient.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(70, 200, 120)),
+		ColorSequenceKeypoint.new(0.7, Color3.fromRGB(240, 200, 60)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(230, 60, 60)),
+	})
+	rpmGradient.Parent = rpmFill
+
+	local redlineMarker = Instance.new("Frame")
+	redlineMarker.BackgroundColor3 = Color3.fromRGB(230, 60, 60)
+	redlineMarker.BorderSizePixel = 0
+	redlineMarker.Size = UDim2.new(0, 2, 1, 0)
+	redlineMarker.ZIndex = 2
+	redlineMarker.Parent = rpmContainer
+
+	local rpmText = Instance.new("TextLabel")
+	rpmText.BackgroundTransparency = 1
+	rpmText.Font = Enum.Font.GothamBold
+	rpmText.Text = "0 RPM"
+	rpmText.TextColor3 = Color3.fromRGB(210, 210, 215)
+	rpmText.TextSize = 12
+	rpmText.TextXAlignment = Enum.TextXAlignment.Right
+	rpmText.Position = UDim2.new(0, 112, 0, 88)
+	rpmText.Size = UDim2.new(0, 434, 0, 14)
+	rpmText.Parent = root
+
+	local throttleFill = makePedalBar(root, Color3.fromRGB(70, 200, 120), UDim2.new(0, 112, 0, 116), UDim2.new(0, 138, 0, 18), "THROTTLE")
+	local brakeFill = makePedalBar(root, Color3.fromRGB(230, 70, 70), UDim2.new(0, 262, 0, 116), UDim2.new(0, 138, 0, 18), "BRAKE")
+	local clutchFill = makePedalBar(root, Color3.fromRGB(80, 150, 230), UDim2.new(0, 412, 0, 116), UDim2.new(0, 134, 0, 18), "CLUTCH")
+
+	local handbrakeLabel = Instance.new("TextLabel")
+	handbrakeLabel.BackgroundTransparency = 1
+	handbrakeLabel.Font = Enum.Font.GothamBlack
+	handbrakeLabel.Text = "HANDBRAKE"
+	handbrakeLabel.TextColor3 = Color3.fromRGB(230, 70, 70)
+	handbrakeLabel.TextSize = 14
+	handbrakeLabel.TextXAlignment = Enum.TextXAlignment.Right
+	handbrakeLabel.Position = UDim2.new(0, 112, 0, -20)
+	handbrakeLabel.Size = UDim2.new(0, 434, 0, 18)
+	handbrakeLabel.Visible = false
+	handbrakeLabel.Parent = root
+
+	Hud.screenGui = screenGui
+	Hud.gearLabel = gearLabel
+	Hud.speedLabel = speedLabel
+	Hud.rpmFill = rpmFill
+	Hud.rpmText = rpmText
+	Hud.redlineMarker = redlineMarker
+	Hud.throttleFill = throttleFill
+	Hud.brakeFill = brakeFill
+	Hud.clutchFill = clutchFill
+	Hud.handbrakeLabel = handbrakeLabel
+end
+
+function Hud.SetVisible(visible)
+	Hud.Build()
+	Hud.screenGui.Enabled = visible
+end
+
+function Hud.Update(state)
+	if not Hud.built then
+		return
+	end
+
+	Hud.gearLabel.Text = if state.gear < 0 then "R" elseif state.gear == 0 then "N" else tostring(state.gear)
+	Hud.speedLabel.Text = string.format("%d", math.floor(state.speedKmh + 0.5))
+
+	local rpmAlpha = math.clamp(state.rpm / state.redlineRpm, 0, 1)
+	Hud.rpmFill.Size = UDim2.new(rpmAlpha, 0, 1, 0)
+	Hud.rpmText.Text = string.format("%d RPM", math.floor(state.rpm + 0.5))
+
+	local redlineAlpha = math.clamp(state.redlineWarnRpm / state.redlineRpm, 0, 1)
+	Hud.redlineMarker.Position = UDim2.new(redlineAlpha, 0, 0, 0)
+
+	Hud.throttleFill.Size = UDim2.new(math.clamp(state.throttle, 0, 1), 0, 1, 0)
+	Hud.brakeFill.Size = UDim2.new(math.clamp(state.brake, 0, 1), 0, 1, 0)
+	Hud.clutchFill.Size = UDim2.new(math.clamp(state.clutch, 0, 1), 0, 1, 0)
+	Hud.handbrakeLabel.Visible = state.handbrake == true
+end
+
+local handledCars = setmetatable({}, { __mode = "k" })
+local CarController = {}
+
+function CarController:HandleCar(car)
+	if typeof(car) ~= "Instance" or not car:IsA("Model") then
+		warn("CarController:HandleCar expects a car Model")
+		return
+	end
+	if handledCars[car] then
+		return
+	end
+
+	local player = Players.LocalPlayer
+	if not player then
+		warn("CarController:HandleCar must be called from a client script")
+		return
+	end
+
+	local parts = validateCar(car)
+	if not parts then
+		return
+	end
+	handledCars[car] = true
+
+	local wheels = parts.wheels
+	local mass = parts.mass
+	local primary = parts.primary
+	local throttleValue = parts.throttleValue
+	local brakeValue = parts.brakeValue
+	local clutchValue = parts.clutchValue
+	local steerValue = parts.steerValue
+	local driverMass = parts.driverMass
+	local drag = parts.drag
+	local steerSlide = parts.steerSlide
+
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Include
+	raycastParams.FilterDescendantsInstances = { workspace.Map, workspace.Built }
+
+	local stats = _G.ReturnStats(car, mass)
+	local massKg = stats.massKg or Units.RobloxForceToNewtons(mass.AssemblyMass)
+	print(stats.wheelRadiusMeters.. "m")
+	print(car.Mass.AssemblyMass.. " Mass")
+
+	local engine = Engine.new(stats.engine)
+	local clutch = Clutch.new(stats.clutch)
+	local transmission = Gearbox.new(stats.transmission)
+	local axleDiff = Diff.new(stats.transmission.differential)
+	local centerDiff
+	if stats.transmission.type == "AWD" then
+		centerDiff = Diff.new({ type = stats.transmission.awd.centerDiff or "LIMITED" })
+	end
+
+	local wheelUnits = {}
+	for _, name in ipairs({ "FR", "FL", "RR", "RL" }) do
+		wheelUnits[name] = WheelPhysics.new({
+			inertia = stats.wheelInertia,
+			radius = stats.wheelRadiusMeters,
+			rollingResistanceCoefficient = stats.aero.rollingResistance,
+		})
+	end
+
+	local drivenWheels = {}
+	if stats.transmission.type == "FWD" then
+		drivenWheels = { FL = true, FR = true }
+	elseif stats.transmission.type == "RWD" then
+		drivenWheels = { RL = true, RR = true }
+	elseif stats.transmission.type == "AWD" then
+		drivenWheels = { FL = true, FR = true, RL = true, RR = true }
+	end
+
+	local alive = true
+	local driving = false
+	local enteredAt = 0
+	local entryCFrame = mass.CFrame
+
+	local replicationActive = false
+	local replicationLimbs = {}
+	local replicationJoints = {}
+	local replicationRoot = nil
+	local mouseSteer = false
+	local handbrakeEngaged = false
+
+	local camera = workspace.CurrentCamera
+	local cameraActive = false
+	local cameraBindName = "OrbitCamera_" .. tostring(car)
+	local cameraOrbitAlpha = 0
+	local cameraOrbitBeta = 0.32
+	local cameraDistance = 20
+	local cameraRightMouseDown = false
+	local cameraPreviousVelocity = Vector3.zero
+	local cameraCurrentFov = camera.FieldOfView
+	local cameraSmoothPosition = nil
+	local cameraSmoothFocus = nil
+	local cameraSmoothAccel = 0
+	local cameraShakeSeed = math.random(0, 10000)
+
+	local character, humanoid, rootPart, diedConnection
+	local connections = {}
+	local activeTweens = {}
+	local collisionCache = {}
+
+	local handbrakeValue = Instance.new("NumberValue")
+	handbrakeValue.Value = 0
+
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = "EnterCarPrompt"
+	prompt.ActionText = CONFIG.PromptActionText
+	prompt.ObjectText = car.Name
+	prompt.KeyboardKeyCode = CONFIG.EnterKey
+	prompt.GamepadKeyCode = CONFIG.EnterGamepadKey
+	prompt.HoldDuration = 0
+	prompt.MaxActivationDistance = CONFIG.PromptDistance
+	prompt.RequiresLineOfSight = false
+	prompt.Enabled = false
+	prompt.Parent = driverMass or mass
+
+	local function track(connection)
+		table.insert(connections, connection)
+		return connection
+	end
+
+	local function tweenValue(value, target, duration)
+		local previous = activeTweens[value]
+		if previous then
+			previous:Cancel()
+		end
+		local tween = TweenService:Create(value, TweenInfo.new(duration), { Value = target })
+		activeTweens[value] = tween
+		tween:Play()
+	end
+
+	local function releaseControls(parked)
+		for value, tween in activeTweens do
+			tween:Cancel()
+			activeTweens[value] = nil
+		end
+		throttleValue.Value = 0
+		clutchValue.Value = 0
+		brakeValue.Value = if parked then 1 else 0
+		if parked then
+			handbrakeEngaged = true
+			handbrakeValue.Value = 1
+		end
+	end
+
+	local function computeExitCFrame()
+		if not (car:IsDescendantOf(workspace) and mass:IsDescendantOf(car)) then
+			return entryCFrame
+		end
+
+		local massCFrame = mass.CFrame
+		local side = -1
+		if driverMass then
+			side = if massCFrame:PointToObjectSpace(driverMass.Position).X < 0 then -1 else 1
+		end
+
+		local halfWidth = car:GetExtentsSize().X * 0.5
+		local rightVector = flatten(massCFrame.RightVector, Vector3.xAxis)
+		local lookVector = flatten(massCFrame.LookVector, -Vector3.zAxis)
+
+		local position = massCFrame.Position
+			+ rightVector * side * (halfWidth + CONFIG.ExitSideClearance)
+			+ Vector3.yAxis * CONFIG.ExitHeight
+
+		return CFrame.lookAt(position, position + lookVector)
+	end
+
+	local function startCamera()
+		if cameraActive then
+			return
+		end
+		cameraActive = true
+		cameraPreviousVelocity = mass.AssemblyLinearVelocity
+		cameraCurrentFov = camera.FieldOfView
+		cameraSmoothPosition = nil
+		cameraSmoothFocus = nil
+		camera.CameraType = Enum.CameraType.Scriptable
+
+		RunService:BindToRenderStep(cameraBindName, Enum.RenderPriority.Camera.Value + 1, function(dt)
+			if not (car:IsDescendantOf(workspace) and mass.Parent) then
+				cameraActive = false
+				RunService:UnbindFromRenderStep(cameraBindName)
+				return
+			end
+
+			if not cameraRightMouseDown then
+				local lookVector = mass.CFrame.LookVector
+				local flatLook = Vector3.new(lookVector.X, 0, lookVector.Z)
+				if flatLook.Magnitude > 0.02 then
+					local targetAlpha = math.atan2(-flatLook.X, -flatLook.Z)
+					local diff = math.atan2(math.sin(targetAlpha - cameraOrbitAlpha), math.cos(targetAlpha - cameraOrbitAlpha))
+					cameraOrbitAlpha += diff * (1 - math.exp(-1.4 * dt))
+				end
+			end
+
+			local velocity = mass.AssemblyLinearVelocity
+			local rawAccel = (velocity - cameraPreviousVelocity) / math.max(dt, 1 / 240)
+			cameraPreviousVelocity = velocity
+
+			local rawForwardAccel = math.clamp(rawAccel:Dot(mass.CFrame.LookVector), -60, 60)
+			cameraSmoothAccel += (rawForwardAccel - cameraSmoothAccel) * (1 - math.exp(-3 * dt))
+			local forwardAccel = cameraSmoothAccel
+
+			local speedKmh = velocity.Magnitude * Units.StudsToMeters * 3.6
+
+			local slip = (car:GetAttribute("FRtotalSlip") or 0)
+				+ (car:GetAttribute("FLtotalSlip") or 0)
+				+ (car:GetAttribute("RRtotalSlip") or 0)
+				+ (car:GetAttribute("RLtotalSlip") or 0)
+
+			local targetFov = 68 + math.clamp(speedKmh / 260, 0, 1) * 10 + math.clamp(forwardAccel / 35, 0, 1) * 4
+			cameraCurrentFov += (targetFov - cameraCurrentFov) * (1 - math.exp(-3 * dt))
+			camera.FieldOfView = cameraCurrentFov
+
+			local dynamicDistance = cameraDistance + math.clamp(speedKmh / 300, 0, 1) * 6
+			local focus = mass.Position + Vector3.new(0, 2.6, 0)
+			local orbitCFrame = CFrame.new(focus) * CFrame.Angles(0, cameraOrbitAlpha, 0) * CFrame.Angles(cameraOrbitBeta, 0, 0)
+			local desiredPosition = orbitCFrame * CFrame.new(0, 0, dynamicDistance)
+
+			local pullback = math.clamp(-forwardAccel / 30, -1, 1) * 1.2
+			desiredPosition += orbitCFrame.LookVector * pullback
+
+			local shakeInput = math.max(math.clamp(slip, 0, 4) - 1.2, 0)
+			local shakeMagnitude = math.clamp(shakeInput * 0.25, 0, 1) * 0.12
+			local t = os.clock()
+			local shakeOffset = camera.CFrame.RightVector * math.noise(t * 7, cameraShakeSeed) * shakeMagnitude
+				+ camera.CFrame.UpVector * math.noise(t * 8, cameraShakeSeed + 40) * shakeMagnitude
+
+			cameraSmoothPosition = cameraSmoothPosition or desiredPosition.Position
+			cameraSmoothFocus = cameraSmoothFocus or focus
+
+			cameraSmoothPosition = cameraSmoothPosition:Lerp(desiredPosition.Position, 1 - math.exp(-6 * dt))
+			cameraSmoothFocus = cameraSmoothFocus:Lerp(focus, 1 - math.exp(-8 * dt))
+
+			camera.CFrame = CFrame.lookAt(cameraSmoothPosition + shakeOffset, cameraSmoothFocus)
+		end)
+	end
+
+	local function stopCamera()
+		if not cameraActive then
+			return
+		end
+		cameraActive = false
+		RunService:UnbindFromRenderStep(cameraBindName)
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		if camera and camera.Parent then
+			camera.CameraType = Enum.CameraType.Custom
+			camera.FieldOfView = 70
+		end
+	end
+
+	local idleSnd, revSnd, whineSnd
+	local idleOk, revOk, whineOk = false, false, false
+	local sndWarned = {}
+
+	local aRpm = engine:GetRPM()
+	local aThr = 0
+	local aLoad = 0
+	local aWhineSpd = 0
+	local idleVol, revVol, whineVol = 0, 0, 0
+	local prevSpd = 0
+	local prevStepSpeedMps = 0
+	local prevGear = transmission:GetGear()
+	local shiftTimer = 0
+	local fadeTimer = 0
+	local fadingOut = false
+	local sndStopped = true
+	local frontLoadDeltaPerWheel = 0
+	local rearLoadDeltaPerWheel = 0
+
+	local function warnMissingSnd(layerName)
+		if not sndWarned[layerName] then
+			sndWarned[layerName] = true
+			warn(string.format("CarController: %s is missing or invalid Sound 'Primary.%s' -- that audio layer will be disabled", car:GetFullName(), layerName))
+		end
+	end
+
+	local function initSnd()
+		local idleInst = primary:FindFirstChild("idle")
+		local revInst = primary:FindFirstChild("rev")
+		local whineInst = nil
+
+		if idleInst and idleInst:IsA("Sound") then
+			idleSnd = idleInst
+			idleOk = true
+			idleSnd.Looped = true
+			idleSnd.Volume = 0
+		else
+			warnMissingSnd("Idle")
+		end
+
+		if revInst and revInst:IsA("Sound") then
+			revSnd = revInst
+			revOk = true
+			revSnd.Looped = true
+			revSnd.Volume = 0
+			revSnd.PlaybackSpeed = SND_CFG.Rev.minPlayback
+		else
+			warnMissingSnd("Rev")
+		end
+
+		if whineInst and whineInst:IsA("Sound") then
+			whineSnd = whineInst
+			whineOk = true
+			whineSnd.Looped = true
+			whineSnd.Volume = 0
+			whineSnd.PlaybackSpeed = SND_CFG.Whine.minPlayback
+		else
+			warnMissingSnd("Whine")
+		end
+	end
+
+	local function startSnd()
+		fadingOut = false
+		fadeTimer = 0
+		sndStopped = false
+
+		aRpm = engine:GetRPM()
+		aThr = throttleValue.Value
+		aLoad = 0
+		aWhineSpd = 0
+		prevSpd = 0
+		prevGear = transmission:GetGear()
+		shiftTimer = 0
+
+		if idleOk and not idleSnd.IsPlaying then
+			idleSnd.Volume = 0
+			idleSnd:Play()
+		end
+		if revOk and not revSnd.IsPlaying then
+			revSnd.Volume = 0
+			revSnd:Play()
+		end
+		if whineOk and not whineSnd.IsPlaying then
+			whineSnd.Volume = 0
+			whineSnd:Play()
+		end
+	end
+
+	local function beginFade()
+		if sndStopped then
+			return
+		end
+		fadingOut = true
+		fadeTimer = SND_CFG.FadeOutTime
+	end
+
+	local function stopSndNow()
+		fadingOut = false
+		fadeTimer = 0
+		sndStopped = true
+
+		if idleOk then
+			idleSnd:Stop()
+			idleSnd.Volume = 0
+		end
+		if revOk then
+			revSnd:Stop()
+			revSnd.Volume = 0
+		end
+		if whineOk then
+			whineSnd:Stop()
+			whineSnd.Volume = 0
+		end
+	end
+
+	local function updateSnd(dt, throttle, clutchPedal, currentGear, gearRatio, finalDrive, carSpeedFrontStuds, wheelRadiusMeters)
+		if sndStopped and not driving then
+			return
+		end
+		if not driving and not fadingOut and not sndStopped then
+			beginFade()
+		end
+
+		if currentGear ~= prevGear then
+			shiftTimer = SND_CFG.ShiftReactionTime
+			prevGear = currentGear
+		elseif shiftTimer > 0 then
+			shiftTimer = math.max(0, shiftTimer - dt)
+		end
+
+		local targetRpm = engine:GetRPM()
+		aRpm = smoothTo(aRpm, targetRpm, SND_CFG.Rev.rpmSmoothing, dt)
+		aThr = smoothTo(aThr, math.clamp(throttle, 0, 1), SND_CFG.Throttle.smoothing, dt)
+
+		local couplingFactor = 1 - math.clamp(clutchPedal, 0, 1)
+		local neutralFactor = if currentGear == 0 then 0.3 else 1
+		local rawLoad = math.clamp(throttle, 0, 1) * couplingFactor * neutralFactor
+		aLoad = smoothTo(aLoad, rawLoad, SND_CFG.Load.smoothing, dt)
+
+		local carSpeedFrontMps = Units.StudsPerSecToMps(carSpeedFrontStuds)
+		local cgHeightMeters = stats.cgHeightMeters or stats.defaultCgHeightMeters
+		local wheelbaseMeters = stats.wheelbaseMeters or stats.defaultWheelbaseMeters
+
+		local longitudinalAccelMps2 = (carSpeedFrontMps - prevStepSpeedMps) / math.max(dt, 1 / 240)
+		prevStepSpeedMps = carSpeedFrontMps
+
+		local axleTransferNewtons = (massKg * longitudinalAccelMps2 * cgHeightMeters) / wheelbaseMeters
+
+		frontLoadDeltaPerWheel = -axleTransferNewtons * 0.5
+		rearLoadDeltaPerWheel = axleTransferNewtons * 0.5
+		local wheelAngularSpeed = math.abs(carSpeedFrontMps) / math.max(wheelRadiusMeters, 0.05)
+		local ratioForWhine = if gearRatio ~= 0 then math.abs(gearRatio) else 1
+		local rawDriveSpeed = wheelAngularSpeed * ratioForWhine * finalDrive * SND_CFG.Whine.driveSpeedScale
+		aWhineSpd = smoothTo(aWhineSpd, rawDriveSpeed, SND_CFG.Whine.smoothing, dt)
+
+		local carAccel = (carSpeedFrontStuds - prevSpd) / math.max(dt, 1 / 240)
+		prevSpd = carSpeedFrontStuds
+		local accelFactor = math.clamp(carAccel / 25, -1, 1)
+
+		if not driving then
+			aThr = smoothTo(aThr, 0, SND_CFG.Throttle.smoothing, dt)
+			aLoad = smoothTo(aLoad, 0, SND_CFG.Load.smoothing, dt)
+		end
+
+		local idleCfg = SND_CFG.Idle
+		local idleFadeAlpha = math.clamp((aRpm - idleCfg.minRPM) / math.max(idleCfg.maxRPM - idleCfg.minRPM, 1), 0, 1)
+		local idleTargetVolume = lerp(idleCfg.maxVolume, idleCfg.minVolume, idleFadeAlpha)
+		if not driving then
+			idleTargetVolume = 0
+		end
+		idleVol = smoothTo(idleVol, idleTargetVolume, idleCfg.smoothing, dt)
+
+		local revCfg = SND_CFG.Rev
+		local span = math.max(revCfg.maxRPM - revCfg.minRPM, 1)
+		local t = math.clamp((aRpm - revCfg.minRPM) / span, 0, 1) ^ revCfg.playbackCurve
+		local revPlayback = lerp(revCfg.minPlayback, revCfg.maxPlayback, t)
+		revPlayback *= (1 + math.max(accelFactor, 0) * aLoad * revCfg.accelPlaybackBoost)
+
+		local rpmPresence = math.clamp((aRpm - revCfg.minRPM) / span, 0, 1)
+		local throttleLoadPresence = math.clamp(aThr * 0.45 + aLoad * 0.55, 0, 1)
+		local revTargetVolume = lerp(revCfg.baseVolume, revCfg.maxVolume, math.clamp(rpmPresence * 0.7 + throttleLoadPresence * 0.75, 0, 1))
+		revTargetVolume += aLoad * revCfg.loadVolumeBoost
+		revTargetVolume = math.clamp(revTargetVolume, 0, revCfg.maxVolume)
+
+		if shiftTimer > 0 then
+			local dipAlpha = shiftTimer / SND_CFG.ShiftReactionTime
+			revTargetVolume *= (1 - SND_CFG.ShiftDipStrength * dipAlpha)
+		end
+		if not driving then
+			revTargetVolume = 0
+		end
+		revVol = smoothTo(revVol, revTargetVolume, revCfg.smoothing, dt)
+
+		local whineCfg = SND_CFG.Whine
+		local whineAlpha = math.clamp((aWhineSpd - whineCfg.minSpeed) / math.max(whineCfg.maxSpeed - whineCfg.minSpeed, 1), 0, 1)
+		local whinePlayback = lerp(whineCfg.minPlayback, whineCfg.maxPlayback, whineAlpha)
+		local whineTargetVolume = lerp(whineCfg.baseVolume, whineCfg.maxVolume, whineAlpha)
+		whineTargetVolume += aLoad * whineCfg.loadVolume
+		whineTargetVolume *= (1 - math.clamp(clutchPedal, 0, 1) * whineCfg.clutchRelease)
+		whineTargetVolume = math.clamp(whineTargetVolume, 0, whineCfg.maxVolume)
+		if not driving then
+			whineTargetVolume = 0
+		end
+		whineVol = smoothTo(whineVol, whineTargetVolume, whineCfg.smoothing, dt)
+
+		if idleOk then
+			idleSnd.Volume = idleVol
+		end
+		if revOk then
+			revSnd.Volume = revVol
+			revSnd.PlaybackSpeed = revPlayback
+		end
+		if whineOk then
+			whineSnd.Volume = whineVol
+			whineSnd.PlaybackSpeed = whinePlayback
+		end
+
+		if fadingOut then
+			fadeTimer -= dt
+			local allSilent = idleVol < 0.01 and revVol < 0.01 and whineVol < 0.01
+			if fadeTimer <= 0 or allSilent then
+				stopSndNow()
+			end
+		end
+	end
+
+	local function buildRigConstraints(part)
+		local attachment = Instance.new("Attachment")
+		attachment.Name = "ChassisReplicationAttachment"
+		attachment.Parent = part
+
+		local alignPosition = Instance.new("AlignPosition")
+		alignPosition.Attachment0 = attachment
+		alignPosition.Mode = Enum.PositionAlignmentMode.OneAttachment
+		alignPosition.MaxForce = math.huge
+		alignPosition.MaxVelocity = math.huge
+		alignPosition.Responsiveness = 200
+		alignPosition.Parent = part
+
+		local alignOrientation = Instance.new("AlignOrientation")
+		alignOrientation.Attachment0 = attachment
+		alignOrientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
+		alignOrientation.MaxTorque = math.huge
+		alignOrientation.Responsiveness = 200
+		alignOrientation.Parent = part
+
+		return attachment, alignPosition, alignOrientation
+	end
+
+	local function setupChassisReplication()
+		if not CHASSIS_REPLICATION.Enabled or not character then
+			return
+		end
+		table.clear(replicationLimbs)
+		table.clear(replicationJoints)
+
+		humanoid.PlatformStand = true
+
+		for wheelName, limbName in pairs(CHASSIS_REPLICATION.WheelToLimb) do
+			local limb = character:FindFirstChild(limbName)
+			local wheelFolder = wheels:FindFirstChild(wheelName)
+			local tire = wheelFolder and wheelFolder:FindFirstChild("Bounds")
+
+			if limb and tire then
+				local spinAtt = tire:FindFirstChild("SpinAtt")
+				if not spinAtt then
+					warn(string.format("CarController: wheel '%s' has no SpinAtt -- limb '%s' will not show wheel roll", wheelName, limbName))
+				end
+
+				local joint = findLimbJoint(character, limbName)
+				if joint then
+					joint:Destroy()
+					table.insert(replicationJoints, joint)
+				else
+					warn(string.format("CarController: no Motor6D found for limb '%s' -- it may fight the replicated CFrame", limbName))
+				end
+
+				limb.CanCollide = false
+				local attachment, alignPosition, alignOrientation = buildRigConstraints(limb)
+				replicationLimbs[limbName] = {
+					limb = limb,
+					tire = tire,
+					spinAtt = spinAtt,
+					attachment = attachment,
+					alignPosition = alignPosition,
+					alignOrientation = alignOrientation,
+				}
+			else
+				warn(string.format("CarController: chassis replication could not find limb '%s' or wheel '%s'", limbName, wheelName))
+			end
+		end
+
+		local rootJoint = findRootJoint(character)
+		if rootJoint then
+			rootJoint.Enabled = false
+			table.insert(replicationJoints, rootJoint)
+		end
+
+		if rootPart then
+			rootPart.CanCollide = false
+			local rootAttachment, rootAlignPosition, rootAlignOrientation = buildRigConstraints(rootPart)
+			replicationRoot = { attachment = rootAttachment, alignPosition = rootAlignPosition, alignOrientation = rootAlignOrientation }
+		end
+
+		replicationActive = true
+	end
+
+	local function teardownChassisReplication()
+		replicationActive = false
+		for _, joint in ipairs(replicationJoints) do
+			if joint then
+				joint.Enabled = true
+			end
+		end
+		table.clear(replicationJoints)
+
+		if humanoid and humanoid.Parent then
+			humanoid.PlatformStand = false
+		end
+
+		for _, entry in pairs(replicationLimbs) do
+			if entry.alignPosition then
+				entry.alignPosition:Destroy()
+			end
+			if entry.alignOrientation then
+				entry.alignOrientation:Destroy()
+			end
+			if entry.attachment then
+				entry.attachment:Destroy()
+			end
+		end
+		table.clear(replicationLimbs)
+
+		if replicationRoot then
+			replicationRoot.alignPosition:Destroy()
+			replicationRoot.alignOrientation:Destroy()
+			replicationRoot.attachment:Destroy()
+			replicationRoot = nil
+		end
+	end
+
+	local function updateChassisReplication()
+		if not replicationActive or not rootPart or not rootPart.Parent then
+			return
+		end
+
+		local chassisCFrame = mass.CFrame
+		local rootTarget = chassisCFrame * CHASSIS_REPLICATION.BodyOffset:Inverse()
+
+		if replicationRoot then
+			replicationRoot.alignPosition.Position = rootTarget.Position
+			replicationRoot.alignOrientation.CFrame = rootTarget
+		end
+
+		for _, entry in pairs(replicationLimbs) do
+			local limb, tire, spinAtt = entry.limb, entry.tire, entry.spinAtt
+			if limb.Parent and tire.Parent and entry.alignPosition and entry.alignOrientation then
+				local target = (spinAtt and spinAtt.Parent) and spinAtt.WorldCFrame or tire.CFrame
+				entry.alignPosition.Position = target.Position
+				entry.alignOrientation.CFrame = target
+			end
+		end
+	end
+
+	local function leaveCar()
+		if not driving then
+			return
+		end
+		driving = false
+		Hud.SetVisible(false)
+		stopCamera()
+
+		local exitCFrame = computeExitCFrame()
+		releaseControls(true)
+
+		if diedConnection then
+			diedConnection:Disconnect()
+			diedConnection = nil
+		end
+
+		toggleCollisions(character, true, collisionCache)
+		teardownChassisReplication()
+
+		if rootPart and rootPart.Parent then
+			rootPart.Anchored = false
+			rootPart.AssemblyLinearVelocity = Vector3.zero
+			rootPart.AssemblyAngularVelocity = Vector3.zero
+			rootPart.CFrame = exitCFrame
+		end
+
+		character, humanoid, rootPart = nil, nil, nil
+		beginFade()
+
+		if alive and prompt.Parent then
+			prompt.Enabled = true
+		end
+	end
+
+	local function destroy()
+		if not alive then
+			return
+		end
+		if driving then
+			leaveCar()
+		end
+		alive = false
+		stopSndNow()
+		stopCamera()
+
+		for _, connection in connections do
+			connection:Disconnect()
+		end
+		table.clear(connections)
+
+		for value, tween in activeTweens do
+			tween:Cancel()
+			activeTweens[value] = nil
+		end
+
+		prompt:Destroy()
+		handbrakeValue:Destroy()
+		handledCars[car] = nil
+	end
+
+	local function onDriverDied()
+		if not driving then
+			return
+		end
+		if diedConnection then
+			diedConnection:Disconnect()
+			diedConnection = nil
+		end
+
+		driving = false
+		alive = false
+		teardownChassisReplication()
+		stopSndNow()
+		stopCamera()
+
+		for _, connection in connections do
+			connection:Disconnect()
+		end
+		table.clear(connections)
+
+		for value, tween in activeTweens do
+			tween:Cancel()
+			activeTweens[value] = nil
+		end
+
+		character, humanoid, rootPart = nil, nil, nil
+		handledCars[car] = nil
+
+		if car:IsDescendantOf(workspace) then
+			car:Destroy()
+		end
+	end
+
+	local function enterCar()
+		if driving or not alive then
+			return
+		end
+
+		local currentCharacter = player.Character
+		local currentHumanoid = currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
+		local currentRoot = currentCharacter and currentCharacter:FindFirstChild("HumanoidRootPart")
+
+		if not currentHumanoid or not currentRoot or currentHumanoid.Health <= 0 then
+			return
+		end
+
+		toggleCollisions(currentCharacter, false, collisionCache)
+
+		driving = true
+		enteredAt = os.clock()
+		character = currentCharacter
+		humanoid = currentHumanoid
+		rootPart = currentRoot
+		entryCFrame = currentRoot.CFrame
+
+		setupChassisReplication()
+
+		if CONFIG.AutoFirstGearOnEnter and transmission:GetGear() == 0 then
+			transmission:RequestShift(1)
+		end
+
+		prompt.Enabled = false
+		releaseControls(false)
+		handbrakeEngaged = false
+		handbrakeValue.Value = 0
+
+		Hud.SetVisible(true)
+		startSnd()
+		startCamera()
+
+		diedConnection = currentHumanoid.Died:Connect(onDriverDied)
+	end
+
+	local function shiftGear(direction)
+		if not driving then
+			return
+		end
+		local nextGear = transmission:GetGear() + direction
+		transmission:RequestShift(nextGear)
+	end
+
+	local function isCarIntact()
+		return car:IsDescendantOf(workspace) and mass.Parent ~= nil and primary.Parent ~= nil
+	end
+
+	local FIXED_SUBSTEP = 1 / 120
+	local MAX_SUBSTEPS = 8
+	local MAX_TOTAL_DT = 0.25
+
+	local function step(dt)
+		if not isCarIntact() then
+			destroy()
+			return
+		end
+		dt = math.min(dt, MAX_TOTAL_DT)
+
+		handbrakeEngaged = UserInputService:IsKeyDown(Enum.KeyCode.Space)
+		tweenValue(handbrakeValue, handbrakeEngaged and 1 or 0, 0.12)
+
+
+		if driving and rootPart and rootPart.Parent and not CHASSIS_REPLICATION.Enabled then
+			rootPart.CFrame = mass.CFrame
+		end
+
+		local steerTime = stats.steerResponseTimeInactive
+		local targetSteer = 0
+		local mouseControlled = false
+
+		if driving and not UserInputService:GetFocusedTextBox() then
+			if mouseSteer then
+				local viewportWidth = math.max(workspace.CurrentCamera.ViewportSize.X, 1)
+				steerValue.Value = math.clamp((UserInputService:GetMouseLocation().X / viewportWidth) * 2 - 1, -1, 1)
+				mouseControlled = true
+			else
+				local left = UserInputService:IsKeyDown(CONFIG.SteerLeftKey)
+				local right = UserInputService:IsKeyDown(CONFIG.SteerRightKey)
+				if left ~= right then
+					targetSteer = if left then -1 else 1
+					steerTime = stats.steerResponseTimeActive
+				end
+			end
+		end
+
+		if not mouseControlled then
+			steerValue.Value = approach(steerValue.Value, targetSteer, steerTime, dt)
+		end
+
+		if steerSlide then
+			steerSlide.Position = Vector3.new(steerValue.Value * -0.34, -1.17, -7.216)
+		end
+
+		local velocity = mass.AssemblyLinearVelocity
+		local carSpeedObjectSpace = mass.CFrame:VectorToObjectSpace(velocity)
+		local carSpeedFrontStuds = carSpeedObjectSpace.Z
+		local carSpeedFrontMps = Units.StudsPerSecToMps(carSpeedFrontStuds)
+
+		local longitudinalAccelMps2 = (carSpeedFrontMps - prevStepSpeedMps) / dt
+		local transferNewtons = (massKg * longitudinalAccelMps2 * stats.cgHeightMeters) / stats.wheelbaseMeters
+
+		if drag then
+			local dragForce = Vector3.zero
+			if velocity.Magnitude > 0.01 then
+				local dragNewtons = aeroDragForce(carSpeedFrontMps, stats.aero)
+				dragForce = -velocity.Unit * Vector3.new(1, 0.5, 1) * (dragNewtons * Units.ForceScale)
+			end
+			drag.Force = dragForce
+		end
+
+		local throttlePedal = throttleValue.Value
+		local brakePedal = brakeValue.Value
+		local clutchPedal = clutchValue.Value
+
+		local tireInfos = {}
+		for _, wheel in ipairs(wheels:GetChildren()) do
+			if wheelUnits[wheel.Name] then
+				local tireInfo = TireContact.Update(car, wheel, raycastParams)
+				tireInfos[wheel.Name] = tireInfo
+				if not tireInfo then
+					wheel.Bounds.FrictionForce.Force = Vector3.zero
+				end
+			end
+		end
+
+		local steps = math.clamp(math.ceil(dt / FIXED_SUBSTEP), 1, MAX_SUBSTEPS)
+		local subDt = dt / steps
+
+		local lastClutchTorque, lastDriveshaftTorque, lastDriveshaftOmega = 0, 0, 0
+
+		for _ = 1, steps do
+			transmission:Update(subDt)
+			local totalRatio = transmission:GetTotalRatio()
+
+			local driveshaftOmega = 0
+			local drivenCount = 0
+			for name, isDriven in pairs(drivenWheels) do
+				if isDriven then
+					driveshaftOmega += wheelUnits[name].omega
+					drivenCount += 1
+				end
+			end
+			if drivenCount > 0 then
+				driveshaftOmega /= drivenCount
+			end
+
+			local clutchTorque
+			if totalRatio ~= 0 then
+				local requiredInputOmega = driveshaftOmega * totalRatio
+				local wheelInertiaSum = massKg * stats.wheelRadiusMeters * stats.wheelRadiusMeters
+				for name, isDriven in pairs(drivenWheels) do
+					if isDriven then
+						wheelInertiaSum += wheelUnits[name].inertia
+					end
+				end
+				local reflectedInertia = wheelInertiaSum / (totalRatio * totalRatio)
+				clutchTorque = clutch:Update(subDt, engine:GetAngularVelocity(), engine.inertia, requiredInputOmega, reflectedInertia, clutchPedal)
+			else
+
+				clutch:Update(subDt, engine:GetAngularVelocity(), engine.inertia, engine:GetAngularVelocity(), 0, clutchPedal)
+				clutchTorque = 0
+			end
+
+			engine:Update(subDt, throttlePedal, clutchTorque)
+			local driveshaftTorque = transmission:GetOutputTorque(clutchTorque)
+
+			local frontAxleTorque, rearAxleTorque = 0, 0
+			if stats.transmission.type == "AWD" then
+				local frontOmega = (wheelUnits.FL.omega + wheelUnits.FR.omega) * 0.5
+				local rearOmega = (wheelUnits.RL.omega + wheelUnits.RR.omega) * 0.5
+				local frontInertia = wheelUnits.FL.inertia + wheelUnits.FR.inertia
+				local rearInertia = wheelUnits.RL.inertia + wheelUnits.RR.inertia
+				if centerDiff then
+					frontAxleTorque, rearAxleTorque = centerDiff:Distribute(subDt, driveshaftTorque, frontOmega, rearOmega, frontInertia, rearInertia)
+				else
+					frontAxleTorque = driveshaftTorque * (stats.transmission.awd.frontBias or 0.5)
+					rearAxleTorque = driveshaftTorque * (stats.transmission.awd.rearBias or 0.5)
+				end
+			elseif stats.transmission.type == "FWD" then
+				frontAxleTorque = driveshaftTorque
+			else
+				rearAxleTorque = driveshaftTorque
+			end
+
+			local wheelDriveTorque = { FL = 0, FR = 0, RL = 0, RR = 0 }
+			if drivenWheels.FL or drivenWheels.FR then
+				wheelDriveTorque.FL, wheelDriveTorque.FR = axleDiff:Distribute(subDt, frontAxleTorque, wheelUnits.FL.omega, wheelUnits.FR.omega, wheelUnits.FL.inertia, wheelUnits.FR.inertia)
+			end
+			if drivenWheels.RL or drivenWheels.RR then
+				wheelDriveTorque.RL, wheelDriveTorque.RR = axleDiff:Distribute(subDt, rearAxleTorque, wheelUnits.RL.omega, wheelUnits.RR.omega, wheelUnits.RL.inertia, wheelUnits.RR.inertia)
+			end
+
+			local frontBrakeTorque = brakePedal * stats.brakes.maxTorqueFront
+			local rearBrakeTorque = brakePedal * stats.brakes.maxTorqueRear
+				+ handbrakeValue.Value * stats.brakes.handbrakeTorque
+			local wheelBrakeTorque = { FL = frontBrakeTorque, FR = frontBrakeTorque, RL = rearBrakeTorque, RR = rearBrakeTorque }
+
+			for name, wheelUnit in pairs(wheelUnits) do
+				local tireInfo = tireInfos[name]
+				local forwardForceNewtons, normalLoadNewtons, tireStiffness = 0, 0, 0
+				local grounded = tireInfo ~= nil
+				if tireInfo then
+					local surfaceSpeedStuds = Units.MpsToStudsPerSec(wheelUnit:GetSurfaceSpeed())
+					local isFrontWheel = (name == "FL" or name == "FR")
+					local loadDeltaNewtons = isFrontWheel and frontLoadDeltaPerWheel or rearLoadDeltaPerWheel
+					forwardForceNewtons, normalLoadNewtons, tireStiffness = Grip.Update(tireInfo, surfaceSpeedStuds, smoothedLoad, subDt, loadDeltaNewtons)
+				end
+				wheelUnit:Update(subDt, wheelDriveTorque[name], wheelBrakeTorque[name], forwardForceNewtons, tireStiffness, normalLoadNewtons, grounded)
+			end
+
+			lastClutchTorque = clutchTorque
+			lastDriveshaftTorque = driveshaftTorque
+			lastDriveshaftOmega = driveshaftOmega
+		end
+
+		for _, wheel in ipairs(wheels:GetChildren()) do
+			local wheelUnit = wheelUnits[wheel.Name]
+			if wheelUnit then
+				local speedAttribute = WHEEL_SPEED_ATTRIBUTES[wheel.Name]
+				if speedAttribute then
+					car:SetAttribute(speedAttribute, Units.MpsToStudsPerSec(wheelUnit:GetSurfaceSpeed()))
+				end
+
+				local roll = wheel.Roll
+				roll.Value = (roll.Value + math.deg(wheelUnit.omega) * dt) % 360
+				wheel.Bounds.SpinAtt.CFrame = CFrame.fromOrientation(math.rad(-roll.Value), 0, 0)
+			end
+		end
+
+		local currentGear = transmission:GetGear()
+		car:SetAttribute("RPM", engine:GetRPM())
+		car:SetAttribute("EngineStalled", engine:IsStalled())
+		car:SetAttribute("Gear", currentGear)
+		car:SetAttribute("Handbrake", handbrakeEngaged)
+
+		if driving then
+			local speedKmh = math.abs(carSpeedFrontMps) * 3.6
+			Hud.Update({
+				gear = currentGear,
+				speedKmh = speedKmh,
+				rpm = engine:GetRPM(),
+				redlineRpm = stats.engine.redlineRPM,
+				redlineWarnRpm = stats.engine.redlineRPM * 0.9,
+				throttle = throttlePedal,
+				brake = brakePedal,
+				clutch = clutchPedal,
+				handbrake = handbrakeEngaged,
+			})
+		end
+
+		updateSnd(dt, throttlePedal, clutchPedal, currentGear, transmission:GetRatio(), stats.transmission.finalDrive, carSpeedFrontStuds, stats.wheelRadiusMeters)
+
+		if stats.debug.enabled then
+			car:SetAttribute("Debug_ClutchSlipRadPerSec", clutch:GetSlip())
+			car:SetAttribute("Debug_ClutchTorque", lastClutchTorque)
+			car:SetAttribute("Debug_DriveshaftTorque", lastDriveshaftTorque)
+			car:SetAttribute("Debug_DriveshaftOmega", lastDriveshaftOmega)
+			car:SetAttribute("Debug_EngineNetTorque", engine.lastNetTorque)
+			car:SetAttribute("Debug_EngineCombustionTorque", engine.lastCombustionTorque)
+		end
+
+		if driving then
+			updateChassisReplication()
+		end
+	end
+
+	track(UserInputService.InputBegan:Connect(function(input, processed)
+		if processed or not driving then
+			return
+		end
+		local key = input.KeyCode
+
+		if key == CONFIG.ThrottleKey then
+			tweenValue(throttleValue, 1, stats.throttleResponseTime)
+		elseif key == CONFIG.BrakeKey then
+			tweenValue(brakeValue, 1, stats.brakeResponseTime)
+		elseif key == CONFIG.ClutchKey then
+			tweenValue(clutchValue, 1, stats.clutchResponseTime)
+		elseif key == CONFIG.GearUpKey then
+			if os.clock() - enteredAt > CONFIG.EnterInputGuard then
+				shiftGear(1)
+			end
+		elseif key == CONFIG.GearDownKey then
+			shiftGear(-1)
+		elseif key == CONFIG.MouseSteerKey then
+			mouseSteer = not mouseSteer
+		elseif key == CONFIG.RestartEngineKey then
+			if engine:IsStalled() then
+				engine:Restart()
+			end			
+		elseif key == CONFIG.ExitKey then
+			leaveCar()
+		elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+			cameraRightMouseDown = true
+			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+		end
+	end))
+
+	track(UserInputService.InputEnded:Connect(function(input)
+		if not driving then
+			return
+		end
+		local key = input.KeyCode
+
+		if key == CONFIG.ThrottleKey then
+			tweenValue(throttleValue, 0, stats.throttleResponseTime / 2)
+		elseif key == CONFIG.BrakeKey then
+			tweenValue(brakeValue, 0, stats.brakeResponseTime / 2)
+		elseif key == CONFIG.ClutchKey then
+			tweenValue(clutchValue, 0, stats.clutchResponseTime / 2)
+		elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+			cameraRightMouseDown = false
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		end
+	end))
+
+	track(UserInputService.InputChanged:Connect(function(input)
+		if not driving then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseMovement and cameraRightMouseDown then
+			cameraOrbitAlpha -= input.Delta.X * 0.0085
+			cameraOrbitBeta = math.clamp(cameraOrbitBeta - input.Delta.Y * 0.0085, -1.1, 1.3)
+		elseif input.UserInputType == Enum.UserInputType.MouseWheel then
+			cameraDistance = math.clamp(cameraDistance - input.Position.Z * 3, 7, 45)
+		end
+	end))
+
+	track(prompt.Triggered:Connect(enterCar))
+
+	track(player.CharacterRemoving:Connect(function()
+		if driving then
+			leaveCar()
+		end
+	end))
+
+	track(car.AncestryChanged:Connect(function()
+		if not car:IsDescendantOf(workspace) then
+			destroy()
+		end
+	end))
+
+	track(car.Destroying:Connect(destroy))
+
+	initSnd()
+
+	task.delay(CONFIG.StartDelay, function()
+		if not alive then
+			return
+		end
+
+		mass.Anchored = false
+		releaseControls(true)
+
+		track(RunService.RenderStepped:Connect(step))
+
+		if player.Character then
+			player.Character:WaitForChild("Humanoid", 5)
+			player.Character:WaitForChild("HumanoidRootPart", 5)
+			enterCar()
+		else
+			local characterConnection
+			characterConnection = player.CharacterAdded:Connect(function(newCharacter)
+				if characterConnection then
+					characterConnection:Disconnect()
+				end
+				newCharacter:WaitForChild("Humanoid", 5)
+				newCharacter:WaitForChild("HumanoidRootPart", 5)
+				enterCar()
+			end)
+			track(characterConnection)
+		end
+	end)
+end
+
+return CarController
