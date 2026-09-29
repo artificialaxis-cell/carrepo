@@ -375,6 +375,7 @@ local function buildTuning(page, Tuning)
 	local entries = {}
 	local rowViews = {}
 	local populate
+	local dirty = false
 
 	local function styleStrip()
 		for category, entry in pairs(entries) do
@@ -421,6 +422,57 @@ local function buildTuning(page, Tuning)
 			}, tab),
 		}
 	end
+	
+	local popup = new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(12, 15, 19),
+		BorderSizePixel = 1,
+		BorderColor3 = Color3.fromRGB(98, 160, 230),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		Size = UDim2.fromOffset(200, 0),
+		ZIndex = 50,
+		Visible = false,
+	}, gui)
+	new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, popup)
+	local popupOwner
+
+	local function hidePopup(owner)
+		if owner == nil or popupOwner == owner then
+			popup.Visible = false
+			popupOwner = nil
+		end
+	end
+
+	local function showSuggestions(row, field, query)
+		popupOwner = field
+		for _, child in ipairs(popup:GetChildren()) do
+			if child:IsA("GuiObject") then
+				child:Destroy()
+			end
+		end
+		local found = Tuning.searchSounds(query, 8)
+		if #found == 0 then
+			popup.Visible = false
+			return
+		end
+		for index, name in ipairs(found) do
+			button({
+				Text = "  " .. name,
+				TextSize = 10,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				BorderSizePixel = 0,
+				ZIndex = 51,
+				LayoutOrder = index,
+				Size = UDim2.new(1, 0, 0, 20),
+			}, popup, function()
+				Tuning.set(row.id, name)
+				hidePopup(field)
+			end)
+		end
+		popup.Size = UDim2.fromOffset(math.max(field.AbsoluteSize.X, 200), 0)
+		popup.Position = UDim2.fromOffset(field.AbsolutePosition.X, field.AbsolutePosition.Y + field.AbsoluteSize.Y)
+		popup.Visible = true
+	end
+
 
 	local title = text("TextLabel", {
 		Text = "",
@@ -534,14 +586,259 @@ local function buildTuning(page, Tuning)
 		Size = UDim2.new(1, -312, 1, 0),
 	}, footer)
 
-	function populate()
+	local function addValueRow(row, indent, stripe, order)	
+		local frame = new("Frame", {
+			BackgroundColor3 = stripe % 2 == 0 and Color3.fromRGB(14, 18, 23) or Color3.fromRGB(10, 12, 16),
+			Size = UDim2.new(1, 0, 0, 22),
+			LayoutOrder = order,
+		}, scroll)
+		local marker = new("Frame", {
+			BackgroundColor3 = Color3.fromRGB(98, 160, 230),
+			Size = UDim2.new(0, 2, 1, 0),
+			Visible = false,
+		}, frame)
+		text("TextLabel", {
+			Text = row.label,
+			TextColor3 = Color3.fromRGB(170, 180, 194),
+			Position = UDim2.new(0, 10 + indent, 0, 0),
+			Size = UDim2.new(0.44, -10 - indent, 1, 0),
+		}, frame)
+
+		local field
+		if row.kind == "boolean" or row.options then
+			field = button({
+				Text = "",
+				Position = UDim2.new(0.44, 0, 0, 2),
+				Size = UDim2.new(0.3, -6, 1, -4),
+			}, frame, function()
+				local current = Tuning.get(row.id)
+				if row.kind == "boolean" then
+					Tuning.set(row.id, not current)
+				else
+					local index = table.find(row.options, current) or 0
+					Tuning.set(row.id, row.options[index % #row.options + 1])
+				end
+			end)
+		else
+			field = text("TextBox", {
+				Text = "",
+				ClearTextOnFocus = false,
+				BackgroundTransparency = 0,
+				BackgroundColor3 = Color3.fromRGB(8, 10, 13),
+				BorderSizePixel = 1,
+				BorderColor3 = Color3.fromRGB(40, 48, 60),
+				TextXAlignment = Enum.TextXAlignment.Center,
+				Position = UDim2.new(0.44, 0, 0, 2),
+				Size = UDim2.new(0.3, -6, 1, -4),
+			}, frame)
+		end
+
+		text("TextLabel", {
+			Text = row.live and "LIVE" or "INIT",
+			TextSize = 9,
+			TextColor3 = row.live and Color3.fromRGB(84, 196, 140) or Color3.fromRGB(110, 120, 134),
+			Position = UDim2.new(0.76, 0, 0, 0),
+			Size = UDim2.new(0.12, 0, 1, 0),
+		}, frame)
+
+		local reset = button({
+			Text = "RST",
+			TextSize = 9,
+			Position = UDim2.new(1, -38, 0, 3),
+			Size = UDim2.new(0, 34, 1, -6),
+			Visible = false,
+		}, frame, function()
+			Tuning.reset(row.id)
+		end)
+
+		local function paint()
+			local value = Tuning.get(row.id)
+			if value == nil then
+				return
+			end
+			local modified = Tuning.isModified(row.id)
+			marker.Visible = modified
+			reset.Visible = modified
+			if row.kind == "boolean" then
+				field.Text = value and "ON" or "OFF"
+				field.TextColor3 = value and Color3.fromRGB(84, 196, 140) or Color3.fromRGB(110, 120, 134)
+			else
+				if row.soundId then
+					field.Text = Tuning.soundLabel(value)
+				elseif row.kind == "number" then
+					field.Text = tostring(math.floor(value * 10000 + 0.5) / 10000)
+				else
+					field.Text = tostring(value)
+				end
+				field.TextColor3 = modified and Color3.fromRGB(140, 196, 255) or Color3.fromRGB(196, 205, 216)
+			end
+			if field:IsA("TextBox") then
+				field.BorderColor3 = Color3.fromRGB(40, 48, 60)
+			end
+		end
+
+		if field:IsA("TextBox") then
+			field.Focused:Connect(function()
+				field.BorderColor3 = Color3.fromRGB(98, 160, 230)
+				if row.soundId then
+					showSuggestions(row, field, "")
+				end
+			end)
+			if row.soundId then
+				field:GetPropertyChangedSignal("Text"):Connect(function()
+					if field:IsFocused() then
+						showSuggestions(row, field, field.Text)
+					end
+				end)
+			end
+			field.FocusLost:Connect(function()
+				if row.soundId then
+					task.delay(0.2, function()
+						hidePopup(field)
+					end)
+				end
+				local value
+				if row.kind == "number" and not row.soundId then
+					value = tonumber(field.Text)
+				else
+					value = field.Text
+				end
+				if value == nil or not Tuning.set(row.id, value) then
+					field.BorderColor3 = Color3.fromRGB(222, 84, 72)
+					task.delay(0.4, paint)
+					field.Text = row.soundId and Tuning.soundLabel(Tuning.get(row.id)) or tostring(Tuning.get(row.id))
+				else
+					paint()
+				end
+			end)
+		end
+
+		rowViews[row.id] = paint
+		paint()
+	end
+	
+	scroll:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
+		hidePopup()
+	end)
+
+	local function addListHeader(row, stripe, order)
+		local entry = row.list
+		local frame = new("Frame", {
+			BackgroundColor3 = stripe % 2 == 0 and Color3.fromRGB(14, 18, 23) or Color3.fromRGB(10, 12, 16),
+			Size = UDim2.new(1, 0, 0, 22),
+			LayoutOrder = order,
+		}, scroll)
+		local toggle = button({
+			Text = "",
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			TextColor3 = Color3.fromRGB(170, 180, 194),
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Size = UDim2.new(1, 0, 1, 0),
+		}, frame, function()
+			Tuning.toggleCollapsed(row.id)
+			populate(true)
+		end)
+		local marker = new("Frame", {
+			BackgroundColor3 = Color3.fromRGB(98, 160, 230),
+			Size = UDim2.new(0, 2, 1, 0),
+			Visible = false,
+		}, frame)
+		local count = text("TextLabel", {
+			Text = "",
+			Position = UDim2.new(0.44, 0, 0, 0),
+			Size = UDim2.new(0.3, -6, 1, 0),
+		}, frame)
+		text("TextLabel", {
+			Text = row.live and "LIVE" or "INIT",
+			TextSize = 9,
+			TextColor3 = row.live and Color3.fromRGB(84, 196, 140) or Color3.fromRGB(110, 120, 134),
+			Position = UDim2.new(0.76, 0, 0, 0),
+			Size = UDim2.new(0.12, 0, 1, 0),
+		}, frame)
+		button({
+			Text = "ADD",
+			TextSize = 9,
+			Position = UDim2.new(1, -76, 0, 3),
+			Size = UDim2.new(0, 34, 1, -6),
+		}, frame, function()
+			Tuning.setCollapsed(row.id, false)
+			Tuning.listAdd(row.id)
+		end)
+		local reset = button({
+			Text = "RST",
+			TextSize = 9,
+			Position = UDim2.new(1, -38, 0, 3),
+			Size = UDim2.new(0, 34, 1, -6),
+			Visible = false,
+		}, frame, function()
+			Tuning.reset(row.id)
+		end)
+
+		local function paint()
+			local modified = Tuning.isModified(row.id)
+			marker.Visible = modified
+			reset.Visible = modified
+			toggle.Text = "  " .. (Tuning.isCollapsed(row.id) and "+ " or "- ") .. row.label
+			count.Text = string.format("%d ITEMS", #entry.items)
+			count.TextColor3 = modified and Color3.fromRGB(140, 196, 255) or Color3.fromRGB(196, 205, 216)
+		end
+
+		rowViews[row.id] = paint
+		paint()
+	end
+
+	local function addItemHeader(row, index, order)
+		local entry = row.list
+		local frame = new("Frame", {
+			BackgroundColor3 = Color3.fromRGB(18, 23, 30),
+			Size = UDim2.new(1, 0, 0, 22),
+			LayoutOrder = order,
+		}, scroll)
+		text("TextLabel", {
+			Text = Tuning.itemTitle(row.id, index),
+			Bold = true,
+			TextSize = 10,
+			TextColor3 = Color3.fromRGB(140, 150, 164),
+			Position = UDim2.new(0, 22, 0, 0),
+			Size = UDim2.new(1, -180, 1, 0),
+		}, frame)
+
+		local function action(label, offset, handler)
+			button({
+				Text = label,
+				TextSize = 9,
+				Position = UDim2.new(1, offset, 0, 3),
+				Size = UDim2.new(0, 34, 1, -6),
+			}, frame, handler)
+		end
+
+		action("DEL", -38, function()
+			Tuning.listRemove(row.id, index)
+		end)
+		action("ADD", -76, function()
+			Tuning.listAdd(row.id, index)
+		end)
+		if not entry.keyed then
+			action("DN", -114, function()
+				Tuning.listMove(row.id, index, 1)
+			end)
+			action("UP", -152, function()
+				Tuning.listMove(row.id, index, -1)
+			end)
+		end
+	end
+
+	function populate(keepScroll)
+		hidePopup()
+		local position = scroll.CanvasPosition
 		for _, child in ipairs(scroll:GetChildren()) do
 			if child:IsA("GuiObject") then
 				child:Destroy()
 			end
 		end
 		table.clear(rowViews)
-		title.Text = "" .. activeCategory
+		title.Text = activeCategory
 
 		local lastGroup
 		local order = 0
@@ -563,117 +860,32 @@ local function buildTuning(page, Tuning)
 
 			order += 1
 			stripe += 1
-			local frame = new("Frame", {
-				BackgroundColor3 = stripe % 2 == 0 and Color3.fromRGB(14, 18, 23) or Color3.fromRGB(10, 12, 16),
-				Size = UDim2.new(1, 0, 0, 22),
-				LayoutOrder = order,
-			}, scroll)
-			local marker = new("Frame", {
-				BackgroundColor3 = Color3.fromRGB(98, 160, 230),
-				Size = UDim2.new(0, 2, 1, 0),
-				Visible = false,
-			}, frame)
-			text("TextLabel", {
-				Text = row.label,
-				TextColor3 = Color3.fromRGB(170, 180, 194),
-				Position = UDim2.new(0, 10, 0, 0),
-				Size = UDim2.new(0.44, -10, 1, 0),
-			}, frame)
-
-			local field
-			if row.kind == "boolean" or row.options then
-				field = button({
-					Text = "",
-					Position = UDim2.new(0.44, 0, 0, 2),
-					Size = UDim2.new(0.3, -6, 1, -4),
-				}, frame, function()
-					local current = Tuning.get(row.id)
-					if row.kind == "boolean" then
-						Tuning.set(row.id, not current)
-					else
-						local index = table.find(row.options, current) or 0
-						Tuning.set(row.id, row.options[index % #row.options + 1])
+			if row.kind == "list" then
+				addListHeader(row, stripe, order)
+				if not Tuning.isCollapsed(row.id) then
+					local entry = row.list
+					for index in ipairs(entry.items) do
+						order += 1
+						addItemHeader(row, index, order)
+						for _, leaf in ipairs(entry.itemRows[index]) do
+							order += 1
+							stripe += 1
+							addValueRow(leaf, 12, stripe, order)
+						end
 					end
-				end)
+				end
 			else
-				field = text("TextBox", {
-					Text = "",
-					ClearTextOnFocus = false,
-					BackgroundTransparency = 0,
-					BackgroundColor3 = Color3.fromRGB(8, 10, 13),
-					BorderSizePixel = 1,
-					BorderColor3 = Color3.fromRGB(40, 48, 60),
-					TextXAlignment = Enum.TextXAlignment.Center,
-					Position = UDim2.new(0.44, 0, 0, 2),
-					Size = UDim2.new(0.3, -6, 1, -4),
-				}, frame)
+				addValueRow(row, 0, stripe, order)
 			end
-
-			text("TextLabel", {
-				Text = row.live and "LIVE" or "INIT",
-				TextSize = 9,
-				TextColor3 = row.live and Color3.fromRGB(84, 196, 140) or Color3.fromRGB(110, 120, 134),
-				Position = UDim2.new(0.76, 0, 0, 0),
-				Size = UDim2.new(0.12, 0, 1, 0),
-			}, frame)
-
-			local reset = button({
-				Text = "RST",
-				TextSize = 9,
-				Position = UDim2.new(1, -38, 0, 3),
-				Size = UDim2.new(0, 34, 1, -6),
-				Visible = false,
-			}, frame, function()
-				Tuning.reset(row.id)
-			end)
-
-			local function paint()
-				local value = Tuning.get(row.id)
-				local modified = Tuning.isModified(row.id)
-				marker.Visible = modified
-				reset.Visible = modified
-				if row.kind == "boolean" then
-					field.Text = value and "ON" or "OFF"
-					field.TextColor3 = value and Color3.fromRGB(84, 196, 140) or Color3.fromRGB(110, 120, 134)
-				else
-					if row.kind == "number" then
-						field.Text = tostring(math.floor(value * 10000 + 0.5) / 10000)
-					else
-						field.Text = tostring(value)
-					end
-					field.TextColor3 = modified and Color3.fromRGB(140, 196, 255) or Color3.fromRGB(196, 205, 216)
-				end
-				if field:IsA("TextBox") then
-					field.BorderColor3 = Color3.fromRGB(40, 48, 60)
-				end
-			end
-
-			if field:IsA("TextBox") then
-				field.Focused:Connect(function()
-					field.BorderColor3 = Color3.fromRGB(98, 160, 230)
-				end)
-				field.FocusLost:Connect(function()
-					local value
-					if row.kind == "number" then
-						value = tonumber(field.Text)
-					else
-						value = field.Text
-					end
-					if value == nil or not Tuning.set(row.id, value) then
-						field.BorderColor3 = Color3.fromRGB(222, 84, 72)
-						task.delay(0.4, paint)
-						field.Text = tostring(Tuning.get(row.id))
-					else
-						paint()
-					end
-				end)
-			end
-
-			rowViews[row.id] = paint
-			paint()
 		end
 
-		scroll.CanvasPosition = Vector2.zero
+		if keepScroll then
+			task.defer(function()
+				scroll.CanvasPosition = position
+			end)
+		else
+			scroll.CanvasPosition = Vector2.zero
+		end
 		styleStrip()
 		modifiedLabel.Text = string.format("%d MODIFIED", Tuning.count())
 	end
@@ -696,9 +908,22 @@ local function buildTuning(page, Tuning)
 		modifiedLabel.Text = string.format("%d MODIFIED", Tuning.count())
 	end))
 
+	table.insert(links, Tuning.structureChanged.Event:Connect(function()
+		if visible and page.Visible then
+			populate(true)
+		else
+			dirty = true
+		end
+	end))
+
 	populate()
 
 	return function()
+		if dirty then
+			dirty = false
+			populate(true)
+			return
+		end
 		for _, paint in pairs(rowViews) do
 			paint()
 		end
