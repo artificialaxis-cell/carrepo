@@ -4,6 +4,17 @@ Tuning.rows = {}
 Tuning.byId = {}
 Tuning.byCategory = {}
 Tuning.categories = {}
+Tuning.groups = {}
+Tuning.lists = {}
+Tuning.listIds = {}
+Tuning.templates = {}
+Tuning.fieldNames = {
+	["engine.torqueCurve"] = { "rpm", "torque" },
+}
+Tuning.collapsed = {}
+Tuning.soundNames = {}
+Tuning.soundByName = {}
+Tuning.soundById = {}
 Tuning.overrides = _G.HubOverrides or {}
 Tuning.live = nil
 Tuning.configs = {}
@@ -14,6 +25,8 @@ Tuning.hooks = {
 	onDelete = nil,
 }
 Tuning.changed = Instance.new("BindableEvent")
+Tuning.structureChanged = Instance.new("BindableEvent")
+Tuning.collapseChanged = Instance.new("BindableEvent")
 
 _G.HubOverrides = Tuning.overrides
 
@@ -79,6 +92,37 @@ for _, item in ipairs(Enum.ReverbType:GetEnumItems()) do
 	table.insert(options["sounds.mix.reverbType"], item.Name)
 end
 
+local function cloneDeep(value)
+	if type(value) ~= "table" then
+		return value
+	end
+	local copy = {}
+	for key, inner in pairs(value) do
+		copy[key] = cloneDeep(inner)
+	end
+	return copy
+end
+
+local function deepEqual(a, b)
+	if type(a) ~= type(b) then
+		return false
+	end
+	if type(a) ~= "table" then
+		return a == b
+	end
+	for key, value in pairs(a) do
+		if not deepEqual(value, b[key]) then
+			return false
+		end
+	end
+	for key in pairs(b) do
+		if a[key] == nil then
+			return false
+		end
+	end
+	return true
+end
+
 local function sortedKeys(node)
 	local keys = {}
 	for key in pairs(node) do
@@ -93,7 +137,47 @@ local function sortedKeys(node)
 	return keys
 end
 
-local function addRow(path, value)
+local function isSoundPath(path)
+	if path[1] ~= "sounds" then
+		return false
+	end
+	for _, key in ipairs(path) do
+		if type(key) == "string" then
+			local lower = string.lower(key)
+			if lower == "id" or lower:sub(-2) == "id" or lower:sub(-3) == "ids" or lower:find("asset", 1, true) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function classify(node)
+	local count = 0
+	local minKey = math.huge
+	local maxKey = -math.huge
+	for key in pairs(node) do
+		if type(key) ~= "number" or key ~= math.floor(key) then
+			return nil
+		end
+		count += 1
+		if key < minKey then
+			minKey = key
+		end
+		if key > maxKey then
+			maxKey = key
+		end
+	end
+	if count == 0 then
+		return "array"
+	end
+	if minKey == 1 and maxKey == count then
+		return "array"
+	end
+	return "keyed"
+end
+
+local function place(path)
 	local parts = {}
 	for index, key in ipairs(path) do
 		parts[index] = tostring(key)
@@ -119,13 +203,20 @@ local function addRow(path, value)
 	end
 
 	local live = false
+	local probe = id .. "."
 	for _, prefix in ipairs(livePrefixes) do
-		if id:sub(1, #prefix) == prefix then
+		if probe:sub(1, #prefix) == prefix then
 			live = true
 			break
 		end
 	end
 
+	return id, category, group, from, live, parts
+end
+
+local function addRow(path, value)
+	local id, category, group, from, live, parts = place(path)
+	local kind = type(value)
 	local row = {
 		id = id,
 		index = #Tuning.rows + 1,
@@ -133,14 +224,163 @@ local function addRow(path, value)
 		category = category,
 		group = group,
 		label = table.concat(parts, ".", from),
-		kind = type(value),
+		kind = kind,
 		default = value,
 		options = options[id],
 		live = live,
+		soundId = kind ~= "boolean" and isSoundPath(path),
 	}
 	table.insert(Tuning.rows, row)
 	table.insert(Tuning.byCategory[category], row)
 	Tuning.byId[id] = row
+end
+
+local function addList(path, node)
+	local id, category, group, from, live, parts = place(path)
+	local keyed = classify(node) == "keyed"
+	local items = {}
+	if keyed then
+		for _, key in ipairs(sortedKeys(node)) do
+			items[#items + 1] = { key = key, value = cloneDeep(node[key]) }
+		end
+	else
+		for index = 1, #node do
+			items[index] = { value = cloneDeep(node[index]) }
+		end
+	end
+
+	local entry = {
+		id = id,
+		path = path,
+		category = category,
+		group = group,
+		keyed = keyed,
+		live = live,
+		sound = isSoundPath(path),
+		default = cloneDeep(items),
+		items = items,
+		itemRows = {},
+		rowIds = {},
+	}
+	local row = {
+		id = id,
+		index = #Tuning.rows + 1,
+		path = path,
+		category = category,
+		group = group,
+		label = table.concat(parts, ".", from),
+		kind = "list",
+		live = live,
+		list = entry,
+	}
+	entry.row = row
+
+	Tuning.lists[id] = entry
+	table.insert(Tuning.listIds, id)
+	table.insert(Tuning.rows, row)
+	table.insert(Tuning.byCategory[category], row)
+	Tuning.byId[id] = row
+end
+
+local function collectLeaves(entry, index, value, sub, defaultValue, out)
+	if type(value) == "table" then
+		for _, key in ipairs(sortedKeys(value)) do
+			local nextSub = table.clone(sub)
+			nextSub[#nextSub + 1] = key
+			local inner = nil
+			if type(defaultValue) == "table" then
+				inner = defaultValue[key]
+			end
+			collectLeaves(entry, index, value[key], nextSub, inner, out)
+		end
+		return
+	end
+
+	local kind = type(value)
+	if kind ~= "number" and kind ~= "string" and kind ~= "boolean" then
+		return
+	end
+
+	local names = Tuning.fieldNames[entry.id]
+	local check = table.clone(entry.path)
+	local parts = {}
+	for position, key in ipairs(sub) do
+		check[#check + 1] = key
+		parts[position] = tostring(key)
+	end
+
+	local label
+	if #sub == 0 then
+		label = names and names[entry.keyed and 2 or 1] or "value"
+	elseif #sub == 1 and names and type(sub[1]) == "number" and names[sub[1]] then
+		label = names[sub[1]]
+	else
+		label = table.concat(parts, ".")
+	end
+
+	local default = value
+	if type(defaultValue) == kind then
+		default = defaultValue
+	end
+
+	local id = entry.id .. "." .. index .. "." .. (#sub == 0 and "value" or table.concat(parts, "."))
+	local row = {
+		id = id,
+		category = entry.category,
+		group = entry.group,
+		label = label,
+		kind = kind,
+		default = default,
+		live = entry.live,
+		list = entry,
+		item = index,
+		sub = sub,
+		soundId = kind ~= "boolean" and isSoundPath(check),
+	}
+	table.insert(out, row)
+	table.insert(entry.rowIds, id)
+	Tuning.byId[id] = row
+end
+
+local function buildRows(entry)
+	for _, rowId in ipairs(entry.rowIds) do
+		Tuning.byId[rowId] = nil
+	end
+	entry.rowIds = {}
+	entry.itemRows = {}
+
+	local names = Tuning.fieldNames[entry.id]
+	for index, item in ipairs(entry.items) do
+		local out = {}
+		local counterpart = entry.default[index]
+		if entry.keyed then
+			counterpart = nil
+			for _, candidate in ipairs(entry.default) do
+				if candidate.key == item.key then
+					counterpart = candidate
+					break
+				end
+			end
+			local keyId = entry.id .. "." .. index .. ".@key"
+			local row = {
+				id = keyId,
+				category = entry.category,
+				group = entry.group,
+				label = names and names[1] or "key",
+				kind = "number",
+				default = item.key,
+				live = entry.live,
+				list = entry,
+				item = index,
+				isKey = true,
+			}
+			table.insert(out, row)
+			table.insert(entry.rowIds, keyId)
+			Tuning.byId[keyId] = row
+		end
+		collectLeaves(entry, index, item.value, {}, counterpart and counterpart.value, out)
+		entry.itemRows[index] = out
+	end
 end
 
 local function walk(node, path)
@@ -149,11 +389,125 @@ local function walk(node, path)
 		local nextPath = table.clone(path)
 		nextPath[#nextPath + 1] = key
 		if type(value) == "table" then
-			walk(value, nextPath)
+			if classify(value) then
+				addList(nextPath, value)
+			else
+				walk(value, nextPath)
+			end
 		elseif type(value) == "number" or type(value) == "string" or type(value) == "boolean" then
 			addRow(nextPath, value)
 		end
 	end
+end
+
+local function readField(row)
+	local item = row.list.items[row.item]
+	if not item then
+		return nil
+	end
+	if row.isKey then
+		return item.key
+	end
+	local node = item.value
+	for _, key in ipairs(row.sub) do
+		if type(node) ~= "table" then
+			return nil
+		end
+		node = node[key]
+	end
+	return node
+end
+
+local function writeField(row, value)
+	local item = row.list.items[row.item]
+	if not item then
+		return
+	end
+	if row.isKey then
+		item.key = value
+		return
+	end
+	if #row.sub == 0 then
+		item.value = value
+		return
+	end
+	local node = item.value
+	for index = 1, #row.sub - 1 do
+		node = node[row.sub[index]]
+	end
+	node[row.sub[#row.sub]] = value
+end
+
+local function nodeFromItems(entry, items)
+	local node = {}
+	for index, item in ipairs(items) do
+		if entry.keyed then
+			node[item.key] = cloneDeep(item.value)
+		else
+			node[index] = cloneDeep(item.value)
+		end
+	end
+	return node
+end
+
+local function validateItems(entry, data)
+	if type(data) ~= "table" then
+		return nil
+	end
+	local clean = {}
+	local seen = {}
+	for index, item in ipairs(data) do
+		if type(item) ~= "table" or item.value == nil then
+			return nil
+		end
+		if entry.keyed then
+			if type(item.key) ~= "number" or item.key ~= item.key or seen[item.key] then
+				return nil
+			end
+			seen[item.key] = true
+		end
+		clean[index] = { key = item.key, value = cloneDeep(item.value) }
+	end
+	return clean
+end
+
+local function commit(entry)
+	if deepEqual(entry.items, entry.default) then
+		Tuning.overrides[entry.id] = nil
+	else
+		Tuning.overrides[entry.id] = cloneDeep(entry.items)
+	end
+
+	if not entry.live or not Tuning.live then
+		return
+	end
+	local node = Tuning.live
+	for index = 1, #entry.path - 1 do
+		node = node[entry.path[index]]
+		if type(node) ~= "table" then
+			return
+		end
+	end
+	local key = entry.path[#entry.path]
+	local fresh = nodeFromItems(entry, entry.items)
+	local target = node[key]
+	if type(target) == "table" then
+		for existing in pairs(target) do
+			target[existing] = nil
+		end
+		for newKey, newValue in pairs(fresh) do
+			target[newKey] = newValue
+		end
+	else
+		node[key] = fresh
+	end
+end
+
+local function refresh(entry)
+	buildRows(entry)
+	commit(entry)
+	Tuning.changed:Fire(entry.id)
+	Tuning.structureChanged:Fire(entry.id)
 end
 
 local function writeLive(row, value)
@@ -170,10 +524,172 @@ local function writeLive(row, value)
 	node[row.path[#row.path]] = value
 end
 
+function Tuning.refreshSounds()
+	local names = {}
+	local byName = {}
+	local byId = {}
+	local roots = {
+		game:GetService("ReplicatedStorage").CarSounds,
+	}
+	for _, root in ipairs(roots) do
+		for _, inst in ipairs(root:GetDescendants()) do
+			if inst:IsA("Sound") then
+				local id = tonumber(string.match(inst.SoundId, "rbxassetid://(%d+)") or string.match(inst.SoundId, "[?&]id=(%d+)"))
+				if id and id ~= 0 then
+					local unique = inst.Name
+					local copy = 1
+					while byName[unique] and byName[unique] ~= id do
+						copy += 1
+						unique = inst.Name .. " (" .. copy .. ")"
+					end
+					if not byName[unique] then
+						byName[unique] = id
+						table.insert(names, unique)
+						if not byId[id] then
+							byId[id] = unique
+						end
+					end
+				end
+			end
+		end
+	end
+	table.sort(names, function(a, b)
+		return string.lower(a) < string.lower(b)
+	end)
+	Tuning.soundNames = names
+	Tuning.soundByName = byName
+	Tuning.soundById = byId
+	return #names
+end
+
+function Tuning.searchSounds(query, limit)
+	local needle = string.lower(query or "")
+	local found = {}
+	for _, name in ipairs(Tuning.soundNames) do
+		if needle == "" or string.find(string.lower(name), needle, 1, true) then
+			found[#found + 1] = name
+			if limit and #found >= limit then
+				break
+			end
+		end
+	end
+	return found
+end
+
+function Tuning.resolveSound(input, kind)
+	local id = nil
+	if type(input) == "number" then
+		id = input
+	elseif type(input) == "string" then
+		local text = string.match(input, "^%s*(.-)%s*$")
+		if text == "" then
+			return nil
+		end
+		id = tonumber(string.match(text, "^rbxassetid://(%d+)$") or string.match(text, "^%d+$"))
+		if not id then
+			local key = string.lower(text)
+			for name, value in pairs(Tuning.soundByName) do
+				if string.lower(name) == key then
+					id = value
+					break
+				end
+			end
+		end
+		if not id then
+			local found = Tuning.searchSounds(text)
+			if #found == 1 then
+				id = Tuning.soundByName[found[1]]
+			end
+		end
+	end
+	if not id or id < 0 or id ~= math.floor(id) or id == math.huge then
+		return nil
+	end
+	if kind == "string" then
+		return "rbxassetid://" .. id
+	end
+	return id
+end
+
+function Tuning.soundLabel(value)
+	local id = tonumber(value) or tonumber(string.match(tostring(value), "%d+"))
+	if id and Tuning.soundById[id] then
+		return Tuning.soundById[id]
+	end
+	return tostring(value)
+end
+
+function Tuning.isCollapsed(key)
+	local state = Tuning.collapsed[key]
+	if state == nil then
+		local entry = Tuning.lists[key]
+		return entry ~= nil and #entry.items > 4
+	end
+	return state
+end
+
+function Tuning.setCollapsed(key, state)
+	Tuning.collapsed[key] = state and true or false
+	Tuning.collapseChanged:Fire(key, Tuning.collapsed[key])
+end
+
+function Tuning.toggleCollapsed(key)
+	local state = not Tuning.isCollapsed(key)
+	Tuning.setCollapsed(key, state)
+	return state
+end
+
+function Tuning.setAllCollapsed(state)
+	for _, groups in pairs(Tuning.groups) do
+		for _, group in ipairs(groups) do
+			Tuning.collapsed[group.key] = state and true or false
+		end
+	end
+	for _, id in ipairs(Tuning.listIds) do
+		Tuning.collapsed[id] = state and true or false
+	end
+	Tuning.collapseChanged:Fire(nil, state and true or false)
+end
+
+function Tuning.modifiedCount(rows)
+	local total = 0
+	for _, row in ipairs(rows) do
+		if Tuning.overrides[row.id] ~= nil then
+			total += 1
+		end
+	end
+	return total
+end
+
+function Tuning.itemTitle(id, index)
+	local entry = Tuning.lists[id]
+	local item = entry and entry.items[index]
+	if not item then
+		return ""
+	end
+	if entry.keyed then
+		local names = Tuning.fieldNames[id]
+		return (names and names[1] or "key") .. " " .. tostring(item.key)
+	end
+	return "#" .. index
+end
+
 function Tuning.apply(stats)
 	for id, value in pairs(Tuning.overrides) do
 		local row = Tuning.byId[id]
-		if row then
+		local list = Tuning.lists[id]
+		if list then
+			local node = stats
+			for index = 1, #list.path - 1 do
+				node = node[list.path[index]]
+				if type(node) ~= "table" then
+					break
+				end
+			end
+			if type(node) == "table" then
+				node[list.path[#list.path]] = nodeFromItems(list, value)
+			end
+		elseif row and not row.list then
 			local node = stats
 			for index = 1, #row.path - 1 do
 				node = node[row.path[index]]
@@ -223,6 +739,72 @@ function Tuning.install()
 		end)
 	end
 
+	for _, id in ipairs(Tuning.listIds) do
+		local entry = Tuning.lists[id]
+		if Tuning.templates[id] then
+			entry.template = cloneDeep(Tuning.templates[id])
+		elseif #entry.default > 0 then
+			entry.template = cloneDeep(entry.default[#entry.default])
+		end
+	end
+
+	for _, id in ipairs(Tuning.listIds) do
+		local entry = Tuning.lists[id]
+		if not entry.template then
+			local name = entry.path[#entry.path]
+			for _, otherId in ipairs(Tuning.listIds) do
+				local other = Tuning.lists[otherId]
+				if other.template and other.path[#other.path] == name and other.keyed == entry.keyed then
+					entry.template = cloneDeep(other.template)
+					break
+				end
+			end
+		end
+		if not entry.template then
+			entry.template = { key = entry.keyed and 0 or nil, value = 0 }
+		end
+	end
+
+	for id, value in pairs(Tuning.overrides) do
+		local entry = Tuning.lists[id]
+		if entry then
+			local clean = validateItems(entry, value)
+			if clean then
+				entry.items = clean
+			else
+				Tuning.overrides[id] = nil
+			end
+		end
+	end
+
+	for _, id in ipairs(Tuning.listIds) do
+		buildRows(Tuning.lists[id])
+	end
+
+	for id in pairs(Tuning.overrides) do
+		local row = Tuning.byId[id]
+		if row and row.list and not Tuning.lists[id] then
+			Tuning.overrides[id] = nil
+		end
+	end
+
+	for _, category in ipairs(Tuning.categories) do
+		local groups = {}
+		local byName = {}
+		for _, row in ipairs(Tuning.byCategory[category]) do
+			local group = byName[row.group]
+			if not group then
+				group = { key = category .. "/" .. row.group, name = row.group, category = category, rows = {} }
+				byName[row.group] = group
+				table.insert(groups, group)
+			end
+			table.insert(group.rows, row)
+		end
+		Tuning.groups[category] = groups
+	end
+
+	Tuning.refreshSounds()
+
 	_G.ReturnStats = function(car, mass)
 		local stats = base(car, mass)
 		Tuning.apply(stats)
@@ -233,15 +815,25 @@ function Tuning.install()
 end
 
 function Tuning.get(id)
+	local row = Tuning.byId[id]
+	if row and row.list then
+		if row.list.id == id then
+			return cloneDeep(row.list.items)
+		end
+		return readField(row)
+	end
 	local value = Tuning.overrides[id]
 	if value == nil then
-		local row = Tuning.byId[id]
 		return row and row.default
 	end
 	return value
 end
 
 function Tuning.isModified(id)
+	local row = Tuning.byId[id]
+	if row and row.list and row.list.id ~= id then
+		return not deepEqual(readField(row), row.default)
+	end
 	return Tuning.overrides[id] ~= nil
 end
 
@@ -255,7 +847,16 @@ end
 
 function Tuning.set(id, value)
 	local row = Tuning.byId[id]
-	if not row or type(value) ~= row.kind then
+	if not row or row.kind == "list" then
+		return false
+	end
+	if row.soundId then
+		value = Tuning.resolveSound(value, row.kind)
+		if value == nil then
+			return false
+		end
+	end
+	if type(value) ~= row.kind then
 		return false
 	end
 	if row.kind == "number" and (value ~= value or value == math.huge or value == -math.huge) then
@@ -263,6 +864,27 @@ function Tuning.set(id, value)
 	end
 	if row.options and not table.find(row.options, value) then
 		return false
+	end
+
+	if row.list then
+		local entry = row.list
+		if row.isKey then
+			for index, item in ipairs(entry.items) do
+				if index ~= row.item and item.key == value then
+					return false
+				end
+			end
+			writeField(row, value)
+			table.sort(entry.items, function(a, b)
+				return a.key < b.key
+			end)
+			refresh(entry)
+			return true
+		end
+		writeField(row, value)
+		commit(entry)
+		Tuning.changed:Fire(id)
+		return true
 	end
 
 	if value == row.default then
@@ -280,6 +902,17 @@ function Tuning.reset(id)
 	if not row then
 		return false
 	end
+	if row.list then
+		if row.list.id == id then
+			row.list.items = cloneDeep(row.list.default)
+			refresh(row.list)
+			return true
+		end
+		if row.default == nil then
+			return false
+		end
+		return Tuning.set(id, row.default)
+	end
 	Tuning.overrides[id] = nil
 	writeLive(row, row.default)
 	Tuning.changed:Fire(id)
@@ -288,17 +921,95 @@ end
 
 function Tuning.resetAll()
 	for id in pairs(Tuning.overrides) do
+		local entry = Tuning.lists[id]
 		local row = Tuning.byId[id]
 		Tuning.overrides[id] = nil
-		if row then
+		if entry then
+			entry.items = cloneDeep(entry.default)
+			buildRows(entry)
+			commit(entry)
+		elseif row and not row.list then
 			writeLive(row, row.default)
 		end
 	end
 	Tuning.changed:Fire(nil)
+	Tuning.structureChanged:Fire(nil)
+end
+
+function Tuning.setList(id, items)
+	local entry = Tuning.lists[id]
+	if not entry then
+		return false
+	end
+	local clean = validateItems(entry, items)
+	if not clean then
+		return false
+	end
+	entry.items = clean
+	refresh(entry)
+	return true
+end
+
+function Tuning.listAdd(id, after)
+	local entry = Tuning.lists[id]
+	if not entry then
+		return nil
+	end
+	local count = #entry.items
+	local position = math.clamp(after and after + 1 or count + 1, 1, count + 1)
+	local item = cloneDeep(entry.items[after or count] or entry.template)
+
+	if entry.keyed then
+		local previous = entry.items[position - 1]
+		local following = entry.items[position]
+		local key = 0
+		if previous and following then
+			key = (previous.key + following.key) / 2
+		elseif previous and entry.items[position - 2] then
+			key = previous.key + (previous.key - entry.items[position - 2].key)
+		elseif previous then
+			key = previous.key + 1
+		elseif following then
+			key = following.key - 1
+		end
+		item.key = key
+	end
+
+	table.insert(entry.items, position, item)
+	refresh(entry)
+	return position
+end
+
+function Tuning.listRemove(id, index)
+	local entry = Tuning.lists[id]
+	if not entry or not entry.items[index] then
+		return false
+	end
+	table.remove(entry.items, index)
+	refresh(entry)
+	return true
+end
+
+function Tuning.listMove(id, index, direction)
+	local entry = Tuning.lists[id]
+	if not entry or entry.keyed then
+		return nil
+	end
+	local target = index + direction
+	if not entry.items[index] or not entry.items[target] then
+		return nil
+	end
+	entry.items[index], entry.items[target] = entry.items[target], entry.items[index]
+	refresh(entry)
+	return target
 end
 
 function Tuning.snapshot()
-	return { version = 1, values = table.clone(Tuning.overrides) }
+	return {
+		version = 1,
+		values = cloneDeep(Tuning.overrides),
+		collapsed = table.clone(Tuning.collapsed),
+	}
 end
 
 function Tuning.restore(data)
@@ -307,7 +1018,15 @@ function Tuning.restore(data)
 	end
 	Tuning.resetAll()
 	for id, value in pairs(data.values) do
-		Tuning.set(id, value)
+		if Tuning.lists[id] then
+			Tuning.setList(id, value)
+		else
+			Tuning.set(id, value)
+		end
+	end
+	if type(data.collapsed) == "table" then
+		Tuning.collapsed = table.clone(data.collapsed)
+		Tuning.collapseChanged:Fire(nil)
 	end
 	return true
 end
