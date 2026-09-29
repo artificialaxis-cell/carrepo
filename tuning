@@ -531,34 +531,28 @@ function Tuning.refreshSounds()
 	local roots = {
 		game:GetService("ReplicatedStorage").CarSounds,
 	}
+
 	for _, root in ipairs(roots) do
 		for _, inst in ipairs(root:GetDescendants()) do
-			if inst:IsA("Sound") then
-				local id = tonumber(string.match(inst.SoundId, "rbxassetid://(%d+)") or string.match(inst.SoundId, "[?&]id=(%d+)"))
-				if id and id ~= 0 then
-					local unique = inst.Name
-					local copy = 1
-					while byName[unique] and byName[unique] ~= id do
-						copy += 1
-						unique = inst.Name .. " (" .. copy .. ")"
-					end
-					if not byName[unique] then
-						byName[unique] = id
-						table.insert(names, unique)
-						if not byId[id] then
-							byId[id] = unique
-						end
-					end
+			if inst:IsA("Sound") and inst.SoundId ~= "" then
+				local name = inst.Name
+
+				if not byName[name] then
+					byName[name] = inst.SoundId
+					table.insert(names, name)
 				end
 			end
 		end
 	end
+
 	table.sort(names, function(a, b)
 		return string.lower(a) < string.lower(b)
 	end)
+
 	Tuning.soundNames = names
 	Tuning.soundByName = byName
 	Tuning.soundById = byId
+
 	return #names
 end
 
@@ -577,38 +571,49 @@ function Tuning.searchSounds(query, limit)
 end
 
 function Tuning.resolveSound(input, kind)
-	local id = nil
-	if type(input) == "number" then
-		id = input
-	elseif type(input) == "string" then
+	local value
+
+	if type(input) == "string" then
 		local text = string.match(input, "^%s*(.-)%s*$")
 		if text == "" then
 			return nil
 		end
-		id = tonumber(string.match(text, "^rbxassetid://(%d+)$") or string.match(text, "^%d+$"))
-		if not id then
+
+		value = Tuning.soundByName[text]
+
+		if not value then
 			local key = string.lower(text)
-			for name, value in pairs(Tuning.soundByName) do
+
+			for name, soundId in pairs(Tuning.soundByName) do
 				if string.lower(name) == key then
-					id = value
+					value = soundId
 					break
 				end
 			end
 		end
-		if not id then
+
+		if not value then
 			local found = Tuning.searchSounds(text)
 			if #found == 1 then
-				id = Tuning.soundByName[found[1]]
+				value = Tuning.soundByName[found[1]]
 			end
 		end
+
+		if value then
+			return value
+		end
+
+		local numeric = tonumber(string.match(text, "^rbxassetid://(%d+)$") or string.match(text, "^%d+$"))
+		if numeric then
+			return kind == "string" and "rbxassetid://" .. numeric or numeric
+		end
 	end
-	if not id or id < 0 or id ~= math.floor(id) or id == math.huge then
-		return nil
+
+	if type(input) == "number" then
+		return kind == "string" and "rbxassetid://" .. input or input
 	end
-	if kind == "string" then
-		return "rbxassetid://" .. id
-	end
-	return id
+
+	return nil
 end
 
 function Tuning.soundLabel(value)
