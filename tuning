@@ -1,0 +1,323 @@
+local Tuning = {}
+
+Tuning.rows = {}
+Tuning.byId = {}
+Tuning.byCategory = {}
+Tuning.categories = {}
+Tuning.overrides = _G.HubOverrides or {}
+Tuning.live = nil
+Tuning.configs = {}
+Tuning.hooks = {
+	onSave = nil,
+	onLoad = nil,
+	onList = nil,
+	onDelete = nil,
+}
+Tuning.changed = Instance.new("BindableEvent")
+
+_G.HubOverrides = Tuning.overrides
+
+local categoryOf = {
+	massKg = "CHASSIS",
+	wheelRadiusMeters = "CHASSIS",
+	wheelInertia = "CHASSIS",
+	cgHeightMeters = "CHASSIS",
+	wheelbaseMeters = "CHASSIS",
+	aero = "CHASSIS",
+	debug = "CHASSIS",
+	steerResponseTimeActive = "CONTROLS",
+	steerResponseTimeInactive = "CONTROLS",
+	throttleResponseTime = "CONTROLS",
+	brakeResponseTime = "CONTROLS",
+	clutchResponseTime = "CONTROLS",
+	maxSteerDegrees = "CONTROLS",
+	frictconfig = "TIRES",
+	engine = "ENGINE",
+	clutch = "DRIVETRAIN",
+	transmission = "DRIVETRAIN",
+	brakes = "BRAKES",
+	sounds = "SOUNDS",
+}
+
+local rank = {
+	CHASSIS = 1,
+	CONTROLS = 2,
+	TIRES = 3,
+	ENGINE = 4,
+	DRIVETRAIN = 5,
+	BRAKES = 6,
+	SOUNDS = 7,
+}
+
+local livePrefixes = {
+	"steerResponseTime",
+	"throttleResponseTime",
+	"brakeResponseTime",
+	"clutchResponseTime",
+	"frictconfig.",
+	"brakes.",
+	"aero.rho",
+	"aero.Cd",
+	"aero.area",
+	"cgHeightMeters",
+	"wheelbaseMeters",
+	"debug.",
+	"engine.idleControl.",
+	"engine.revLimiter.",
+	"engine.torqueCurve.",
+}
+
+local options = {
+	["transmission.type"] = { "RWD", "FWD", "AWD" },
+	["transmission.differential.type"] = { "OPEN", "LIMITED", "TORSEN", "CLUTCH_LSD", "LOCKED", "WELDED" },
+	["transmission.awd.centerDiff"] = { "OPEN", "LIMITED", "TORSEN", "CLUTCH_LSD", "LOCKED", "WELDED" },
+	["transmission.gearbox"] = { "MANUAL", "ASSISTED", "AUTOMATIC" },
+	["sounds.mix.reverbType"] = {},
+}
+
+for _, item in ipairs(Enum.ReverbType:GetEnumItems()) do
+	table.insert(options["sounds.mix.reverbType"], item.Name)
+end
+
+local function sortedKeys(node)
+	local keys = {}
+	for key in pairs(node) do
+		keys[#keys + 1] = key
+	end
+	table.sort(keys, function(a, b)
+		if type(a) == type(b) then
+			return a < b
+		end
+		return type(a) == "number"
+	end)
+	return keys
+end
+
+local function addRow(path, value)
+	local parts = {}
+	for index, key in ipairs(path) do
+		parts[index] = tostring(key)
+	end
+
+	local id = table.concat(parts, ".")
+	local root = parts[1]
+	local group = "CORE"
+	local from = 1
+	if #path > 1 then
+		group = root
+		from = 2
+		if root == "sounds" and #path > 2 then
+			group = root .. "." .. parts[2]
+			from = 3
+		end
+	end
+
+	local category = categoryOf[root] or "OTHER"
+	if not Tuning.byCategory[category] then
+		Tuning.byCategory[category] = {}
+		table.insert(Tuning.categories, category)
+	end
+
+	local live = false
+	for _, prefix in ipairs(livePrefixes) do
+		if id:sub(1, #prefix) == prefix then
+			live = true
+			break
+		end
+	end
+
+	local row = {
+		id = id,
+		index = #Tuning.rows + 1,
+		path = path,
+		category = category,
+		group = group,
+		label = table.concat(parts, ".", from),
+		kind = type(value),
+		default = value,
+		options = options[id],
+		live = live,
+	}
+	table.insert(Tuning.rows, row)
+	table.insert(Tuning.byCategory[category], row)
+	Tuning.byId[id] = row
+end
+
+local function walk(node, path)
+	for _, key in ipairs(sortedKeys(node)) do
+		local value = node[key]
+		local nextPath = table.clone(path)
+		nextPath[#nextPath + 1] = key
+		if type(value) == "table" then
+			walk(value, nextPath)
+		elseif type(value) == "number" or type(value) == "string" or type(value) == "boolean" then
+			addRow(nextPath, value)
+		end
+	end
+end
+
+local function writeLive(row, value)
+	local node = Tuning.live
+	if not node then
+		return
+	end
+	for index = 1, #row.path - 1 do
+		node = node[row.path[index]]
+		if type(node) ~= "table" then
+			return
+		end
+	end
+	node[row.path[#row.path]] = value
+end
+
+function Tuning.apply(stats)
+	for id, value in pairs(Tuning.overrides) do
+		local row = Tuning.byId[id]
+		if row then
+			local node = stats
+			for index = 1, #row.path - 1 do
+				node = node[row.path[index]]
+				if type(node) ~= "table" then
+					break
+				end
+			end
+			if type(node) == "table" then
+				node[row.path[#row.path]] = value
+			end
+		end
+	end
+end
+
+function Tuning.install()
+	local base = _G.ReturnStats
+	if type(base) ~= "function" then
+		warn("Tuning: _G.ReturnStats is not defined")
+		return
+	end
+
+	local ok, template = pcall(base, {
+		Wheels = { FL = { Bounds = { Size = Vector3.new(1.175, 3.5626, 3.402) } } },
+	}, nil)
+	if not ok then
+		warn("Tuning: could not read default stats - " .. tostring(template))
+		return
+	end
+
+	walk(template, {})
+
+	table.sort(Tuning.categories, function(a, b)
+		return (rank[a] or 99) < (rank[b] or 99)
+	end)
+
+	for _, rows in pairs(Tuning.byCategory) do
+		table.sort(rows, function(a, b)
+			if a.group ~= b.group then
+				if a.group == "CORE" then
+					return true
+				elseif b.group == "CORE" then
+					return false
+				end
+				return a.group < b.group
+			end
+			return a.index < b.index
+		end)
+	end
+
+	_G.ReturnStats = function(car, mass)
+		local stats = base(car, mass)
+		Tuning.apply(stats)
+		Tuning.live = stats
+		Tuning.changed:Fire(nil, "live")
+		return stats
+	end
+end
+
+function Tuning.get(id)
+	local value = Tuning.overrides[id]
+	if value == nil then
+		local row = Tuning.byId[id]
+		return row and row.default
+	end
+	return value
+end
+
+function Tuning.isModified(id)
+	return Tuning.overrides[id] ~= nil
+end
+
+function Tuning.count()
+	local total = 0
+	for _ in pairs(Tuning.overrides) do
+		total += 1
+	end
+	return total
+end
+
+function Tuning.set(id, value)
+	local row = Tuning.byId[id]
+	if not row or type(value) ~= row.kind then
+		return false
+	end
+	if row.kind == "number" and (value ~= value or value == math.huge or value == -math.huge) then
+		return false
+	end
+	if row.options and not table.find(row.options, value) then
+		return false
+	end
+
+	if value == row.default then
+		Tuning.overrides[id] = nil
+	else
+		Tuning.overrides[id] = value
+	end
+	writeLive(row, value)
+	Tuning.changed:Fire(id)
+	return true
+end
+
+function Tuning.reset(id)
+	local row = Tuning.byId[id]
+	if not row then
+		return false
+	end
+	Tuning.overrides[id] = nil
+	writeLive(row, row.default)
+	Tuning.changed:Fire(id)
+	return true
+end
+
+function Tuning.resetAll()
+	for id in pairs(Tuning.overrides) do
+		local row = Tuning.byId[id]
+		Tuning.overrides[id] = nil
+		if row then
+			writeLive(row, row.default)
+		end
+	end
+	Tuning.changed:Fire(nil)
+end
+
+function Tuning.snapshot()
+	return { version = 1, values = table.clone(Tuning.overrides) }
+end
+
+function Tuning.restore(data)
+	if type(data) ~= "table" or type(data.values) ~= "table" then
+		return false
+	end
+	Tuning.resetAll()
+	for id, value in pairs(data.values) do
+		Tuning.set(id, value)
+	end
+	return true
+end
+
+function Tuning.save(name) end
+
+function Tuning.load(name) end
+
+function Tuning.list() end
+
+function Tuning.delete(name) end
+
+return Tuning
