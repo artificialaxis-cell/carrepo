@@ -14,10 +14,10 @@ local function grab(url)
 	return mod
 end
 
-local Connection 
+local Connection
 local CarInit
-local Tuning
-local UI
+local Tuning = require(script.Tuning)
+local UI = require(script.UI)
 
 if game.RunService:IsStudio() then
 	Connection = require(script.Connection)
