@@ -16,8 +16,8 @@ end
 
 local Connection
 local CarInit
-local Tuning = require(script.Tuning)
-local UI = require(script.UI)
+local Tuning
+local UI
 
 if game.RunService:IsStudio() then
 	Connection = require(script.Connection)
