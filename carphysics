@@ -909,6 +909,21 @@ function CarController:HandleCar(car)
 		[Enum.Material.Snow] = "dirt",
 		[Enum.Material.Glacier] = "dirt",
 	}
+	
+	local carsounds = game:GetService("ReplicatedStorage"):WaitForChild("CarSounds")
+
+	local function resolveSound(id)
+		if type(id) ~= "string" then
+			return id
+		end
+
+		local sound = carsounds:FindFirstChild(id, true)
+		if sound and sound:IsA("Sound") then
+			return sound.SoundId
+		end
+
+		return id
+	end
 
 	local spec = {
 		idle = cf.idle,
@@ -941,7 +956,7 @@ function CarController:HandleCar(car)
 		if c.id then
 			local s = Instance.new("Sound")
 			s.Name = key
-			s.SoundId = c.id
+			s.SoundId = resolveSound(c.id)
 			s.Looped = true
 			s.Volume = 0
 			s.RollOffMode = Enum.RollOffMode.InverseTapered
@@ -971,7 +986,7 @@ function CarController:HandleCar(car)
 			return
 		end
 		local s = Instance.new("Sound")
-		s.SoundId = id
+		s.SoundId = resolveSound(id)
 		s.Volume = vol or 1
 		s.PlaybackSpeed = pitch or 1
 		s.RollOffMode = Enum.RollOffMode.InverseTapered
