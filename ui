@@ -1,0 +1,1000 @@
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+local UI = {}
+
+UI.applied = 0
+
+local gui
+local window
+local toast
+local toastBar
+local toastText
+local toastSerial = 0
+local refreshAll
+local refreshers = {}
+local links = {}
+local visible = false
+
+local function new(class, props, parent)
+	local inst = Instance.new(class)
+	if inst:IsA("GuiObject") then
+		inst.BorderSizePixel = 0
+	end
+	for key, value in pairs(props) do
+		inst[key] = value
+	end
+	inst.Parent = parent
+	return inst
+end
+
+local function text(class, props, parent)
+	local base = {
+		BackgroundTransparency = 1,
+		TextSize = 11,
+		TextColor3 = Color3.fromRGB(196, 205, 216),
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Center,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	}
+	for key, value in pairs(props) do
+		base[key] = value
+	end
+	local weight = base.Bold and Enum.FontWeight.Bold or Enum.FontWeight.Regular
+	base.Bold = nil
+	base.FontFace = Font.new(Font.fromEnum(Enum.Font.RobotoMono).Family, weight)
+	return new(class, base, parent)
+end
+
+local function button(props, parent, onClick)
+	local base = {
+		AutoButtonColor = false,
+		BackgroundTransparency = 0,
+		BackgroundColor3 = Color3.fromRGB(24, 30, 39),
+		BorderSizePixel = 1,
+		BorderColor3 = Color3.fromRGB(48, 57, 70),
+		TextXAlignment = Enum.TextXAlignment.Center,
+	}
+	for key, value in pairs(props) do
+		base[key] = value
+	end
+	local btn = text("TextButton", base, parent)
+	btn.MouseEnter:Connect(function()
+		btn.BorderColor3 = Color3.fromRGB(98, 160, 230)
+	end)
+	btn.MouseLeave:Connect(function()
+		btn.BorderColor3 = base.BorderColor3
+	end)
+	if onClick then
+		btn.Activated:Connect(onClick)
+	end
+	return btn
+end
+
+local function buildConnection(page, Connection)
+	text("TextLabel", {
+		Text = "SERVER LINK",
+		Bold = true,
+		TextColor3 = Color3.fromRGB(98, 160, 230),
+		Size = UDim2.new(1, 0, 0, 16),
+	}, page)
+	new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(48, 57, 70),
+		Position = UDim2.new(0, 0, 0, 18),
+		Size = UDim2.new(1, 0, 0, 1),
+	}, page)
+
+	text("TextLabel", {
+		Text = "STATUS",
+		TextColor3 = Color3.fromRGB(110, 120, 134),
+		Position = UDim2.new(0, 0, 0, 26),
+		Size = UDim2.new(0, 80, 0, 18),
+	}, page)
+	local chip = new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(222, 84, 72),
+		Position = UDim2.new(0, 80, 0, 31),
+		Size = UDim2.new(0, 8, 0, 8),
+	}, page)
+	local status = text("TextLabel", {
+		Text = "NO CONNECTION",
+		Bold = true,
+		TextColor3 = Color3.fromRGB(232, 238, 246),
+		Position = UDim2.new(0, 96, 0, 26),
+		Size = UDim2.new(1, -96, 0, 18),
+	}, page)
+
+	text("TextLabel", {
+		Text = "DETAIL",
+		TextColor3 = Color3.fromRGB(110, 120, 134),
+		Position = UDim2.new(0, 0, 0, 46),
+		Size = UDim2.new(0, 80, 0, 18),
+	}, page)
+	local detail = text("TextLabel", {
+		Text = "",
+		TextColor3 = Color3.fromRGB(140, 150, 164),
+		Position = UDim2.new(0, 80, 0, 46),
+		Size = UDim2.new(1, -80, 0, 18),
+	}, page)
+
+	text("TextLabel", {
+		Text = "PLAYERS",
+		Bold = true,
+		TextColor3 = Color3.fromRGB(98, 160, 230),
+		Position = UDim2.new(0, 0, 0, 78),
+		Size = UDim2.new(0.5, 0, 0, 16),
+	}, page)
+	local count = text("TextLabel", {
+		Text = "0",
+		TextColor3 = Color3.fromRGB(110, 120, 134),
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Position = UDim2.new(0.5, 0, 0, 78),
+		Size = UDim2.new(0.5, 0, 0, 16),
+	}, page)
+	new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(48, 57, 70),
+		Position = UDim2.new(0, 0, 0, 96),
+		Size = UDim2.new(1, 0, 0, 1),
+	}, page)
+
+	local list = new("ScrollingFrame", {
+		BackgroundColor3 = Color3.fromRGB(10, 12, 16),
+		BorderSizePixel = 1,
+		BorderColor3 = Color3.fromRGB(34, 41, 52),
+		Position = UDim2.new(0, 0, 0, 104),
+		Size = UDim2.new(1, 0, 1, -104),
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = Color3.fromRGB(98, 160, 230),
+	}, page)
+	new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, list)
+	local empty = text("TextLabel", {
+		Text = "",
+		TextColor3 = Color3.fromRGB(110, 120, 134),
+		TextXAlignment = Enum.TextXAlignment.Center,
+		Position = UDim2.new(0, 0, 0, 104),
+		Size = UDim2.new(1, 0, 1, -104),
+		ZIndex = 2,
+	}, page)
+
+	local colors = {
+		DISCONNECTED = Color3.fromRGB(222, 84, 72),
+		CONNECTING = Color3.fromRGB(226, 168, 58),
+		CONNECTED = Color3.fromRGB(84, 196, 140),
+	}
+	local words = {
+		DISCONNECTED = "NO CONNECTION",
+		CONNECTING = "CONNECTING",
+		CONNECTED = "CONNECTED",
+	}
+
+	return function()
+		chip.BackgroundColor3 = colors[Connection.status] or colors.DISCONNECTED
+		status.Text = words[Connection.status] or words.DISCONNECTED
+		detail.Text = Connection.detail
+		count.Text = tostring(#Connection.players)
+		empty.Visible = #Connection.players == 0
+		empty.Text = Connection.status == "CONNECTED" and "NO PLAYERS" or "NO CONNECTION - PLAYER LIST UNAVAILABLE"
+
+		for _, child in ipairs(list:GetChildren()) do
+			if child:IsA("Frame") then
+				child:Destroy()
+			end
+		end
+		for index, entry in ipairs(Connection.players) do
+			local row = new("Frame", {
+				BackgroundColor3 = index % 2 == 0 and Color3.fromRGB(14, 18, 23) or Color3.fromRGB(10, 12, 16),
+				Size = UDim2.new(1, 0, 0, 20),
+				LayoutOrder = index,
+			}, list)
+			text("TextLabel", {
+				Text = string.format("%02d", index),
+				TextColor3 = Color3.fromRGB(110, 120, 134),
+				Position = UDim2.new(0, 8, 0, 0),
+				Size = UDim2.new(0, 28, 1, 0),
+			}, row)
+			text("TextLabel", {
+				Text = type(entry) == "table" and tostring(entry.name) or tostring(entry),
+				Position = UDim2.new(0, 40, 0, 0),
+				Size = UDim2.new(1, -48, 1, 0),
+			}, row)
+		end
+	end
+end
+
+local function buildInit(page, CarInit, Tuning)
+	text("TextLabel", {
+		Text = "INITIALIZATION",
+		Bold = true,
+		TextColor3 = Color3.fromRGB(98, 160, 230),
+		Size = UDim2.new(1, 0, 0, 16),
+	}, page)
+	new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(48, 57, 70),
+		Position = UDim2.new(0, 0, 0, 18),
+		Size = UDim2.new(1, 0, 0, 1),
+	}, page)
+
+	local chip = new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(110, 128, 150),
+		Position = UDim2.new(0, 0, 0, 32),
+		Size = UDim2.new(0, 10, 0, 10),
+	}, page)
+	local stateLabel = text("TextLabel", {
+		Text = "IDLE",
+		Bold = true,
+		TextSize = 15,
+		TextColor3 = Color3.fromRGB(232, 238, 246),
+		Position = UDim2.new(0, 18, 0, 26),
+		Size = UDim2.new(1, -18, 0, 22),
+	}, page)
+	local messageLabel = text("TextLabel", {
+		Text = "",
+		TextColor3 = Color3.fromRGB(140, 150, 164),
+		TextWrapped = true,
+		TextTruncate = Enum.TextTruncate.None,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		Position = UDim2.new(0, 0, 0, 52),
+		Size = UDim2.new(1, 0, 0, 28),
+	}, page)
+
+	new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(34, 41, 52),
+		Position = UDim2.new(0, 0, 0, 84),
+		Size = UDim2.new(1, 0, 0, 1),
+	}, page)
+
+	local values = {}
+	for index, name in ipairs({ "CAR", "LOADER", "BUILD TIME", "ATTEMPTS", "GEARBOX", "TUNING" }) do
+		text("TextLabel", {
+			Text = name,
+			TextColor3 = Color3.fromRGB(110, 120, 134),
+			Position = UDim2.new(0, 0, 0, 90 + (index - 1) * 18),
+			Size = UDim2.new(0, 90, 0, 18),
+		}, page)
+		values[name] = text("TextLabel", {
+			Text = "-",
+			Position = UDim2.new(0, 90, 0, 90 + (index - 1) * 18),
+			Size = UDim2.new(1, -90, 0, 18),
+		}, page)
+	end
+
+	local action = button({
+		Text = "INITIALIZE  [N]",
+		Bold = true,
+		TextSize = 12,
+		Position = UDim2.new(0, 0, 0, 206),
+		Size = UDim2.new(1, 0, 0, 32),
+	}, page, function()
+		local ok, reason = CarInit.request()
+		if not ok then
+			UI.notify("info", reason)
+		end
+	end)
+
+	text("TextLabel", {
+		Text = "EVENT LOG",
+		Bold = true,
+		TextColor3 = Color3.fromRGB(98, 160, 230),
+		Position = UDim2.new(0, 0, 0, 250),
+		Size = UDim2.new(1, 0, 0, 16),
+	}, page)
+	new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(48, 57, 70),
+		Position = UDim2.new(0, 0, 0, 268),
+		Size = UDim2.new(1, 0, 0, 1),
+	}, page)
+	local logBox = new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(10, 12, 16),
+		BorderSizePixel = 1,
+		BorderColor3 = Color3.fromRGB(34, 41, 52),
+		Position = UDim2.new(0, 0, 0, 274),
+		Size = UDim2.new(1, 0, 1, -274),
+	}, page)
+	new("UIPadding", {
+		PaddingLeft = UDim.new(0, 6),
+		PaddingRight = UDim.new(0, 6),
+		PaddingTop = UDim.new(0, 4),
+		PaddingBottom = UDim.new(0, 4),
+	}, logBox)
+	local logLabel = text("TextLabel", {
+		Text = "",
+		TextSize = 10,
+		TextColor3 = Color3.fromRGB(140, 150, 164),
+		TextWrapped = true,
+		TextTruncate = Enum.TextTruncate.None,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		Size = UDim2.new(1, 0, 1, 0),
+	}, logBox)
+
+	local colors = {
+		IDLE = Color3.fromRGB(110, 128, 150),
+		INITIALIZING = Color3.fromRGB(226, 168, 58),
+		ACTIVE = Color3.fromRGB(84, 196, 140),
+		FAILED = Color3.fromRGB(222, 84, 72),
+		ENDED = Color3.fromRGB(110, 120, 134),
+	}
+
+	return function()
+		local state = CarInit.state
+		local can = CarInit.canInitialize()
+
+		chip.BackgroundColor3 = colors[state] or colors.IDLE
+		stateLabel.Text = state
+		messageLabel.Text = CarInit.message
+
+		values.CAR.Text = CarInit.carName or "-"
+		values.LOADER.Text = CarInit.loader
+		values["BUILD TIME"].Text = CarInit.buildMs and (CarInit.buildMs .. " ms") or "-"
+		values.ATTEMPTS.Text = tostring(CarInit.attempts)
+		local car = CarInit.car
+		values.GEARBOX.Text = (car and car.Parent and car:GetAttribute("GearboxMode")) or "-"
+		values.TUNING.Text = string.format("%d OVERRIDES", Tuning.count())
+			.. (state == "ACTIVE" and string.format("  |  %d APPLIED AT INIT", UI.applied) or "")
+
+		if state == "INITIALIZING" then
+			action.Text = "INITIALIZING..."
+		elseif state == "ACTIVE" then
+			action.Text = "INITIALIZED"
+		elseif state == "ENDED" then
+			action.Text = "RESPAWN TO REINITIALIZE"
+		elseif state == "FAILED" and can then
+			action.Text = "RETRY  [N]"
+		elseif can then
+			action.Text = "INITIALIZE  [N]"
+		else
+			action.Text = "RESPAWN TO RETRY"
+		end
+		action.BackgroundColor3 = can and Color3.fromRGB(32, 64, 102) or Color3.fromRGB(20, 25, 32)
+		action.TextColor3 = can and Color3.fromRGB(232, 238, 246) or Color3.fromRGB(110, 120, 134)
+
+		logLabel.Text = table.concat(CarInit.log, "\n", math.max(1, #CarInit.log - 6), #CarInit.log)
+	end
+end
+
+local function buildTuning(page, Tuning)
+	local activeCategory = Tuning.categories[1]
+	if not activeCategory then
+		text("TextLabel", {
+			Text = "NO STATS AVAILABLE",
+			TextColor3 = Color3.fromRGB(110, 120, 134),
+			TextXAlignment = Enum.TextXAlignment.Center,
+			Size = UDim2.new(1, 0, 1, 0),
+		}, page)
+		return function() end
+	end
+
+	local strip = new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(12, 15, 19),
+		BorderSizePixel = 1,
+		BorderColor3 = Color3.fromRGB(34, 41, 52),
+		Size = UDim2.new(1, 0, 0, 24),
+	}, page)
+
+	local entries = {}
+	local rowViews = {}
+	local populate
+
+	local function styleStrip()
+		for category, entry in pairs(entries) do
+			local on = category == activeCategory
+			entry.button.BackgroundColor3 = on and Color3.fromRGB(28, 36, 47) or Color3.fromRGB(12, 15, 19)
+			entry.button.TextColor3 = on and Color3.fromRGB(232, 238, 246) or Color3.fromRGB(110, 120, 134)
+			entry.underline.Visible = on
+			local modified = 0
+			for _, row in ipairs(Tuning.byCategory[category]) do
+				if Tuning.isModified(row.id) then
+					modified += 1
+				end
+			end
+			entry.dot.Visible = modified > 0
+		end
+	end
+
+	for index, category in ipairs(Tuning.categories) do
+		local width = 1 / #Tuning.categories
+		local tab = button({
+			Text = category,
+			TextSize = 10,
+			BackgroundColor3 = Color3.fromRGB(12, 15, 19),
+			BorderSizePixel = 0,
+			Position = UDim2.new(width * (index - 1), 0, 0, 0),
+			Size = UDim2.new(width, 0, 1, 0),
+		}, strip, function()
+			activeCategory = category
+			populate()
+		end)
+		entries[category] = {
+			button = tab,
+			underline = new("Frame", {
+				BackgroundColor3 = Color3.fromRGB(98, 160, 230),
+				Position = UDim2.new(0, 0, 1, -2),
+				Size = UDim2.new(1, 0, 0, 2),
+				Visible = false,
+			}, tab),
+			dot = new("Frame", {
+				BackgroundColor3 = Color3.fromRGB(98, 160, 230),
+				Position = UDim2.new(1, -7, 0, 4),
+				Size = UDim2.new(0, 4, 0, 4),
+				Visible = false,
+			}, tab),
+		}
+	end
+
+	local title = text("TextLabel", {
+		Text = "",
+		Bold = true,
+		TextColor3 = Color3.fromRGB(98, 160, 230),
+		Position = UDim2.new(0, 0, 0, 32),
+		Size = UDim2.new(0.5, 0, 0, 16),
+	}, page)
+	local modifiedLabel = text("TextLabel", {
+		Text = "",
+		TextColor3 = Color3.fromRGB(110, 120, 134),
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Position = UDim2.new(0.5, 0, 0, 32),
+		Size = UDim2.new(0.5, 0, 0, 16),
+	}, page)
+	text("TextLabel", {
+		Text = "LIVE = APPLIES NOW    INIT = APPLIES AT NEXT INITIALIZATION",
+		TextSize = 9,
+		TextColor3 = Color3.fromRGB(110, 120, 134),
+		Position = UDim2.new(0, 0, 0, 50),
+		Size = UDim2.new(1, 0, 0, 12),
+	}, page)
+	new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(48, 57, 70),
+		Position = UDim2.new(0, 0, 0, 65),
+		Size = UDim2.new(1, 0, 0, 1),
+	}, page)
+
+	text("TextLabel", {
+		Text = "STAT",
+		TextSize = 10,
+		TextColor3 = Color3.fromRGB(110, 120, 134),
+		Position = UDim2.new(0, 10, 0, 68),
+		Size = UDim2.new(0.44, 0, 0, 14),
+	}, page)
+	text("TextLabel", {
+		Text = "VALUE",
+		TextSize = 10,
+		TextColor3 = Color3.fromRGB(110, 120, 134),
+		Position = UDim2.new(0.44, 0, 0, 68),
+		Size = UDim2.new(0.3, 0, 0, 14),
+	}, page)
+	text("TextLabel", {
+		Text = "MODE",
+		TextSize = 10,
+		TextColor3 = Color3.fromRGB(110, 120, 134),
+		Position = UDim2.new(0.76, 0, 0, 68),
+		Size = UDim2.new(0.12, 0, 0, 14),
+	}, page)
+
+	local scroll = new("ScrollingFrame", {
+		BackgroundColor3 = Color3.fromRGB(10, 12, 16),
+		BorderSizePixel = 1,
+		BorderColor3 = Color3.fromRGB(34, 41, 52),
+		Position = UDim2.new(0, 0, 0, 84),
+		Size = UDim2.new(1, 0, 1, -124),
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = Color3.fromRGB(98, 160, 230),
+	}, page)
+	new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, scroll)
+
+	local footer = new("Frame", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 0, 1, -32),
+		Size = UDim2.new(1, 0, 0, 30),
+	}, page)
+	local nameBox = text("TextBox", {
+		Text = "",
+		PlaceholderText = "CONFIG NAME",
+		PlaceholderColor3 = Color3.fromRGB(80, 90, 104),
+		ClearTextOnFocus = false,
+		BackgroundTransparency = 0,
+		BackgroundColor3 = Color3.fromRGB(10, 12, 16),
+		BorderSizePixel = 1,
+		BorderColor3 = Color3.fromRGB(40, 48, 60),
+		Position = UDim2.new(0, 0, 0, 3),
+		Size = UDim2.new(0, 120, 0, 24),
+	}, footer)
+	button({
+		Text = "SAVE",
+		TextSize = 10,
+		Position = UDim2.new(0, 126, 0, 3),
+		Size = UDim2.new(0, 46, 0, 24),
+	}, footer, function()
+		Tuning.save(nameBox.Text)
+	end)
+	button({
+		Text = "LOAD",
+		TextSize = 10,
+		Position = UDim2.new(0, 178, 0, 3),
+		Size = UDim2.new(0, 46, 0, 24),
+	}, footer, function()
+		Tuning.load(nameBox.Text)
+	end)
+	button({
+		Text = "RESET ALL",
+		TextSize = 10,
+		Position = UDim2.new(0, 230, 0, 3),
+		Size = UDim2.new(0, 76, 0, 24),
+	}, footer, function()
+		Tuning.resetAll()
+	end)
+	text("TextLabel", {
+		Text = "STORAGE: NOT IMPLEMENTED",
+		TextSize = 9,
+		TextColor3 = Color3.fromRGB(110, 120, 134),
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Position = UDim2.new(0, 312, 0, 0),
+		Size = UDim2.new(1, -312, 1, 0),
+	}, footer)
+
+	function populate()
+		for _, child in ipairs(scroll:GetChildren()) do
+			if child:IsA("GuiObject") then
+				child:Destroy()
+			end
+		end
+		table.clear(rowViews)
+		title.Text = "" .. activeCategory
+
+		local lastGroup
+		local order = 0
+		local stripe = 0
+
+		for _, row in ipairs(Tuning.byCategory[activeCategory]) do
+			if row.group ~= lastGroup then
+				lastGroup = row.group
+				order += 1
+				text("TextLabel", {
+					Text = "  // " .. row.group:upper(),
+					Bold = true,
+					TextSize = 10,
+					TextColor3 = Color3.fromRGB(98, 130, 168),
+					Size = UDim2.new(1, 0, 0, 20),
+					LayoutOrder = order,
+				}, scroll)
+			end
+
+			order += 1
+			stripe += 1
+			local frame = new("Frame", {
+				BackgroundColor3 = stripe % 2 == 0 and Color3.fromRGB(14, 18, 23) or Color3.fromRGB(10, 12, 16),
+				Size = UDim2.new(1, 0, 0, 22),
+				LayoutOrder = order,
+			}, scroll)
+			local marker = new("Frame", {
+				BackgroundColor3 = Color3.fromRGB(98, 160, 230),
+				Size = UDim2.new(0, 2, 1, 0),
+				Visible = false,
+			}, frame)
+			text("TextLabel", {
+				Text = row.label,
+				TextColor3 = Color3.fromRGB(170, 180, 194),
+				Position = UDim2.new(0, 10, 0, 0),
+				Size = UDim2.new(0.44, -10, 1, 0),
+			}, frame)
+
+			local field
+			if row.kind == "boolean" or row.options then
+				field = button({
+					Text = "",
+					Position = UDim2.new(0.44, 0, 0, 2),
+					Size = UDim2.new(0.3, -6, 1, -4),
+				}, frame, function()
+					local current = Tuning.get(row.id)
+					if row.kind == "boolean" then
+						Tuning.set(row.id, not current)
+					else
+						local index = table.find(row.options, current) or 0
+						Tuning.set(row.id, row.options[index % #row.options + 1])
+					end
+				end)
+			else
+				field = text("TextBox", {
+					Text = "",
+					ClearTextOnFocus = false,
+					BackgroundTransparency = 0,
+					BackgroundColor3 = Color3.fromRGB(8, 10, 13),
+					BorderSizePixel = 1,
+					BorderColor3 = Color3.fromRGB(40, 48, 60),
+					TextXAlignment = Enum.TextXAlignment.Center,
+					Position = UDim2.new(0.44, 0, 0, 2),
+					Size = UDim2.new(0.3, -6, 1, -4),
+				}, frame)
+			end
+
+			text("TextLabel", {
+				Text = row.live and "LIVE" or "INIT",
+				TextSize = 9,
+				TextColor3 = row.live and Color3.fromRGB(84, 196, 140) or Color3.fromRGB(110, 120, 134),
+				Position = UDim2.new(0.76, 0, 0, 0),
+				Size = UDim2.new(0.12, 0, 1, 0),
+			}, frame)
+
+			local reset = button({
+				Text = "RST",
+				TextSize = 9,
+				Position = UDim2.new(1, -38, 0, 3),
+				Size = UDim2.new(0, 34, 1, -6),
+				Visible = false,
+			}, frame, function()
+				Tuning.reset(row.id)
+			end)
+
+			local function paint()
+				local value = Tuning.get(row.id)
+				local modified = Tuning.isModified(row.id)
+				marker.Visible = modified
+				reset.Visible = modified
+				if row.kind == "boolean" then
+					field.Text = value and "ON" or "OFF"
+					field.TextColor3 = value and Color3.fromRGB(84, 196, 140) or Color3.fromRGB(110, 120, 134)
+				else
+					if row.kind == "number" then
+						field.Text = tostring(math.floor(value * 10000 + 0.5) / 10000)
+					else
+						field.Text = tostring(value)
+					end
+					field.TextColor3 = modified and Color3.fromRGB(140, 196, 255) or Color3.fromRGB(196, 205, 216)
+				end
+				if field:IsA("TextBox") then
+					field.BorderColor3 = Color3.fromRGB(40, 48, 60)
+				end
+			end
+
+			if field:IsA("TextBox") then
+				field.Focused:Connect(function()
+					field.BorderColor3 = Color3.fromRGB(98, 160, 230)
+				end)
+				field.FocusLost:Connect(function()
+					local value
+					if row.kind == "number" then
+						value = tonumber(field.Text)
+					else
+						value = field.Text
+					end
+					if value == nil or not Tuning.set(row.id, value) then
+						field.BorderColor3 = Color3.fromRGB(222, 84, 72)
+						task.delay(0.4, paint)
+						field.Text = tostring(Tuning.get(row.id))
+					else
+						paint()
+					end
+				end)
+			end
+
+			rowViews[row.id] = paint
+			paint()
+		end
+
+		scroll.CanvasPosition = Vector2.zero
+		styleStrip()
+		modifiedLabel.Text = string.format("%d MODIFIED", Tuning.count())
+	end
+
+	table.insert(links, Tuning.changed.Event:Connect(function(id)
+		if not visible then
+			return
+		end
+		if id then
+			local paint = rowViews[id]
+			if paint then
+				paint()
+			end
+		else
+			for _, paint in pairs(rowViews) do
+				paint()
+			end
+		end
+		styleStrip()
+		modifiedLabel.Text = string.format("%d MODIFIED", Tuning.count())
+	end))
+
+	populate()
+
+	return function()
+		for _, paint in pairs(rowViews) do
+			paint()
+		end
+		styleStrip()
+		modifiedLabel.Text = string.format("%d MODIFIED", Tuning.count())
+	end
+end
+
+function UI.build(Connection, CarInit, Tuning)
+	local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
+	local old = playerGui:FindFirstChild("HubUI")
+	if old then
+		old:Destroy()
+	end
+
+	gui = new("ScreenGui", {
+		Name = "HubUI",
+		ResetOnSpawn = false,
+		DisplayOrder = 100,
+		IgnoreGuiInset = true,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	}, playerGui)
+
+	window = new("Frame", {
+		Name = "Window",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundColor3 = Color3.fromRGB(15, 18, 23),
+		BorderSizePixel = 1,
+		BorderColor3 = Color3.fromRGB(48, 57, 70),
+		Position = UDim2.new(0.5, 0, 0.5, 0),
+		Size = UDim2.fromOffset(420, 320),
+		Active = true,
+		Visible = false,
+	}, gui)
+
+	for _, corner in ipairs({ { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } }) do
+		for _, size in ipairs({ UDim2.fromOffset(14, 2), UDim2.fromOffset(2, 14) }) do
+			new("Frame", {
+				AnchorPoint = Vector2.new(corner[1], corner[2]),
+				BackgroundColor3 = Color3.fromRGB(98, 160, 230),
+				Position = UDim2.new(corner[1], corner[1] == 0 and -5 or 5, corner[2], corner[2] == 0 and -5 or 5),
+				Size = size,
+			}, window)
+		end
+	end
+
+	local header = new("Frame", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 28),
+		Active = true,
+	}, window)
+	new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(98, 160, 230),
+		Size = UDim2.new(0, 4, 1, 0),
+	}, header)
+	text("TextLabel", {
+		Text = "HUB",
+		Bold = true,
+		TextSize = 14,
+		TextColor3 = Color3.fromRGB(232, 238, 246),
+		Position = UDim2.new(0, 14, 0, 0),
+		Size = UDim2.new(0, 40, 1, 0),
+	}, header)
+	text("TextLabel", {
+		Text = "CAR SIM CONTROL",
+		TextSize = 10,
+		TextColor3 = Color3.fromRGB(110, 120, 134),
+		Position = UDim2.new(0, 56, 0, 0),
+		Size = UDim2.new(0.5, -56, 1, 0),
+	}, header)
+	text("TextLabel", {
+		Text = "DRAG  |  P  CLOSE",
+		TextSize = 10,
+		TextColor3 = Color3.fromRGB(110, 120, 134),
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Position = UDim2.new(0.5, 0, 0, 0),
+		Size = UDim2.new(0.5, -12, 1, 0),
+	}, header)
+	new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(48, 57, 70),
+		Position = UDim2.new(0, 0, 1, -1),
+		Size = UDim2.new(1, 0, 0, 1),
+	}, header)
+
+	header.InputBegan:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then
+			return
+		end
+		local origin = window.Position
+		local start = input.Position
+		local move = UserInputService.InputChanged:Connect(function(change)
+			if change.UserInputType == Enum.UserInputType.MouseMovement or change.UserInputType == Enum.UserInputType.Touch then
+				local delta = change.Position - start
+				local viewport = workspace.CurrentCamera.ViewportSize
+				window.Position = UDim2.new(
+					0.5,
+					math.clamp(origin.X.Offset + delta.X, -viewport.X / 2 + 80, viewport.X / 2 - 80),
+					0.5,
+					math.clamp(origin.Y.Offset + delta.Y, -viewport.Y / 2 + 20, viewport.Y / 2 - 20)
+				)
+			end
+		end)
+		local ended
+		ended = input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				move:Disconnect()
+				ended:Disconnect()
+			end
+		end)
+	end)
+
+	local tabBar = new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(12, 15, 19),
+		Position = UDim2.new(0, 0, 0, 28),
+		Size = UDim2.new(1, 0, 0, 26),
+	}, window)
+	new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(48, 57, 70),
+		Position = UDim2.new(0, 0, 1, -1),
+		Size = UDim2.new(1, 0, 0, 1),
+	}, tabBar)
+
+	new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(34, 41, 52),
+		Position = UDim2.new(0, 0, 1, -20),
+		Size = UDim2.new(1, 0, 0, 1),
+	}, window)
+
+	local tabs = {}
+	local pages = {}
+	local activeTab = 1
+	local choose
+
+	for index, name in ipairs({ "CONNECTION", "CAR INITIALIZATION", "CAR TUNING" }) do
+		local tab = button({
+			Text = name,
+			TextSize = 10,
+			BackgroundColor3 = Color3.fromRGB(12, 15, 19),
+			BorderSizePixel = 0,
+			Position = UDim2.new((index - 1) / 3, 0, 0, 0),
+			Size = UDim2.new(1 / 3, 0, 1, -1),
+		}, tabBar, function()
+			choose(index)
+		end)
+		tabs[index] = {
+			button = tab,
+			underline = new("Frame", {
+				BackgroundColor3 = Color3.fromRGB(98, 160, 230),
+				Position = UDim2.new(0, 0, 1, -2),
+				Size = UDim2.new(1, 0, 0, 2),
+				Visible = false,
+			}, tab),
+		}
+
+		local page = new("Frame", {
+			BackgroundTransparency = 1,
+			Position = UDim2.new(0, 0, 0, 54),
+			Size = UDim2.new(1, 0, 1, -74),
+			Visible = false,
+		}, window)
+		new("UIPadding", {
+			PaddingLeft = UDim.new(0, 12),
+			PaddingRight = UDim.new(0, 12),
+			PaddingTop = UDim.new(0, 10),
+			PaddingBottom = UDim.new(0, 8),
+		}, page)
+		pages[index] = page
+	end
+
+	refreshers[1] = buildConnection(pages[1], Connection)
+	refreshers[2] = buildInit(pages[2], CarInit, Tuning)
+	refreshers[3] = buildTuning(pages[3], Tuning)
+
+	local function targetSize(index)
+		if index == 1 then
+			return UDim2.fromOffset(420, 320)
+		elseif index == 2 then
+			return UDim2.fromOffset(440, 470)
+		end
+		local height = math.min(708, workspace.CurrentCamera.ViewportSize.Y * 0.88)
+		return UDim2.fromOffset(math.floor(height / 1.414), math.floor(height))
+	end
+
+	function choose(index, animate)
+		activeTab = index
+		for i, tab in ipairs(tabs) do
+			local on = i == index
+			tab.button.BackgroundColor3 = on and Color3.fromRGB(28, 36, 47) or Color3.fromRGB(12, 15, 19)
+			tab.button.TextColor3 = on and Color3.fromRGB(232, 238, 246) or Color3.fromRGB(110, 120, 134)
+			tab.underline.Visible = on
+			pages[i].Visible = on
+		end
+		refreshers[index]()
+		if animate == false then
+			window.Size = targetSize(index)
+		else
+			TweenService:Create(window, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+				Size = targetSize(index),
+			}):Play()
+		end
+	end
+
+	function refreshAll()
+		choose(activeTab, false)
+	end
+
+	toast = new("Frame", {
+		AnchorPoint = Vector2.new(0, 1),
+		BackgroundColor3 = Color3.fromRGB(15, 18, 23),
+		BorderSizePixel = 1,
+		BorderColor3 = Color3.fromRGB(48, 57, 70),
+		Position = UDim2.new(0, 16, 1, -16),
+		Size = UDim2.fromOffset(400, 26),
+		Visible = false,
+	}, gui)
+	toastBar = new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(98, 160, 230),
+		Size = UDim2.new(0, 3, 1, 0),
+	}, toast)
+	toastText = text("TextLabel", {
+		Text = "",
+		Position = UDim2.new(0, 12, 0, 0),
+		Size = UDim2.new(1, -18, 1, 0),
+	}, toast)
+
+	table.insert(links, Connection.changed.Event:Connect(function()
+		if visible then
+			refreshers[1]()
+		end
+	end))
+
+	table.insert(links, CarInit.changed.Event:Connect(function(state)
+		if state == "INITIALIZING" then
+			UI.applied = Tuning.count()
+			UI.notify("info", "INITIALIZING CAR")
+		elseif state == "ACTIVE" then
+			UI.notify("ok", "CAR INITIALIZED - " .. tostring(CarInit.carName))
+		elseif state == "FAILED" then
+			UI.notify("fail", "INIT FAILED - " .. CarInit.message)
+		elseif state == "ENDED" then
+			UI.notify("info", CarInit.message)
+		end
+		if visible then
+			refreshers[2]()
+		end
+	end))
+
+	table.insert(links, Tuning.changed.Event:Connect(function()
+		if visible then
+			if activeTab == 2 then
+				refreshers[2]()
+			end
+		end
+	end))
+end
+
+function UI.notify(kind, message)
+	if not toast then
+		return
+	end
+	toastSerial += 1
+	local serial = toastSerial
+	toastBar.BackgroundColor3 = kind == "ok" and Color3.fromRGB(84, 196, 140)
+		or kind == "fail" and Color3.fromRGB(222, 84, 72)
+		or Color3.fromRGB(98, 160, 230)
+	toastText.Text = message
+	toast.Visible = true
+	task.delay(3.5, function()
+		if toastSerial == serial and toast then
+			toast.Visible = false
+		end
+	end)
+end
+
+function UI.toggle()
+	if not window then
+		return
+	end
+	visible = not visible
+	window.Visible = visible
+	if visible then
+		refreshAll()
+	end
+end
+
+function UI.destroy()
+	for _, link in ipairs(links) do
+		link:Disconnect()
+	end
+	table.clear(links)
+	if gui then
+		gui:Destroy()
+	end
+	gui = nil
+	window = nil
+	toast = nil
+end
+
+return UI
