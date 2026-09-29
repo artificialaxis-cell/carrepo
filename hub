@@ -1,0 +1,58 @@
+local UserInputService = game:GetService("UserInputService")
+
+local Hub = {}
+
+local function grab(url)
+	local ok, src = pcall(game.HttpGet, game, url)
+	if not ok then error("couldn't fetch " .. url .. ": " .. tostring(src)) end
+
+	local chunk, err = loadstring(src)
+	if not chunk then error("bad chunk from " .. url .. ": " .. tostring(err)) end
+
+	local ok2, mod = pcall(chunk)
+	if not ok2 then error("module blew up (" .. url .. "): " .. tostring(mod)) end
+	return mod
+end
+
+local Connection = require(script.Connection)
+local CarInit = require(script.CarInit)
+local Tuning = require(script.Tuning)
+local UI = require(script.UI)
+
+if game.RunService:IsStudio() then
+	Connection = require(script.Connection)
+	CarInit = require(script.CarInit)
+	Tuning = require(script.Tuning)
+	UI = require(script.UI)
+else
+	Connection = grab("https://raw.githubusercontent.com/artificialaxis-cell/carrepo/refs/heads/main/serverconnection")
+	CarInit = grab("https://raw.githubusercontent.com/artificialaxis-cell/carrepo/refs/heads/main/creation")
+	Tuning = grab("https://raw.githubusercontent.com/artificialaxis-cell/carrepo/refs/heads/main/tuning")
+	UI = grab("https://raw.githubusercontent.com/artificialaxis-cell/carrepo/refs/heads/main/ui")
+end
+
+function Hub.start()
+
+	Tuning.install()
+	UI.build(Connection, CarInit, Tuning)
+
+	local input = UserInputService.InputBegan:Connect(function(key, processed)
+		if processed then
+			return
+		end
+		if key.KeyCode == Enum.KeyCode.P then
+			UI.toggle()
+		elseif key.KeyCode == Enum.KeyCode.N then
+			CarInit.request()
+		end
+	end)
+
+	script.Destroying:Connect(function()
+		input:Disconnect()
+		UI.destroy()
+	end)
+
+	UI.notify("info", "press P bradar")
+end
+
+return Hub
