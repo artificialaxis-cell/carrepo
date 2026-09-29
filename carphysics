@@ -543,7 +543,7 @@ local function gripupdate(info, surfacespeed, dt, loaddelta, stats)
 		local smoke = att:FindFirstChild("TireSmoke")
 		if smoke then
 			local slipping = totalslip > 0.6 and (totalslip >= 0.7 or tire.AssemblyLinearVelocity.Magnitude > 2)
-			smoke.Rate = slipping and 50 * math.min(totalslip, 2) or 0
+			smoke.Rate = slipping and 15 * math.min(totalslip, 2) or 0
 		end
 	end
 
