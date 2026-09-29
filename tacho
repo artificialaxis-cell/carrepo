@@ -22,7 +22,6 @@ local redlinemax = 0.9
 
 local revattack = 8
 local revcoast = 8
-local revbrake = 7
 
 local springstiff = 220
 local springdamp = 18
@@ -235,7 +234,7 @@ local function updaterev(dt, throttle, brake)
 	if throttle > level then
 		level = math.min(throttle, level + revattack * dt)
 	else
-		local fall = revcoast + brake * revbrake
+		local fall = revcoast + brake
 		level = math.max(throttle, level - fall * dt)
 	end
 	st.revlevel = level
