@@ -1,0 +1,15 @@
+local Connection = {}
+
+Connection.status = "DISCONNECTED"
+Connection.detail = "NO CONNECTION TO SERVER"
+Connection.players = {}
+Connection.changed = Instance.new("BindableEvent")
+
+function Connection.update(status, detail, players)
+	Connection.status = status
+	Connection.detail = detail
+	Connection.players = players or {}
+	Connection.changed:Fire(status)
+end
+
+return Connection
