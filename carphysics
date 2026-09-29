@@ -19,6 +19,10 @@ local function grab(url)
 	return mod
 end
 
+local function lerp(a,b,c)
+	return a + (b - a) * c
+end
+
 local Tacho
 
 if rs:IsStudio() then
@@ -311,7 +315,7 @@ end
 local sampleoffsets = {}
 local smoothedload = { FR = 0, FL = 0, RR = 0, RL = 0 }
 local slaglag = { FR = { x = 0, y = 0 }, FL = { x = 0, y = 0 }, RR = { x = 0, y = 0 }, RL = { x = 0, y = 0 } }
-local radii = { 0.1, 0.2, 0.3, 0.4 }
+local radii = { 0.15, 0.33 }
 
 for _, r in ipairs(radii) do
 	table.insert(sampleoffsets, { r, 0 })
@@ -1510,7 +1514,7 @@ function CarController:HandleCar(car)
 		dt = math.min(dt, 0.25)
 
 		handbrake = uis:IsKeyDown(Enum.KeyCode.Space)
-		tweenval(hbvalue, handbrake and 1 or 0, 0.12)
+		hbvalue.Value = lerp(hbvalue.Value, handbrake and 1 or 0, 0.12)
 
 		local steertime = stats.steerResponseTimeInactive
 		local targetsteer = 0
