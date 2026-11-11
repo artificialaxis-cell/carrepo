@@ -1,0 +1,730 @@
+--[[
+	Tuning
+	------
+	State and workflow around Spec:
+
+	  value(id) = override  ->  preset value  ->  auto (derived from geometry/other values)  ->  default
+
+	* Overrides are sparse: only what the user changed is stored, so presets and derived
+	  values keep flowing through everything else.
+	* Every change is applied live (debounced) to the car that is currently driving.
+	* "Expert" overrides patch any leaf of the built stats table directly, for the rare
+	  value that has no friendly parameter.
+	* Configs can be saved/loaded (files when the environment has them, memory otherwise)
+	  and exported/imported as JSON text.
+]]
+
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Tuning = {}
+
+local Spec
+
+Tuning.changed = Instance.new("BindableEvent") -- (id | nil)
+Tuning.geometry = nil
+
+-- survives character respawns (the hub script re-runs on spawn)
+local state = _G.CarHubState or {}
+_G.CarHubState = state
+state.preset = state.preset or "Factory"
+state.values = state.values or {}
+state.raw = state.raw or {}
+state.configs = state.configs or {}
+state.profiles = state.profiles or {}
+state.ui = state.ui or {}
+Tuning.state = state
+
+local applyHandler
+local applyQueued = false
+
+local FOLDER = "carhub"
+local function hasFiles()
+	return type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+		and type(makefolder) == "function" and type(isfolder) == "function"
+end
+
+local function ensureFolder(path)
+	if not isfolder(path) then
+		makefolder(path)
+	end
+end
+
+local function clone(value)
+	if type(value) ~= "table" then
+		return value
+	end
+	local copy = {}
+	for key, inner in pairs(value) do
+		copy[key] = clone(inner)
+	end
+	return copy
+end
+
+local function equal(a, b)
+	if type(a) ~= type(b) then
+		return false
+	end
+	if type(a) ~= "table" then
+		if type(a) == "number" then
+			return math.abs(a - b) < 1e-9
+		end
+		return a == b
+	end
+	for key, value in pairs(a) do
+		if not equal(value, b[key]) then
+			return false
+		end
+	end
+	for key in pairs(b) do
+		if a[key] == nil then
+			return false
+		end
+	end
+	return true
+end
+
+------------------------------------------------------------------------------------------
+-- Sound library
+------------------------------------------------------------------------------------------
+
+Tuning.soundNames = {}
+local packCache
+
+function Tuning.refreshSounds()
+	local names, seen = {}, {}
+	local root = ReplicatedStorage:FindFirstChild("CarSounds")
+	if root then
+		for _, inst in ipairs(root:GetDescendants()) do
+			if inst:IsA("Sound") and inst.SoundId ~= "" and not seen[inst.Name] then
+				seen[inst.Name] = true
+				table.insert(names, inst.Name)
+			end
+		end
+	end
+	table.sort(names, function(a, b)
+		return a:lower() < b:lower()
+	end)
+	Tuning.soundNames = names
+	packCache = Spec and Spec.detectPacks(names) or {}
+	return #names
+end
+
+function Tuning.packs()
+	if not packCache then
+		Tuning.refreshSounds()
+	end
+	return packCache
+end
+
+function Tuning.searchSounds(query, limit)
+	local needle = (query or ""):lower()
+	local found = {}
+	for _, name in ipairs(Tuning.soundNames) do
+		if needle == "" or name:lower():find(needle, 1, true) then
+			table.insert(found, name)
+			if limit and #found >= limit then
+				break
+			end
+		end
+	end
+	return found
+end
+
+local function validSound(value)
+	if type(value) ~= "string" then
+		return nil
+	end
+	local text = value:match("^%s*(.-)%s*$")
+	if text == "" or text == "0" or text == "none" then
+		return "rbxassetid://0"
+	end
+	if text:match("^rbxassetid://%d+$") then
+		return text
+	end
+	if text:match("^%d+$") then
+		return "rbxassetid://" .. text
+	end
+	for _, name in ipairs(Tuning.soundNames) do
+		if name == text then
+			return name
+		end
+	end
+	local lower = text:lower()
+	for _, name in ipairs(Tuning.soundNames) do
+		if name:lower() == lower then
+			return name
+		end
+	end
+	local found = Tuning.searchSounds(text, 2)
+	if #found == 1 then
+		return found[1]
+	end
+	return nil
+end
+
+------------------------------------------------------------------------------------------
+-- Values
+------------------------------------------------------------------------------------------
+
+local presetValues = {}
+
+local function resolveBase(id, getter)
+	local param = Spec.byId[id]
+	if not param then
+		return nil
+	end
+	local preset = presetValues[id]
+	if preset ~= nil then
+		return clone(preset)
+	end
+	if param.auto then
+		return param.auto({ geo = Tuning.geometry or Spec.REFERENCE_GEOMETRY, get = getter })
+	end
+	return clone(param.default)
+end
+
+function Tuning.get(id)
+	local value = state.values[id]
+	if value ~= nil then
+		return value
+	end
+	return resolveBase(id, Tuning.get)
+end
+
+-- value without the user's override for this id
+function Tuning.base(id)
+	return resolveBase(id, Tuning.get)
+end
+
+function Tuning.param(id)
+	return Spec.byId[id]
+end
+
+function Tuning.isAuto(id)
+	local param = Spec.byId[id]
+	return param ~= nil and param.auto ~= nil and state.values[id] == nil and presetValues[id] == nil
+end
+
+function Tuning.isModified(id)
+	return state.values[id] ~= nil
+end
+
+function Tuning.modifiedCount(section)
+	local n = 0
+	for id in pairs(state.values) do
+		local param = Spec.byId[id]
+		if param and (not section or param.section == section) then
+			n += 1
+		end
+	end
+	if not section then
+		for _ in pairs(state.raw) do
+			n += 1
+		end
+	end
+	return n
+end
+
+local function queueApply()
+	if applyQueued then
+		return
+	end
+	applyQueued = true
+	task.delay(0.12, function()
+		applyQueued = false
+		if applyHandler then
+			local ok, err = pcall(applyHandler)
+			if not ok then
+				warn("Tuning: live apply failed - " .. tostring(err))
+			end
+		end
+	end)
+end
+
+local function changed(id)
+	Tuning.changed:Fire(id)
+	queueApply()
+end
+
+local function validate(param, value)
+	local kind = param.kind
+	if kind == "number" then
+		value = tonumber(value)
+		if not value or value ~= value or value == math.huge or value == -math.huge then
+			return nil
+		end
+		if param.min then
+			value = math.max(value, param.min)
+		end
+		if param.max then
+			value = math.min(value, param.max)
+		end
+		return value
+	elseif kind == "bool" then
+		return value == true
+	elseif kind == "enum" then
+		return table.find(param.options, value) and value or nil
+	elseif kind == "gears" then
+		if type(value) ~= "table" or #value < 1 or #value > 10 then
+			return nil
+		end
+		local out = {}
+		for i, ratio in ipairs(value) do
+			ratio = tonumber(ratio)
+			if not ratio or ratio <= 0 or ratio > 30 then
+				return nil
+			end
+			out[i] = ratio
+		end
+		return out
+	elseif kind == "curve" then
+		if type(value) ~= "table" then
+			return nil
+		end
+		local out, seen = {}, {}
+		for _, p in ipairs(value) do
+			local rpm, torque = tonumber(p.rpm), tonumber(p.torque)
+			if not rpm or not torque or rpm < 0 or seen[rpm] then
+				return nil
+			end
+			seen[rpm] = true
+			table.insert(out, { rpm = rpm, torque = math.max(torque, 0) })
+		end
+		table.sort(out, function(a, b)
+			return a.rpm < b.rpm
+		end)
+		return out
+	elseif kind == "pack" then
+		return type(value) == "string" and value or nil
+	elseif kind == "sound" then
+		return validSound(value)
+	end
+	return nil
+end
+
+function Tuning.set(id, value)
+	local param = Spec.byId[id]
+	if not param then
+		return false
+	end
+	local clean = validate(param, value)
+	if clean == nil then
+		return false
+	end
+	if equal(clean, resolveBase(id, Tuning.get)) then
+		state.values[id] = nil
+	else
+		state.values[id] = clean
+	end
+	changed(id)
+	return true
+end
+
+function Tuning.reset(id)
+	if state.values[id] == nil then
+		return false
+	end
+	state.values[id] = nil
+	changed(id)
+	return true
+end
+
+function Tuning.resetSection(section)
+	for id in pairs(state.values) do
+		local param = Spec.byId[id]
+		if param and param.section == section then
+			state.values[id] = nil
+		end
+	end
+	changed(nil)
+end
+
+function Tuning.resetAll()
+	table.clear(state.values)
+	table.clear(state.raw)
+	changed(nil)
+end
+
+function Tuning.presetName()
+	return state.preset
+end
+
+function Tuning.applyPreset(name, keepOverrides)
+	local preset = Spec.preset(name)
+	state.preset = preset.name
+	presetValues = clone(preset.values)
+	if not keepOverrides then
+		table.clear(state.values)
+	end
+	changed(nil)
+end
+
+------------------------------------------------------------------------------------------
+-- Building stats
+------------------------------------------------------------------------------------------
+
+local function pathKey(path)
+	local parts = {}
+	for i, key in ipairs(path) do
+		parts[i] = tostring(key)
+	end
+	return table.concat(parts, ".")
+end
+
+local function applyRaw(stats)
+	for _, entry in pairs(state.raw) do
+		local node = stats
+		local path = entry.path
+		for i = 1, #path - 1 do
+			node = type(node) == "table" and node[path[i]] or nil
+		end
+		if type(node) == "table" and node[path[#path]] ~= nil then
+			node[path[#path]] = entry.value
+		end
+	end
+end
+
+function Tuning.build(geometry)
+	local previous = Tuning.geometry
+	if geometry then
+		Tuning.geometry = geometry
+	end
+	local ok, stats = pcall(Spec.build, Tuning.get, Tuning.geometry or Spec.REFERENCE_GEOMETRY)
+	if geometry == nil then
+		Tuning.geometry = previous
+	end
+	if not ok then
+		warn("Tuning: build failed - " .. tostring(stats))
+		return nil
+	end
+	applyRaw(stats)
+	return stats
+end
+
+function Tuning.readouts()
+	local stats = Tuning.build()
+	if not stats then
+		return nil
+	end
+	return Spec.readouts(Tuning.get, stats), stats
+end
+
+function Tuning.setGeometry(geometry)
+	Tuning.geometry = geometry
+	changed(nil)
+end
+
+function Tuning.onApply(handler)
+	applyHandler = handler
+end
+
+------------------------------------------------------------------------------------------
+-- Expert (raw) overrides
+------------------------------------------------------------------------------------------
+
+function Tuning.rawRows(filter)
+	local stats = Tuning.build()
+	local rows = {}
+	if not stats then
+		return rows
+	end
+	-- the expert view shows built values before raw overrides so the "base" column is honest
+	local base = select(2, pcall(Spec.build, Tuning.get, Tuning.geometry or Spec.REFERENCE_GEOMETRY))
+	local needle = filter and filter:lower() or ""
+
+	local function walk(node, baseNode, path)
+		local keys = {}
+		for key in pairs(node) do
+			table.insert(keys, key)
+		end
+		table.sort(keys, function(a, b)
+			if type(a) == type(b) then
+				return a < b
+			end
+			return type(a) == "number"
+		end)
+		for _, key in ipairs(keys) do
+			local value = node[key]
+			local nextPath = table.clone(path)
+			table.insert(nextPath, key)
+			if type(value) == "table" then
+				walk(value, type(baseNode) == "table" and baseNode[key] or nil, nextPath)
+			elseif type(value) == "number" or type(value) == "string" or type(value) == "boolean" then
+				local id = pathKey(nextPath)
+				if needle == "" or id:lower():find(needle, 1, true) then
+					table.insert(rows, {
+						id = id,
+						path = nextPath,
+						value = value,
+						base = type(baseNode) == "table" and baseNode[key] or value,
+						kind = type(value),
+						overridden = state.raw[id] ~= nil,
+					})
+				end
+			end
+		end
+	end
+	walk(stats, base, {})
+	return rows
+end
+
+function Tuning.setRaw(path, value)
+	local id = pathKey(path)
+	state.raw[id] = { path = table.clone(path), value = value }
+	changed("raw:" .. id)
+end
+
+function Tuning.clearRaw(id)
+	if state.raw[id] then
+		state.raw[id] = nil
+		changed("raw:" .. id)
+	end
+end
+
+------------------------------------------------------------------------------------------
+-- Persistence
+------------------------------------------------------------------------------------------
+
+function Tuning.snapshot()
+	local raw = {}
+	for _, entry in pairs(state.raw) do
+		table.insert(raw, entry)
+	end
+	return {
+		version = 2,
+		preset = state.preset,
+		values = clone(state.values),
+		raw = raw,
+	}
+end
+
+function Tuning.restore(data)
+	if type(data) ~= "table" or type(data.values) ~= "table" then
+		return false
+	end
+	local preset = Spec.preset(data.preset or "Factory")
+	state.preset = preset.name
+	presetValues = clone(preset.values)
+	table.clear(state.values)
+	table.clear(state.raw)
+	for id, value in pairs(data.values) do
+		local param = Spec.byId[id]
+		if param then
+			local clean = validate(param, value)
+			if clean ~= nil then
+				state.values[id] = clean
+			end
+		end
+	end
+	if type(data.raw) == "table" then
+		for _, entry in ipairs(data.raw) do
+			if type(entry) == "table" and type(entry.path) == "table" and entry.value ~= nil then
+				state.raw[pathKey(entry.path)] = { path = entry.path, value = entry.value }
+			end
+		end
+	end
+	changed(nil)
+	return true
+end
+
+function Tuning.export()
+	return HttpService:JSONEncode(Tuning.snapshot())
+end
+
+function Tuning.import(text)
+	local ok, data = pcall(HttpService.JSONDecode, HttpService, text or "")
+	if not ok then
+		return false, "Not valid JSON"
+	end
+	if not Tuning.restore(data) then
+		return false, "Not a tuning config"
+	end
+	return true
+end
+
+local function safeName(name)
+	name = tostring(name or ""):gsub("[^%w%s%-_]", ""):match("^%s*(.-)%s*$")
+	return name ~= "" and name or nil
+end
+
+function Tuning.save(name)
+	name = safeName(name)
+	if not name then
+		return false, "Enter a name"
+	end
+	local snapshot = Tuning.snapshot()
+	state.configs[name] = snapshot
+	if hasFiles() then
+		local ok, err = pcall(function()
+			ensureFolder(FOLDER)
+			ensureFolder(FOLDER .. "/configs")
+			writefile(FOLDER .. "/configs/" .. name .. ".json", HttpService:JSONEncode(snapshot))
+		end)
+		if not ok then
+			return true, "Saved for this session (file write failed: " .. tostring(err) .. ")"
+		end
+		return true, "Saved to " .. FOLDER .. "/configs"
+	end
+	return true, "Saved for this session"
+end
+
+function Tuning.list()
+	local names, seen = {}, {}
+	for name in pairs(state.configs) do
+		seen[name] = true
+		table.insert(names, name)
+	end
+	if hasFiles() and type(listfiles) == "function" then
+		pcall(function()
+			if isfolder(FOLDER .. "/configs") then
+				for _, file in ipairs(listfiles(FOLDER .. "/configs")) do
+					local name = file:match("([^/\\]+)%.json$")
+					if name and not seen[name] then
+						seen[name] = true
+						table.insert(names, name)
+					end
+				end
+			end
+		end)
+	end
+	table.sort(names, function(a, b)
+		return a:lower() < b:lower()
+	end)
+	return names
+end
+
+function Tuning.load(name)
+	name = safeName(name)
+	if not name then
+		return false, "Pick a config"
+	end
+	local data = state.configs[name]
+	if not data and hasFiles() then
+		pcall(function()
+			local path = FOLDER .. "/configs/" .. name .. ".json"
+			if isfile(path) then
+				data = HttpService:JSONDecode(readfile(path))
+			end
+		end)
+	end
+	if not data then
+		return false, "No config named " .. name
+	end
+	return Tuning.restore(data), nil
+end
+
+function Tuning.delete(name)
+	name = safeName(name)
+	if not name then
+		return false
+	end
+	state.configs[name] = nil
+	if hasFiles() and type(delfile) == "function" then
+		pcall(function()
+			local path = FOLDER .. "/configs/" .. name .. ".json"
+			if isfile(path) then
+				delfile(path)
+			end
+		end)
+	end
+	Tuning.changed:Fire("configs")
+	return true
+end
+
+-- chassis layout profiles keyed by body mesh id
+function Tuning.profiles()
+	if not state.profilesLoaded then
+		state.profilesLoaded = true
+		if hasFiles() then
+			pcall(function()
+				local path = FOLDER .. "/profiles.json"
+				if isfile(path) then
+					local data = HttpService:JSONDecode(readfile(path))
+					for key, layout in pairs(data) do
+						if state.profiles[key] == nil then
+							state.profiles[key] = layout
+						end
+					end
+				end
+			end)
+		end
+	end
+	return state.profiles
+end
+
+function Tuning.saveProfile(meshId, layout)
+	local profiles = Tuning.profiles()
+	profiles[meshId] = layout
+	if hasFiles() then
+		pcall(function()
+			ensureFolder(FOLDER)
+			writefile(FOLDER .. "/profiles.json", HttpService:JSONEncode(profiles))
+		end)
+	end
+end
+
+function Tuning.clearProfile(meshId)
+	local profiles = Tuning.profiles()
+	profiles[meshId] = nil
+	if hasFiles() then
+		pcall(function()
+			ensureFolder(FOLDER)
+			writefile(FOLDER .. "/profiles.json", HttpService:JSONEncode(profiles))
+		end)
+	end
+end
+
+function Tuning.hasFiles()
+	return hasFiles()
+end
+
+------------------------------------------------------------------------------------------
+-- Setup
+------------------------------------------------------------------------------------------
+
+function Tuning.setup(spec)
+	Spec = spec
+	Spec.availablePacks = Tuning.packs
+
+	-- vehicle-level defaults from the entry script (e.g. a different car definition)
+	if type(_G.CarSpec) == "table" then
+		for id, value in pairs(_G.CarSpec) do
+			local param = Spec.byId[id]
+			if param then
+				param.default = value
+			end
+		end
+	end
+
+	presetValues = clone(Spec.preset(state.preset).values)
+	for id, value in pairs(state.values) do
+		local param = Spec.byId[id]
+		local clean = param and validate(param, value)
+		state.values[id] = clean
+	end
+
+	Tuning.refreshSounds()
+	local root = ReplicatedStorage:FindFirstChild("CarSounds")
+	if root then
+		local pending = false
+		root.DescendantAdded:Connect(function()
+			if pending then
+				return
+			end
+			pending = true
+			task.delay(0.5, function()
+				pending = false
+				Tuning.refreshSounds()
+				Tuning.changed:Fire("sounds")
+			end)
+		end)
+	end
+
+	-- legacy entry point for anything that still asks for stats the old way
+	_G.ReturnStats = function(car)
+		return Tuning.build(car and car.GetAttribute and car:GetAttribute("Wheelbase") and Tuning.geometry or nil)
+	end
+end
+
+return Tuning
