@@ -1,0 +1,2899 @@
+--!native
+--[[
+	Physics
+	-------
+	Client-side vehicle simulation. Successor to ADAPTTO; same model, same feel, tighter
+	implementation.
+
+	Model overview
+	  * Ground contact: 33 raycasts per wheel sample the contact patch. The highest cluster
+	    of hits (measured along the wheel's own up axis) gives the contact point and normal.
+	    A spring-damper "sidewall" between the wheel and that point pushes the wheel up.
+	  * Suspension: real Roblox constraints (struts, links, tie rods) built by Chassis.
+	  * Tires: simplified Pacejka magic formula with load sensitivity and relaxation
+	    lengths. Longitudinal/lateral forces are combined with a blend of the classic
+	    friction-ellipse clamp and normalised combined slip (tunable).
+	  * Tire load: static share + longitudinal and lateral load transfer from the measured
+	    body acceleration (analytic, as in the original, now with lateral transfer).
+	  * Drivetrain: engine (torque curve, friction, pumping, idle control, limiter, stall),
+	    impulse-synchronising clutch, gearbox with torque cut while shifting, open/LSD/
+	    locked axle and centre diffs, per-wheel spin integration with implicit tire damping
+	    and static brake hold.
+	  * Everything that couples wheel spin and tire force is sub-stepped at 240 Hz inside
+	    one physics frame; the resulting tire force is the time average over the substeps,
+	    so the impulse applied to the body matches what the wheels integrated.
+
+	Timing
+	  * PreSimulation: inputs, contact, tire/drivetrain integration, force output.
+	  * RenderStepped: camera, wheel spin visuals, driver pivot, gauges, audio.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local SoundService = game:GetService("SoundService")
+local ContentProvider = game:GetService("ContentProvider")
+local Debris = game:GetService("Debris")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local STUD = 0.28
+local KG_TO_RMU = 2853 / 1500
+local N_TO_FORCE = KG_TO_RMU / STUD
+local DRIVE_GRAVITY = 40
+local SUBSTEP = 1 / 240
+local MAX_SUBSTEPS = 16
+local TO_RPM = 30 / math.pi
+local REF_RADIUS = 1.78 -- radius the sample pattern was designed for
+
+local WHEELS = { "FL", "FR", "RL", "RR" }
+local SPEED_ATTR = { FR = "frontRws", FL = "frontLws", RR = "rearRws", RL = "rearLws" }
+
+local function grab(url)
+	local ok, src = pcall(game.HttpGet, game, url)
+	if not ok then
+		error("couldn't fetch " .. url .. ": " .. tostring(src))
+	end
+	local chunk, err = loadstring(src)
+	if not chunk then
+		error("bad chunk from " .. url .. ": " .. tostring(err))
+	end
+	local ok2, mod = pcall(chunk)
+	if not ok2 then
+		error("module blew up (" .. url .. "): " .. tostring(mod))
+	end
+	return mod
+end
+
+local Tacho
+do
+	local ok, result = pcall(function()
+		if RunService:IsStudio() then
+			return require(workspace:WaitForChild("Tacho", 5))
+		end
+		return grab("https://raw.githubusercontent.com/artificialaxis-cell/carrepo/refs/heads/main/tacho")
+	end)
+	if ok and result then
+		Tacho = result
+	else
+		warn("Physics: tachometer unavailable - " .. tostring(result))
+		Tacho = {}
+	end
+	for _, name in ipairs({ "Create", "Update", "Visibility", "Clear" }) do
+		if type(Tacho[name]) ~= "function" then
+			Tacho[name] = function() end
+		end
+	end
+end
+
+local function smoothing(rate, dt)
+	return 1 - math.exp(-rate * dt)
+end
+
+local function smooth01(x)
+	x = math.clamp(x, 0, 1)
+	return x * x * (3 - 2 * x)
+end
+
+local function lerp(a, b, t)
+	return a + (b - a) * t
+end
+
+------------------------------------------------------------------------------------------
+-- Engine
+------------------------------------------------------------------------------------------
+
+local Engine = {}
+Engine.__index = Engine
+
+function Engine.new(cfg)
+	local self = setmetatable({}, Engine)
+	self.omega = (cfg.idleRPM or 900) / TO_RPM
+	self.stalled = false
+	self.limiting = false
+	self.lastcomb = 0
+	self.lastnet = 0
+	self:configure(cfg)
+	return self
+end
+
+function Engine:configure(cfg)
+	self.idlerpm = cfg.idleRPM or 900
+	self.redline = cfg.redlineRPM or 7000
+	self.inertia = cfg.inertia or 0.15
+
+	local rpms = {}
+	for rpm in pairs(cfg.torqueCurve) do
+		table.insert(rpms, rpm)
+	end
+	table.sort(rpms)
+	assert(#rpms >= 2, "Engine requires at least 2 torqueCurve points")
+	local values = {}
+	for i, rpm in ipairs(rpms) do
+		values[i] = cfg.torqueCurve[rpm]
+	end
+	self.points = rpms
+	self.values = values
+	self.segment = 1
+
+	local fr = cfg.friction or {}
+	self.staticfric = fr.static or 12
+	self.viscous = fr.viscous or 0.010
+	self.pumping = fr.pumpingLossCoefficient or 0.0009
+	self.accessory = cfg.accessoryTorque or 6
+
+	local idle = cfg.idleControl or {}
+	self.idleenabled = idle.enabled ~= false
+	self.idletarget = idle.targetRPM or self.idlerpm
+	self.idleauthority = idle.authority or 0.55
+	self.stallrpm = idle.stallRPM or (self.idlerpm * 0.35)
+
+	local limiter = cfg.revLimiter or {}
+	self.limitrpm = limiter.rpm or self.redline
+	self.limitcut = limiter.cut or 1
+	self.limithyst = limiter.hysteresis or 120
+end
+
+function Engine:torqueAt(rpm)
+	local pts, vals = self.points, self.values
+	local n = #pts
+	if rpm <= pts[1] then
+		return vals[1]
+	elseif rpm >= pts[n] then
+		return vals[n]
+	end
+	local i = self.segment
+	if not (i < n and pts[i] <= rpm and rpm <= pts[i + 1]) then
+		local lo, hi = 1, n - 1
+		while lo < hi do
+			local mid = (lo + hi + 1) // 2
+			if pts[mid] <= rpm then
+				lo = mid
+			else
+				hi = mid - 1
+			end
+		end
+		i = lo
+		self.segment = i
+	end
+	local a, b = pts[i], pts[i + 1]
+	return vals[i] + (vals[i + 1] - vals[i]) * ((rpm - a) / (b - a))
+end
+
+function Engine:update(dt, throttle, load)
+	local rpm = self.omega * TO_RPM
+
+	-- idle control: feedforward that exactly covers the losses at the target speed (so the
+	-- target is an equilibrium), faded out just above it, plus proportional correction
+	local idlethrottle = 0
+	local target = self.idletarget
+	if self.idleenabled and rpm < target * 1.05 then
+		local w = target / TO_RPM
+		local losses = self.staticfric + self.viscous * w + self.accessory
+		local pump = self.pumping * w * w
+		local feed = (losses + pump) / math.max(self:torqueAt(target) + pump, 1)
+		local fade = math.clamp((target * 1.05 - rpm) / (target * 0.05), 0, 1)
+		local p = math.max(target - rpm, 0) / target * self.idleauthority * 2
+		idlethrottle = math.clamp(feed * fade + p, 0, 1)
+	end
+	local thr = math.max(math.clamp(throttle, 0, 1), idlethrottle)
+
+	if rpm >= self.limitrpm then
+		self.limiting = true
+	elseif rpm < self.limitrpm - self.limithyst then
+		self.limiting = false
+	end
+	if self.limiting then
+		thr *= 1 - self.limitcut
+	end
+
+	local comb = self.stalled and 0 or self:torqueAt(rpm) * thr
+	local fric = self.staticfric + self.viscous * self.omega
+	local pump = self.pumping * (1 - thr) * self.omega * self.omega
+	local net = comb - fric - pump - self.accessory - load
+
+	if not self.stalled and rpm < self.stallrpm and net < 0 then
+		self.stalled = true
+		comb = 0
+		net = -fric - pump - load
+	end
+
+	self.omega = math.max(self.omega + net / self.inertia * dt, 0)
+	self.lastcomb = comb
+	self.lastnet = net
+end
+
+function Engine:restart()
+	if self.omega < self.stallrpm / TO_RPM then
+		self.omega = self.idlerpm / TO_RPM
+	end
+	self.stalled = false
+end
+
+------------------------------------------------------------------------------------------
+-- Clutch: transmits whatever torque synchronises engine and driveline this step, up to
+-- its capacity.
+------------------------------------------------------------------------------------------
+
+local Clutch = {}
+Clutch.__index = Clutch
+
+function Clutch.new(cfg)
+	local self = setmetatable({ slip = 0 }, Clutch)
+	self:configure(cfg)
+	return self
+end
+
+function Clutch:configure(cfg)
+	self.maxtorque = cfg.maxTorque or 380
+end
+
+function Clutch:update(dt, eomega, einertia, tomega, reflected, pedal)
+	local cap = self.maxtorque * math.clamp(1 - pedal, 0, 1)
+	self.slip = eomega - tomega
+	if cap <= 0.001 or reflected <= 0 or einertia <= 0 then
+		return 0
+	end
+	local combined = (einertia * reflected) / (einertia + reflected)
+	return math.clamp(self.slip * combined / dt, -cap, cap)
+end
+
+------------------------------------------------------------------------------------------
+-- Gearbox
+------------------------------------------------------------------------------------------
+
+local Gearbox = {}
+Gearbox.__index = Gearbox
+
+function Gearbox.new(cfg)
+	local self = setmetatable({ gear = 0, pending = 0, shifting = false, timer = 0 }, Gearbox)
+	self:configure(cfg)
+	return self
+end
+
+function Gearbox:configure(cfg)
+	self.gears = cfg.gears
+	self.finaldrive = cfg.finalDrive or 3.9
+	self.eff = cfg.efficiency or 0.94
+	self.shifttime = cfg.shiftTime or 0.18
+	self.mingear, self.maxgear = 0, 0
+	for g in pairs(self.gears) do
+		if type(g) == "number" then
+			self.mingear = math.min(self.mingear, g)
+			self.maxgear = math.max(self.maxgear, g)
+		end
+	end
+	if self.gears[self.gear] == nil then
+		self.gear = math.clamp(self.gear, self.mingear, self.maxgear)
+	end
+	if self.shifting and self.gears[self.pending] == nil then
+		self.shifting = false
+	end
+end
+
+function Gearbox:ratio(gear)
+	return self.gears[gear or self.gear] or 0
+end
+
+function Gearbox:request(gear)
+	if self.gears[gear] == nil or self.shifting or gear == self.gear then
+		return false
+	end
+	self.pending = gear
+	self.shifting = true
+	self.timer = self.shifttime
+	return true
+end
+
+function Gearbox:update(dt)
+	if self.shifting then
+		self.timer -= dt
+		if self.timer <= 0 then
+			self.gear = self.pending
+			self.shifting = false
+		end
+	end
+end
+
+function Gearbox:outtorque(input)
+	if self.shifting then
+		return 0
+	end
+	return input * self:ratio() * self.finaldrive * self.eff
+end
+
+function Gearbox:totalratio()
+	return self:ratio() * self.finaldrive
+end
+
+------------------------------------------------------------------------------------------
+-- Differential. `bias` is the static share sent to side A (0.5 for axle diffs, the AWD
+-- front share for centre diffs); locking terms act on top of it.
+------------------------------------------------------------------------------------------
+
+local Diff = {}
+Diff.__index = Diff
+
+function Diff.new(cfg)
+	local self = setmetatable({}, Diff)
+	self:configure(cfg)
+	return self
+end
+
+function Diff:configure(cfg)
+	self.kind = tostring(cfg.type or "OPEN"):upper()
+	self.preload = cfg.preload or 15
+	self.powerlock = cfg.powerLock or 0.35
+	self.coastlock = cfg.coastLock or 0.15
+	self.maxbias = cfg.maxBias or 3
+end
+
+function Diff:split(dt, input, wa, wb, ia, ib, bias)
+	bias = bias or 0.5
+	local a, b = input * bias, input * (1 - bias)
+	if self.kind == "OPEN" then
+		return a, b
+	end
+
+	local wdiff = wa - wb
+	local biascap = math.abs(input) * (self.maxbias - 1) * 0.5
+
+	if self.kind == "LOCKED" or self.kind == "WELDED" then
+		local x = math.max(ia or 1, 0.01)
+		local y = math.max(ib or 1, 0.01)
+		local combined = (x * y) / (x + y)
+		local lock = math.clamp(wdiff * combined / dt, -biascap, biascap)
+		return a - lock, b + lock
+	end
+
+	local lockfrac = input >= 0 and self.powerlock or self.coastlock
+	local speedterm = math.clamp(wdiff * 6, -1, 1)
+	local lock = math.clamp((math.abs(input) * lockfrac + self.preload) * speedterm, -biascap, biascap)
+	return a - lock, b + lock
+end
+
+------------------------------------------------------------------------------------------
+-- Tire model
+------------------------------------------------------------------------------------------
+
+local LONG = { fz0 = 3000, muload = 0.15, stiffper = 18, stiffload = 0.25, C = 1.5, E = -0.1, relax = 0.35, maxslip = 1.0 }
+local LAT = { fz0 = 3000, muload = 0.22, stiffper = 16.0, stiffload = 0.30, C = 1.38, E = -0.35, relax = 0.4, maxslip = math.rad(32) }
+
+-- B*slip at which the magic formula peaks; depends only on C and E.
+local function peakArgument(C, E)
+	local target = math.tan(math.pi / (2 * C))
+	local u = target
+	for _ = 1, 12 do
+		local f = u - E * (u - math.atan(u)) - target
+		local df = 1 - E * (1 - 1 / (1 + u * u))
+		u -= f / df
+	end
+	return u
+end
+LONG.peak = peakArgument(LONG.C, LONG.E)
+LAT.peak = peakArgument(LAT.C, LAT.E)
+
+local FRICTION = {
+	[Enum.Material.Asphalt] = 1.3, [Enum.Material.Concrete] = 1.3, [Enum.Material.Pavement] = 1.1,
+	[Enum.Material.Grass] = 0.7, [Enum.Material.Mud] = 0.25, [Enum.Material.Sand] = 0.4,
+	[Enum.Material.Snow] = 0.2, [Enum.Material.Ice] = 0.08, [Enum.Material.Ground] = 1.0,
+	[Enum.Material.Rock] = 0.9, [Enum.Material.Salt] = 0.7, [Enum.Material.Basalt] = 0.95,
+	[Enum.Material.LeafyGrass] = 0.35, [Enum.Material.CrackedLava] = 0.15, [Enum.Material.Glacier] = 0.1,
+	[Enum.Material.Plastic] = 0.7, [Enum.Material.SmoothPlastic] = 0.6, [Enum.Material.Granite] = 0.95,
+	[Enum.Material.Slate] = 0.9, [Enum.Material.Wood] = 0.6, [Enum.Material.WoodPlanks] = 0.65,
+	[Enum.Material.CorrodedMetal] = 0.9, [Enum.Material.DiamondPlate] = 1.0, [Enum.Material.Metal] = 0.65,
+	[Enum.Material.Foil] = 0.15, [Enum.Material.Marble] = 0.45, [Enum.Material.Glass] = 0.05,
+	[Enum.Material.Pebble] = 0.5, [Enum.Material.Fabric] = 0.7, [Enum.Material.Neon] = 0.3,
+	[Enum.Material.ForceField] = 0.0,
+}
+
+local SURFACES = {
+	[Enum.Material.Asphalt] = "asphalt", [Enum.Material.Concrete] = "asphalt", [Enum.Material.Pavement] = "asphalt",
+	[Enum.Material.Brick] = "asphalt", [Enum.Material.Metal] = "asphalt", [Enum.Material.DiamondPlate] = "asphalt",
+	[Enum.Material.CorrodedMetal] = "asphalt", [Enum.Material.Plastic] = "asphalt", [Enum.Material.SmoothPlastic] = "asphalt",
+	[Enum.Material.Wood] = "asphalt", [Enum.Material.WoodPlanks] = "asphalt", [Enum.Material.Marble] = "asphalt",
+	[Enum.Material.Grass] = "grass", [Enum.Material.LeafyGrass] = "grass",
+	[Enum.Material.Cobblestone] = "gravel", [Enum.Material.Pebble] = "gravel", [Enum.Material.Rock] = "gravel",
+	[Enum.Material.Slate] = "gravel", [Enum.Material.Basalt] = "gravel", [Enum.Material.Granite] = "gravel",
+	[Enum.Material.CrackedLava] = "gravel", [Enum.Material.Salt] = "gravel",
+	[Enum.Material.Ground] = "dirt", [Enum.Material.Mud] = "dirt", [Enum.Material.Sand] = "dirt",
+	[Enum.Material.Snow] = "dirt", [Enum.Material.Glacier] = "dirt",
+}
+
+-- Contact patch sample pattern (fractions of REF_RADIUS): centre, 4 rings of 8.
+local SAMPLES = { Vector2.zero }
+for _, r in ipairs({ 0.1, 0.2, 0.3, 0.4 }) do
+	table.insert(SAMPLES, Vector2.new(r, 0))
+	table.insert(SAMPLES, Vector2.new(-r, 0))
+	table.insert(SAMPLES, Vector2.new(0, r))
+	table.insert(SAMPLES, Vector2.new(0, -r))
+end
+for _, r in ipairs({ 0.1, 0.2, 0.3, 0.4 }) do
+	local d = r * math.sqrt(0.5)
+	table.insert(SAMPLES, Vector2.new(d, d))
+	table.insert(SAMPLES, Vector2.new(d, -d))
+	table.insert(SAMPLES, Vector2.new(-d, d))
+	table.insert(SAMPLES, Vector2.new(-d, -d))
+end
+
+-- scratch buffers reused by every probe (single-threaded)
+local hitH, hitP, hitN, hitM, hitI = {}, {}, {}, {}, {}
+local matVotes = {}
+
+local function coeffs(axis, mu, fz, grip, stiff)
+	local ratio = fz / axis.fz0
+	local D = math.max(mu * (1 - axis.muload * (ratio - 1)), 0) * fz * grip
+	local bcd = math.max(axis.stiffper * (1 - axis.stiffload * (ratio - 1)), 0) * fz * stiff
+	return bcd / math.max(axis.C * D, 1e-6), D
+end
+
+local function pacejka(slip, axis, B, D)
+	local bx = B * math.clamp(slip, -axis.maxslip, axis.maxslip)
+	local E = axis.E
+	return D * math.sin(axis.C * math.atan(bx - E * (bx - math.atan(bx))))
+end
+
+local function projectOnPlane(v, n)
+	local p = v - n * v:Dot(n)
+	local m = p.Magnitude
+	if m < 1e-4 then
+		return nil
+	end
+	return p / m
+end
+
+------------------------------------------------------------------------------------------
+-- Controller
+------------------------------------------------------------------------------------------
+
+local REQUIRED = { "Wheels", "Mass", "Primary", "Throttle", "Brake", "Clutch", "Steer" }
+
+-- names the old JSON rig used for duplicated children
+local RENAMES = {
+	ForceAtt = { "ForceAtt_2", "ForceAtt_3", "ForceAtt_4" },
+	SteerSlide = { "SteerSlide_2" },
+	TIREEND = { "TIREEND_2", "TIREEND_3", "TIREEND_4" },
+	TIRESTART = { "TIRESTART_2", "TIRESTART_3", "TIRESTART_4" },
+	SpinAtt = { "SpinAtt_2", "SpinAtt_3", "SpinAtt_4" },
+}
+
+local handled = setmetatable({}, { __mode = "k" })
+local CarController = {}
+
+local function togglecollide(char, enabled, cache)
+	if not char then
+		return
+	end
+	if enabled then
+		for part, orig in pairs(cache) do
+			if part.Parent then
+				part.CanCollide = orig
+			end
+		end
+		table.clear(cache)
+	else
+		for _, part in ipairs(char:GetDescendants()) do
+			if part:IsA("BasePart") then
+				cache[part] = part.CanCollide
+				part.CanCollide = false
+			end
+		end
+	end
+end
+
+-- The humanoid keeps re-enabling collision on some limbs, so the seated driver needs
+-- explicit no-collision pairs against the car's colliding parts.
+local function ignoreCharacter(car, char)
+	local holder = Instance.new("Folder")
+	holder.Name = "DriverNoCollide"
+	local mine = {}
+	for _, part in ipairs(car:GetDescendants()) do
+		if part:IsA("BasePart") and part.CanCollide then
+			table.insert(mine, part)
+		end
+	end
+	for _, limb in ipairs(char:GetDescendants()) do
+		if limb:IsA("BasePart") then
+			for _, part in ipairs(mine) do
+				local c = Instance.new("NoCollisionConstraint")
+				c.Part0 = part
+				c.Part1 = limb
+				c.Parent = holder
+			end
+		end
+	end
+	holder.Parent = car
+	return holder
+end
+
+local function findCarSounds()
+	local folder = ReplicatedStorage:FindFirstChild("CarSounds")
+	if not folder then
+		folder = ReplicatedStorage:WaitForChild("CarSounds", 3)
+	end
+	return folder
+end
+
+local function resolveSoundWith(folder, id)
+	if type(id) == "number" then
+		return id ~= 0 and ("rbxassetid://" .. id) or nil
+	end
+	if type(id) ~= "string" or id == "" or id == "rbxassetid://0" then
+		return nil
+	end
+	if id:match("^rbxassetid://%d+$") or id:match("^rbxasset://") or id:match("^https?://") then
+		return id
+	end
+	if id:match("^%d+$") then
+		return "rbxassetid://" .. id
+	end
+	if not folder then
+		return nil
+	end
+	local sound = folder:FindFirstChild(id, true)
+	if not sound then
+		local base = id:gsub("%.%w+$", "")
+		sound = folder:FindFirstChild(base, true)
+		if not sound then
+			for _, ext in ipairs({ ".wav", ".mp3", ".ogg", ".flac" }) do
+				sound = folder:FindFirstChild(base .. ext, true)
+				if sound then
+					break
+				end
+			end
+		end
+	end
+	if sound and sound:IsA("Sound") and sound.SoundId ~= "" then
+		return sound.SoundId
+	end
+	return nil
+end
+
+function CarController:HandleCar(car, initialStats)
+	if typeof(car) ~= "Instance" or not car:IsA("Model") then
+		warn("CarController:HandleCar expects a car Model")
+		return
+	end
+	if handled[car] then
+		return handled[car]
+	end
+	local player = Players.LocalPlayer
+	if not player then
+		warn("CarController:HandleCar must be called from a client script")
+		return
+	end
+
+	for _, name in ipairs(REQUIRED) do
+		if not car:FindFirstChild(name) then
+			warn(("CarController: %s is missing '%s'"):format(car:GetFullName(), name))
+			return
+		end
+	end
+	for orig, clones in pairs(RENAMES) do
+		for _, cname in ipairs(clones) do
+			local child = car:FindFirstChild(cname, true)
+			if child then
+				child.Name = orig
+			end
+		end
+	end
+
+	local stats = initialStats or (_G.ReturnStats and _G.ReturnStats(car, car.Mass))
+	if type(stats) ~= "table" then
+		warn("CarController: no stats for " .. car:GetFullName())
+		return
+	end
+
+	local wheelsFolder = car.Wheels
+	local mass = car.Mass
+	local primary = car.Primary
+	local thrval, brkval, cltval, steerval = car.Throttle, car.Brake, car.Clutch, car.Steer
+	local drivermass = car:FindFirstChild("DriverMass")
+	local drag = mass:FindFirstChild("Drag")
+	local massGravity = mass:FindFirstChild("GravityComp")
+	local steerslide = primary:FindFirstChild("SteerSlide")
+	local slideBase = steerslide and steerslide.Position
+	local downF = primary:FindFirstChild("DownforceFront")
+	local downR = primary:FindFirstChild("DownforceRear")
+	local legacy = car:GetAttribute("Wheelbase") == nil
+	if legacy and steerslide then
+		slideBase = Vector3.new(0, -1.17, -7.216)
+	end
+
+	local ctl = { car = car }
+	handled[car] = ctl
+
+	local playerGui = player:FindFirstChildOfClass("PlayerGui")
+	if playerGui and not playerGui:FindFirstChild("TachoUI") then
+		pcall(Tacho.Create, Tacho)
+		Tacho:Visibility(false)
+	end
+
+	-- raycast filter: the original maps keep drivable geometry in Map/Built
+	local rayparams = RaycastParams.new()
+	local includes = {}
+	for _, name in ipairs({ "Map", "Built" }) do
+		local folder = workspace:FindFirstChild(name)
+		if folder then
+			table.insert(includes, folder)
+		end
+	end
+	if #includes > 0 then
+		rayparams.FilterType = Enum.RaycastFilterType.Include
+		rayparams.FilterDescendantsInstances = includes
+	else
+		rayparams.FilterType = Enum.RaycastFilterType.Exclude
+		local list = { car }
+		if player.Character then
+			table.insert(list, player.Character)
+		end
+		local thrown = workspace:FindFirstChild("Thrown")
+		if thrown then
+			table.insert(list, thrown)
+		end
+		rayparams.FilterDescendantsInstances = list
+	end
+	rayparams.IgnoreWater = true
+
+	----------------------------------------------------------------------------------
+	-- per-car state
+	----------------------------------------------------------------------------------
+
+	local engine, clutch, trans, axlediff, centerdiff
+	local driven = {}
+	local wheels = {}
+	local wheelList = {}
+	local masskg
+	local tireLong, tireLat = table.clone(LONG), table.clone(LAT)
+
+	for _, name in ipairs(WHEELS) do
+		local model = wheelsFolder:FindFirstChild(name)
+		local bounds = model and model:FindFirstChild("Bounds")
+		if bounds then
+			local radiusStuds = model:GetAttribute("Radius") or bounds.Size.Y / 2
+			local w = {
+				name = name,
+				front = name == "FL" or name == "FR",
+				model = model,
+				bounds = bounds,
+				forceAtt = bounds:FindFirstChild("ForceAtt"),
+				tireForce = bounds:FindFirstChild("TireForce"),
+				frictionForce = bounds:FindFirstChild("FrictionForce"),
+				gravityComp = bounds:FindFirstChild("GravityComp"),
+				spinAtt = bounds:FindFirstChild("SpinAtt"),
+				startAtt = bounds:FindFirstChild("TIRESTART"),
+				endAtt = bounds:FindFirstChild("TIREEND"),
+				rollValue = model:FindFirstChild("Roll"),
+				radiusStuds = radiusStuds,
+				sampleScale = radiusStuds / REF_RADIUS,
+				omega = 0,
+				roll = 0,
+				grounded = false,
+				compression = 0,
+				fz = 0,
+				lagx = 0,
+				lagy = 0,
+				slipRatio = 0,
+				slipAngle = 0,
+				totalSlip = 0,
+				absScale = 1,
+				force = Vector3.zero,
+				fx = 0,
+				fy = 0,
+			}
+			w.smoke = w.forceAtt and w.forceAtt:FindFirstChild("TireSmoke")
+			wheels[name] = w
+			table.insert(wheelList, w)
+		end
+	end
+	if #wheelList == 0 then
+		warn("CarController: no wheels on " .. car:GetFullName())
+		handled[car] = nil
+		return
+	end
+
+	local function readWheelAttributes()
+		for _, w in ipairs(wheelList) do
+			local m = w.model
+			if m:GetAttribute("RayStart") then
+				w.rayStart = m:GetAttribute("RayStart")
+				w.rayLength = m:GetAttribute("RayLength")
+				w.tireRate = m:GetAttribute("TireRate")
+				w.tireDamper = m:GetAttribute("TireDamper")
+			else
+				-- legacy rig: one tire spec on the car
+				local tstart = car:GetAttribute("tirestart") or 1.2
+				local tend = car:GetAttribute("tireend") or 1.52
+				w.rayStart = tstart
+				w.rayLength = tend + 0.35 - tstart
+				w.tireRate = (car:GetAttribute("psi") or 950) * 300
+				w.tireDamper = car:GetAttribute("damper") or 3900
+			end
+		end
+	end
+
+	local function applyStats(newStats)
+		stats = newStats
+		masskg = stats.massKg or (mass.AssemblyMass / KG_TO_RMU)
+		local tires = stats.tires or {}
+		tireLong.muload = tires.loadSensLong or LONG.muload
+		tireLat.muload = tires.loadSensLat or LAT.muload
+		tireLong.relax = tires.relaxLong or LONG.relax
+		tireLat.relax = tires.relaxLat or LAT.relax
+
+		if engine then
+			engine:configure(stats.engine)
+			clutch:configure(stats.clutch)
+			trans:configure(stats.transmission)
+			axlediff:configure(stats.transmission.differential)
+		else
+			engine = Engine.new(stats.engine)
+			clutch = Clutch.new(stats.clutch)
+			trans = Gearbox.new(stats.transmission)
+			axlediff = Diff.new(stats.transmission.differential)
+		end
+		local layout = stats.transmission.type
+		if layout == "AWD" then
+			local awd = stats.transmission.awd or {}
+			local cfg = { type = awd.centerDiff or "LIMITED" }
+			if centerdiff then
+				centerdiff:configure(cfg)
+			else
+				centerdiff = Diff.new(cfg)
+			end
+		else
+			centerdiff = nil
+		end
+
+		table.clear(driven)
+		if layout == "FWD" then
+			driven.FL, driven.FR = true, true
+		elseif layout == "AWD" then
+			driven.FL, driven.FR, driven.RL, driven.RR = true, true, true, true
+		else
+			driven.RL, driven.RR = true, true
+		end
+
+		for _, w in ipairs(wheelList) do
+			local r = w.model:GetAttribute("Radius")
+			if r then
+				w.radius = r * STUD
+			else
+				w.radius = stats.wheelRadiusMeters
+			end
+			w.inertia = stats.wheelInertia or 1.1
+			w.rollres = stats.aero.rollingResistance or 0.015
+		end
+		readWheelAttributes()
+	end
+	applyStats(stats)
+	ctl.engine, ctl.trans = engine, trans
+
+	local alive = true
+	local driving = false
+	local uivisible = 1
+	local tiredebug = false
+	local dbgfolder = nil
+	local dbgparts = {}
+	local enteredat = 0
+	local entrycf = mass.CFrame
+
+	local mousesteer = false
+	local handbrake = false
+	local hbsmooth = 0
+
+	local gearmodes = { "MANUAL", "ASSISTED", "AUTOMATIC" }
+	local gearmode = tostring(stats.transmission.gearbox or "MANUAL"):upper()
+	if not table.find(gearmodes, gearmode) then
+		gearmode = "MANUAL"
+	end
+	local queuedgear = nil
+	local autoclutch = 1
+	local autoreverse = false
+	local reversehold = 0
+	local autocool = 0
+	car:SetAttribute("GearboxMode", gearmode)
+
+	-- pedals: targets set by input, values ramp linearly at the configured response
+	local pedal = { thr = 0, brk = 0, clt = 0, thrT = 0, brkT = 0, cltT = 0 }
+	local pad = { steer = 0, thr = 0, brk = 0, active = false }
+	local tcsScale = 1
+
+	local cam = workspace.CurrentCamera
+	local camactive = false
+	local cambind = "CarHubCamera_" .. tostring(car)
+	local camMode = (stats.camera and stats.camera.mode) or 1
+	local camState = {
+		alpha = 0,
+		beta = 0.32,
+		zoom = 0,
+		rmb = false,
+		pvel = Vector3.zero,
+		fov = cam.FieldOfView,
+		pos = nil,
+		focus = nil,
+		accel = 0,
+		lat = 0,
+		lean = 0,
+		bump = 0,
+		bumpv = 0,
+		impact = 0,
+		yawoff = 0,
+		seed = math.random(0, 10000),
+	}
+
+	local char, root, diedconn
+	local conns = {}
+	local collidecache = {}
+
+	local prevvel = mass.AssemblyLinearVelocity
+	local loadLong, loadLat = 0, 0
+	local kmh = 0
+	local lastclutch, lastdshaft, lastdomega = 0, 0, 0
+	local lastEngineThr = 0
+
+	----------------------------------------------------------------------------------
+	-- Audio setup
+	----------------------------------------------------------------------------------
+
+	local carsounds = findCarSounds()
+	local function resolveSound(id)
+		return resolveSoundWith(carsounds, id)
+	end
+
+	local snd, chans, cf, mix
+	local sg = Instance.new("SoundGroup")
+	sg.Name = "CarSounds_" .. car.Name
+	sg.Parent = SoundService
+	local eq = Instance.new("EqualizerSoundEffect")
+	eq.Parent = sg
+
+	local sv = {
+		wasdriving = false,
+		wasrunning = false,
+		enteredat = 0,
+		runat = 0,
+		master = 0,
+		load = 0,
+		power = 0,
+		boost = 0,
+		interior = 0,
+		popsarmed = false,
+		bovarmed = false,
+		bovcool = 0,
+		lastgear = trans.gear,
+		lastclutch = 0,
+		hb = false,
+		indtimer = 0,
+		indstate = false,
+		impactcool = 0,
+		bottomcool = 0,
+		prevvel = Vector3.zero,
+		comp = {},
+		wheelcool = {},
+		reverbset = false,
+		prevreverb = nil,
+	}
+
+	local function buildAudio()
+		if chans then
+			for _, c in pairs(chans) do
+				c.s:Destroy()
+			end
+		end
+		chans = {}
+		snd = stats.sounds or {}
+		for _, g in ipairs({ "engine", "intake", "exhaust", "turbo", "driveline", "tires", "brakes", "body", "interior", "mix" }) do
+			snd[g] = snd[g] or {}
+		end
+		snd.engine.on = snd.engine.on or {}
+		snd.engine.off = snd.engine.off or {}
+		mix = snd.mix
+
+		cf = {
+			start = snd.engine.start or {},
+			stop = snd.engine.stop or {},
+			idle = snd.engine.idle or {},
+			limiter = snd.engine.limiter or {},
+			intake = snd.intake,
+			exhaust = snd.exhaust,
+			pops = snd.exhaust.pops or {},
+			spool = snd.turbo.spool or {},
+			blowoff = snd.turbo.blowoff or {},
+			flutter = snd.turbo.flutter or {},
+			whine = snd.driveline.gearWhine or {},
+			diffwhine = snd.driveline.diffWhine or {},
+			clunk = snd.driveline.shiftClunk or {},
+			clutchengage = snd.driveline.clutchEngage or {},
+			driveshaft = snd.driveline.driveshaftRumble or {},
+			squeal = snd.tires.squeal or {},
+			skid = snd.tires.skidLoose or {},
+			roll = snd.tires.roadRoll or {},
+			kickup = snd.tires.kickup or {},
+			bsqueal = snd.brakes.squeal or {},
+			handbrake = snd.brakes.handbrake or {},
+			abs = snd.brakes.absChatter or {},
+			wind = snd.body.wind or {},
+			bump = snd.body.suspensionBump or {},
+			bottom = snd.body.bottomOut or {},
+			impacts = snd.body.impacts or {},
+			rattle = snd.body.rattle or {},
+			door = snd.interior.door or {},
+			ignition = snd.interior.ignition or {},
+			seatbelt = snd.interior.seatbelt or {},
+			indicator = snd.interior.indicator or {},
+		}
+
+		local spec = {
+			idle = cf.idle, limiter = cf.limiter, intake = cf.intake, exhaust = cf.exhaust,
+			turbospool = cf.spool, gearwhine = cf.whine, diffwhine = cf.diffwhine,
+			driveshaft = cf.driveshaft, squeal = cf.squeal, skid = cf.skid, kickup = cf.kickup,
+			bsqueal = cf.bsqueal, abs = cf.abs, wind = cf.wind, rattle = cf.rattle,
+		}
+		for i, l in ipairs(snd.engine.on) do
+			spec["on" .. i] = l
+		end
+		for i, l in ipairs(snd.engine.off) do
+			spec["off" .. i] = l
+		end
+		for k, v in pairs(cf.roll) do
+			spec["road" .. k] = v
+		end
+
+		local preload = {}
+		for key, c in pairs(spec) do
+			local id = c.id and resolveSound(c.id)
+			if id then
+				local s = Instance.new("Sound")
+				s.Name = key
+				s.SoundId = id
+				s.Looped = true
+				s.Volume = 0
+				s.RollOffMode = Enum.RollOffMode.InverseTapered
+				s.RollOffMinDistance = mix.rollOffMin or 12
+				s.RollOffMaxDistance = mix.rollOffMax or 350
+				s.SoundGroup = sg
+				s.Parent = mass
+				local chan = { s = s, v = 0, p = 1, vk = 10, pk = 25 }
+				if key:sub(1, 2) == "on" or key:sub(1, 3) == "off" then
+					chan.vk = 25
+					chan.pk = 60
+				end
+				chans[key] = chan
+				table.insert(preload, s)
+			end
+		end
+		if chans.limiter then
+			chans.limiter.vk = 30
+		end
+		if chans.squeal then
+			chans.squeal.vk = 14
+		end
+		if chans.turbospool then
+			chans.turbospool.pk = 12
+		end
+		task.spawn(function()
+			pcall(ContentProvider.PreloadAsync, ContentProvider, preload)
+		end)
+	end
+	buildAudio()
+
+	local function oneshot(id, vol, pitch)
+		id = resolveSound(id)
+		if not id then
+			return
+		end
+		local s = Instance.new("Sound")
+		s.SoundId = id
+		s.Volume = vol or 1
+		s.PlaybackSpeed = pitch or 1
+		s.RollOffMode = Enum.RollOffMode.InverseTapered
+		s.RollOffMinDistance = mix.rollOffMin or 12
+		s.RollOffMaxDistance = mix.rollOffMax or 350
+		s.SoundGroup = sg
+		s.Parent = mass
+		s.Ended:Once(function()
+			s:Destroy()
+		end)
+		s:Play()
+		Debris:AddItem(s, 10)
+	end
+
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = "EnterCarPrompt"
+	prompt.ActionText = "Drive"
+	prompt.ObjectText = car.Name
+	prompt.KeyboardKeyCode = Enum.KeyCode.E
+	prompt.GamepadKeyCode = Enum.KeyCode.ButtonX
+	prompt.HoldDuration = 0
+	prompt.MaxActivationDistance = 12
+	prompt.RequiresLineOfSight = false
+	prompt.Enabled = false
+	prompt.Parent = drivermass or mass
+
+	----------------------------------------------------------------------------------
+	-- Controls
+	----------------------------------------------------------------------------------
+
+	local function typing()
+		return UserInputService:GetFocusedTextBox() ~= nil
+	end
+
+	local function releasecontrols(parked)
+		pedal.thrT, pedal.brkT = 0, parked and 1 or 0
+		pedal.thr, pedal.brk = 0, parked and 1 or 0
+		pedal.cltT, pedal.clt = 0, 0
+		autoclutch = 1
+		queuedgear = nil
+		autoreverse = false
+		reversehold = 0
+		thrval.Value = 0
+		cltval.Value = 0
+		brkval.Value = pedal.brk
+		if parked then
+			handbrake = true
+			hbsmooth = 1
+		end
+	end
+
+	local function updatepedals()
+		if not driving then
+			return
+		end
+		local w = not typing() and UserInputService:IsKeyDown(Enum.KeyCode.W)
+		local s = not typing() and UserInputService:IsKeyDown(Enum.KeyCode.S)
+		local fwd = math.max(w and 1 or 0, pad.thr)
+		local back = math.max(s and 1 or 0, pad.brk)
+		if autoreverse then
+			pedal.thrT, pedal.brkT = back, fwd
+		else
+			pedal.thrT, pedal.brkT = fwd, back
+		end
+	end
+
+	local function ramp(current, target, time, dt)
+		if time <= 0 then
+			return target
+		end
+		local step = dt / time
+		if current < target then
+			return math.min(current + step, target)
+		end
+		return math.max(current - step, target)
+	end
+
+	local function updatepedalvalues(dt)
+		updatepedals()
+		local tr = stats.throttleResponseTime or 0.05
+		local br = stats.brakeResponseTime or 0.12
+		local cr = stats.clutchResponseTime or 0.04
+		pedal.thr = ramp(pedal.thr, pedal.thrT, pedal.thrT > pedal.thr and tr or tr * 0.5, dt)
+		pedal.brk = ramp(pedal.brk, pedal.brkT, pedal.brkT > pedal.brk and br or br * 0.5, dt)
+		if gearmode == "MANUAL" then
+			pedal.clt = ramp(pedal.clt, pedal.cltT, pedal.cltT > pedal.clt and cr or cr * 0.5, dt)
+		end
+		thrval.Value = pedal.thr
+		brkval.Value = pedal.brk
+	end
+
+	local function setgearmode(mode)
+		gearmode = mode
+		queuedgear = nil
+		autoreverse = false
+		reversehold = 0
+		autocool = 0
+		car:SetAttribute("GearboxMode", mode)
+		if mode == "MANUAL" then
+			local held = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) and not typing()
+			pedal.cltT = held and 1 or 0
+			pedal.clt = autoclutch
+		else
+			autoclutch = pedal.clt
+		end
+		updatepedals()
+	end
+
+	local function queueshift(gear)
+		if trans.gears[gear] == nil or gear == trans.gear or trans.shifting then
+			return
+		end
+		if gearmode == "MANUAL" then
+			trans:request(gear)
+		else
+			queuedgear = gear
+		end
+	end
+
+	local function shift(dir)
+		if not driving or gearmode == "AUTOMATIC" then
+			return
+		end
+		if gearmode == "ASSISTED" and (queuedgear or trans.shifting) then
+			return
+		end
+		queueshift(trans.gear + dir)
+	end
+
+	local function drivenomega()
+		local total, count = 0, 0
+		for _, w in ipairs(wheelList) do
+			if driven[w.name] then
+				total += w.omega
+				count += 1
+			end
+		end
+		return count > 0 and total / count or 0
+	end
+
+	local function drivenradius()
+		local total, count = 0, 0
+		for _, w in ipairs(wheelList) do
+			if driven[w.name] then
+				total += w.radius
+				count += 1
+			end
+		end
+		return count > 0 and total / count or stats.wheelRadiusMeters
+	end
+
+	local function autoselect(dt, thr, brk, domega, erpm, wrpm)
+		autocool = math.max(autocool - dt, 0)
+		local speed = math.abs(domega) * drivenradius()
+		local w = not typing() and (UserInputService:IsKeyDown(Enum.KeyCode.W) or pad.thr > 0.2)
+		local s = not typing() and (UserInputService:IsKeyDown(Enum.KeyCode.S) or pad.brk > 0.2)
+
+		if trans.mingear < 0 then
+			if not autoreverse then
+				if s and not w and speed < 1 then
+					reversehold += dt
+					if reversehold > 0.35 then
+						reversehold = 0
+						autoreverse = true
+						updatepedals()
+					end
+				else
+					reversehold = 0
+				end
+			elseif w and speed < 1.5 then
+				autoreverse = false
+				updatepedals()
+			end
+		end
+
+		if trans.shifting or queuedgear then
+			return
+		end
+
+		local want
+		if autoreverse and trans.mingear < 0 then
+			want = trans.mingear
+		elseif trans.gear < 1 then
+			want = 1
+		end
+		if want then
+			if trans.gear ~= want then
+				queueshift(want)
+				autocool = 0.5
+			end
+			return
+		end
+		if autocool > 0 then
+			return
+		end
+
+		local g = trans.gear
+		local ratio = trans:ratio(g)
+		if ratio <= 0 then
+			return
+		end
+		local upat = engine.redline * (0.45 + 0.43 * thr)
+		local downat = engine.redline * (0.18 + 0.27 * thr)
+
+		local nextratio = trans:ratio(g + 1)
+		if nextratio > 0 and brk < 0.5 and autoclutch < 0.35 then
+			local after = wrpm * nextratio / ratio
+			if math.max(erpm, wrpm) > upat and after > engine.idlerpm * 1.6 then
+				queueshift(g + 1)
+				autocool = 0.6
+				return
+			end
+		end
+
+		local prevratio = trans:ratio(g - 1)
+		if g > 1 and prevratio > 0 then
+			local after = wrpm * prevratio / ratio
+			if wrpm < downat and after < upat * 0.92 then
+				queueshift(g - 1)
+				autocool = 0.6
+			end
+		end
+	end
+
+	local function autodrive(dt, thr, brk, domega)
+		local idle = engine.idlerpm
+		local erpm = engine.omega * TO_RPM
+		local wrpm = math.abs(domega * trans:totalratio()) * TO_RPM
+
+		if gearmode == "AUTOMATIC" and driving then
+			autoselect(dt, thr, brk, domega, erpm, wrpm)
+		end
+		if queuedgear and not trans.shifting and autoclutch >= 0.95 then
+			trans:request(queuedgear)
+			queuedgear = nil
+		end
+
+		local shiftgear = queuedgear or (trans.shifting and trans.pending) or nil
+		local enginethr = thr
+		local target
+
+		if shiftgear then
+			target = 1
+			local tr = math.abs(trans:ratio(shiftgear) * trans.finaldrive)
+			local goal = tr > 0 and math.abs(domega) * tr * TO_RPM or idle
+			goal = math.clamp(goal, idle, engine.redline * 0.95)
+			enginethr = math.clamp(0.1 + (goal - erpm) / 600, 0, 1)
+		elseif trans.gear == 0 or engine.stalled then
+			target = 1
+		else
+			local lo = idle * 1.1
+			local hi = idle * 1.8 + (idle + (engine.redline - idle) * 0.3 - idle * 1.8) * thr
+			local launch = smooth01((erpm - lo) / math.max(hi - lo, 1))
+			local rolling = smooth01((wrpm - lo) / (idle * 0.4))
+			local engage = math.max(launch, rolling)
+			if gearmode == "AUTOMATIC" then
+				local creep = 0.12 * (1 - brk) * smooth01((erpm - idle * 0.75) / (idle * 0.2))
+				engage = math.max(engage, creep)
+			end
+			target = 1 - engage
+		end
+
+		local rateout = 1 / math.max(stats.clutchResponseTime * 0.5, 0.04)
+		local ratein = 1 / math.max(stats.clutchResponseTime, 0.12)
+		if target > autoclutch then
+			autoclutch = math.min(autoclutch + dt * rateout, target)
+		else
+			autoclutch = math.max(autoclutch - dt * ratein, target)
+		end
+		return autoclutch, enginethr
+	end
+
+	----------------------------------------------------------------------------------
+	-- Camera
+	----------------------------------------------------------------------------------
+
+	local function totalSlip()
+		local s = 0
+		for _, w in ipairs(wheelList) do
+			s += w.totalSlip
+		end
+		return s
+	end
+
+	local function cameraStep(dt)
+		local cams = stats.camera or {}
+		local look = mass.CFrame.LookVector
+		local flat = Vector3.new(look.X, 0, look.Z)
+		local vel = mass.AssemblyLinearVelocity
+		local rawaccel = (vel - camState.pvel) / math.max(dt, 1 / 240)
+		camState.pvel = vel
+		local fwdaccel = math.clamp(rawaccel:Dot(look), -60, 60)
+		camState.accel += (fwdaccel - camState.accel) * smoothing(3, dt)
+		local accel = camState.accel
+		local speedKmh = vel.Magnitude * STUD * 3.6
+
+		local function followYaw(target, rate)
+			local diff = math.atan2(math.sin(target - camState.alpha), math.cos(target - camState.alpha))
+			camState.alpha += diff * smoothing(rate, dt)
+		end
+		local heading = flat.Magnitude > 0.02 and math.atan2(-flat.X, -flat.Z) or camState.alpha
+
+		if camMode == 2 then
+			local c = cams.simple or {}
+			if not camState.rmb then
+				followYaw(heading, c.followRate or 2)
+			end
+			camState.fov += ((c.fov or 70) - camState.fov) * smoothing(c.fovRate or 3, dt)
+			local focus = mass.Position + Vector3.new(0, c.height or 2.6, 0)
+			local orbit = CFrame.new(focus) * CFrame.Angles(0, camState.alpha, 0)
+			local desired = (orbit * CFrame.new(0, (c.camHeight or 3.5) - (c.height or 2.6), (c.distance or 18) + camState.zoom)).Position
+			camState.pos = camState.pos and camState.pos:Lerp(desired, smoothing(c.offsetRate or 7, dt)) or desired
+			camState.focus = camState.focus and camState.focus:Lerp(focus, smoothing(8, dt)) or focus
+			cam.FieldOfView = camState.fov
+			cam.CFrame = CFrame.lookAt(camState.pos, camState.focus)
+			return
+		end
+
+		if camMode == 3 then
+			local c = cams.racing or {}
+			local right = mass.CFrame.RightVector
+			local latraw = math.clamp(rawaccel:Dot(right), -200, 200)
+			camState.lat += (latraw - camState.lat) * smoothing(c.leanRate or 5, dt)
+
+			local target = heading
+			local hv = Vector3.new(vel.X, 0, vel.Z)
+			if hv.Magnitude > 6 then
+				local vh = math.atan2(-hv.X, -hv.Z)
+				local drift = math.atan2(math.sin(vh - heading), math.cos(vh - heading))
+				local maxd = math.rad(c.maxDriftYawDeg or 12)
+				target = heading + math.clamp(drift * (c.driftFollow or 0.5), -maxd, maxd)
+			end
+			if not camState.rmb then
+				followYaw(target, c.followRate or 4)
+			end
+
+			local sf = math.clamp(speedKmh / (c.speedRef or 240), 0, 1) ^ (c.speedCurve or 1.6)
+			local af = math.clamp(accel / (c.accelRef or 40), -1, 1)
+			local fov = (c.fovBase or 72) + sf * (c.fovSpeed or 16) + math.max(af, 0) * (c.fovAccel or 3)
+			camState.fov += (fov - camState.fov) * smoothing(c.fovRate or 4, dt)
+
+			-- vertical bump spring driven by body vertical acceleration
+			local va = math.clamp(rawaccel.Y, -(c.bumpAccelClamp or 250), c.bumpAccelClamp or 250)
+			camState.bumpv += (-(c.bumpStiff or 140) * camState.bump - (c.bumpDamp or 14) * camState.bumpv - va * (c.bumpGain or 0.0015) * 60) * dt
+			camState.bump = math.clamp(camState.bump + camState.bumpv * dt, -(c.bumpMax or 0.35), c.bumpMax or 0.35)
+			local jolt = (rawaccel - Vector3.new(0, -workspace.Gravity, 0)).Magnitude
+			if jolt > (c.impactThreshold or 120) then
+				camState.impact = math.max(camState.impact, math.clamp((jolt - (c.impactThreshold or 120)) / (c.impactRange or 400), 0, 1))
+			end
+			camState.impact *= math.exp(-(c.impactDecay or 8) * dt)
+
+			local dist = (c.distance or 12) + camState.zoom + sf * (c.pullback or 1.5) + math.max(af, 0) * (c.accelBack or 1.2)
+			local focus = mass.Position + Vector3.new(0, (c.height or 1.2) + camState.bump, 0)
+			local steerYaw = math.rad(c.steerYawDeg or 2.5) * steerval.Value
+			local orbit = CFrame.new(focus) * CFrame.Angles(0, camState.alpha - steerYaw, 0) * CFrame.Angles(camState.beta * 0.4, 0, 0)
+			local desired = (orbit * CFrame.new(0, (c.camHeight or 2.2) - (c.height or 1.2), dist)).Position
+			camState.pos = camState.pos and camState.pos:Lerp(desired, smoothing(c.offsetRate or 16, dt)) or desired
+			camState.focus = focus
+
+			local lean = math.clamp(camState.lat / (c.latRef or 80), -1, 1) * math.clamp(speedKmh / (c.leanSpeed or 30), 0, 1)
+			camState.lean += (lean - camState.lean) * smoothing(c.leanRate or 5, dt)
+			local t = os.clock()
+			local slip = math.max(totalSlip() - (c.slipStart or 1.2), 0) * (c.slipShake or 0.5)
+			local shake = (c.shakeBase or 0.02) + math.clamp(speedKmh / 250, 0, 1) * (c.shakeSpeed or 0.5) * (c.roughness or 0.06) + slip * 0.05 + camState.impact
+			local freq = c.shakeFreq or 7
+			local rot = math.rad(c.shakeRotDeg or 1.2) * shake
+			local pos = (c.shakePos or 0.08) * shake
+			local seed = camState.seed
+			local offset = Vector3.new(math.noise(t * freq, seed) * pos, math.noise(t * freq, seed + 13) * pos, 0)
+
+			cam.FieldOfView = camState.fov
+			cam.CFrame = CFrame.lookAt(camState.pos, camState.focus)
+				* CFrame.new(offset)
+				* CFrame.Angles(math.rad(c.accelPitchDeg or 2.5) * -af * 0.5 + math.noise(t * freq, seed + 7) * rot, math.noise(t * freq, seed + 21) * rot, math.rad(c.leanRoll or 2.5) * camState.lean)
+			return
+		end
+
+		-- chase (the original camera)
+		local c = cams.advanced or {}
+		if not camState.rmb then
+			followYaw(heading, c.followRate or 1.4)
+		end
+		local fov = (c.fovBase or 68)
+			+ math.clamp(speedKmh / (c.fovSpeedRef or 260), 0, 1) * (c.fovSpeed or 10)
+			+ math.clamp(accel / (c.fovAccelRef or 35), 0, 1) * (c.fovAccel or 4)
+		camState.fov += (fov - camState.fov) * smoothing(c.fovRate or 3, dt)
+		cam.FieldOfView = camState.fov
+
+		local dist = (c.distance or 20) + camState.zoom + math.clamp(speedKmh / (c.speedRef or 300), 0, 1) * (c.speedPullback or 6)
+		local focus = mass.Position + Vector3.new(0, c.height or 2.6, 0)
+		local orbit = CFrame.new(focus) * CFrame.Angles(0, camState.alpha, 0) * CFrame.Angles(camState.beta, 0, 0)
+		local desired = orbit * CFrame.new(0, 0, dist)
+		desired += orbit.LookVector * (math.clamp(-accel / (c.accelRef or 30), -1, 1) * (c.accelOffset or 1.2))
+
+		local slip = totalSlip()
+		local shake = math.clamp(math.max(math.clamp(slip, 0, 4) - (c.shakeStart or 1.2), 0) * (c.shakeScale or 0.25), 0, 1) * (c.shakeMax or 0.12)
+		local t = os.clock()
+		local shakeoffset = cam.CFrame.RightVector * math.noise(t * 7, camState.seed) * shake
+			+ cam.CFrame.UpVector * math.noise(t * 8, camState.seed + 40) * shake
+
+		camState.pos = camState.pos or desired.Position
+		camState.focus = camState.focus or focus
+		camState.pos = camState.pos:Lerp(desired.Position, smoothing(c.offsetRate or 6, dt))
+		camState.focus = camState.focus:Lerp(focus, smoothing(c.focusRate or 8, dt))
+		cam.CFrame = CFrame.lookAt(camState.pos + shakeoffset, camState.focus)
+	end
+
+	local function startcamera()
+		if camactive then
+			return
+		end
+		camactive = true
+		camState.pvel = mass.AssemblyLinearVelocity
+		camState.fov = cam.FieldOfView
+		camState.pos = nil
+		camState.focus = nil
+		local look = mass.CFrame.LookVector
+		camState.alpha = math.atan2(-look.X, -look.Z)
+		cam.CameraType = Enum.CameraType.Scriptable
+		RunService:BindToRenderStep(cambind, Enum.RenderPriority.Camera.Value + 1, function(dt)
+			if not (car:IsDescendantOf(workspace) and mass.Parent) then
+				camactive = false
+				RunService:UnbindFromRenderStep(cambind)
+				return
+			end
+			cam = workspace.CurrentCamera
+			cameraStep(dt)
+		end)
+	end
+
+	local function stopcamera()
+		if not camactive then
+			return
+		end
+		camactive = false
+		RunService:UnbindFromRenderStep(cambind)
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		if cam and cam.Parent then
+			cam.CameraType = Enum.CameraType.Custom
+			cam.FieldOfView = 70
+		end
+	end
+
+	----------------------------------------------------------------------------------
+	-- Enter / leave / teardown
+	----------------------------------------------------------------------------------
+
+	local function leavecar()
+		if not driving then
+			return
+		end
+		driving = false
+		stopcamera()
+		Tacho:Visibility(false)
+		local exitcf = entrycf
+		if car:IsDescendantOf(workspace) and mass:IsDescendantOf(car) then
+			local mcf = mass.CFrame
+			local side = -1
+			if drivermass then
+				side = mcf:PointToObjectSpace(drivermass.Position).X < 0 and -1 or 1
+			end
+			local halfwidth = car:GetExtentsSize().X * 0.5
+			local r = Vector3.new(mcf.RightVector.X, 0, mcf.RightVector.Z)
+			r = r.Magnitude < 0.01 and Vector3.xAxis or r.Unit
+			local l = Vector3.new(mcf.LookVector.X, 0, mcf.LookVector.Z)
+			l = l.Magnitude < 0.01 and -Vector3.zAxis or l.Unit
+			local pos = mcf.Position + r * side * (halfwidth + 3) + Vector3.yAxis * 2
+			exitcf = CFrame.lookAt(pos, pos + l)
+		end
+
+		releasecontrols(true)
+		if diedconn then
+			diedconn:Disconnect()
+			diedconn = nil
+		end
+		togglecollide(char, true, collidecache)
+		if root and root.Parent then
+			root.Anchored = false
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+			root.CFrame = exitcf
+		end
+		-- keep the pairs a moment so the exiting character is clear of the hull
+		local holder = ctl.noCollide
+		ctl.noCollide = nil
+		if holder then
+			task.delay(1, function()
+				holder:Destroy()
+			end)
+		end
+		-- gravity goes back only after the character is free again
+		workspace.Gravity = ctl.prevgravity or 196.2
+		ctl.prevgravity = nil
+		char, root = nil, nil
+		if alive and prompt.Parent then
+			prompt.Enabled = true
+		end
+	end
+
+	local function teardown()
+		if not alive then
+			return
+		end
+		alive = false
+		Tacho:Clear()
+		if dbgfolder then
+			dbgfolder:Destroy()
+			dbgfolder = nil
+		end
+		stopcamera()
+		for _, c in conns do
+			c:Disconnect()
+		end
+		table.clear(conns)
+		if sv.reverbset and sv.prevreverb then
+			SoundService.AmbientReverb = sv.prevreverb
+			sv.reverbset = false
+		end
+		prompt:Destroy()
+		sg:Destroy()
+		if chans then
+			for _, c in pairs(chans) do
+				c.s:Destroy()
+			end
+		end
+		handled[car] = nil
+	end
+
+	local function destroy()
+		if not alive then
+			return
+		end
+		if driving then
+			leavecar()
+		end
+		teardown()
+	end
+
+	local function driverdied()
+		if not driving then
+			return
+		end
+		if diedconn then
+			diedconn:Disconnect()
+			diedconn = nil
+		end
+		driving = false
+		workspace.Gravity = ctl.prevgravity or 196.2
+		ctl.prevgravity = nil
+		char, root = nil, nil
+		teardown()
+		if car:IsDescendantOf(workspace) then
+			car:Destroy()
+		end
+	end
+
+	local function entercar()
+		if driving or not alive then
+			return
+		end
+		local newchar = player.Character
+		local newhum = newchar and newchar:FindFirstChildOfClass("Humanoid")
+		local newroot = newchar and newchar:FindFirstChild("HumanoidRootPart")
+		if not newhum or not newroot or newhum.Health <= 0 then
+			return
+		end
+		Tacho:Visibility(true)
+		togglecollide(newchar, false, collidecache)
+		if ctl.noCollide then
+			ctl.noCollide:Destroy()
+		end
+		ctl.noCollide = ignoreCharacter(car, newchar)
+		newroot.Anchored = true
+
+		driving = true
+		ctl.prevgravity = workspace.Gravity
+		workspace.Gravity = DRIVE_GRAVITY
+		enteredat = os.clock()
+		char = newchar
+		root = newroot
+		entrycf = newroot.CFrame
+
+		-- automated boxes select first themselves; a manual starts in neutral so the
+		-- engine is not stalled against a standing car before the driver touches the clutch
+		if trans.gear == 0 and gearmode ~= "MANUAL" then
+			trans:request(1)
+		end
+		if engine.stalled then
+			engine:restart()
+		end
+		prompt.Enabled = false
+		releasecontrols(false)
+		handbrake = false
+		hbsmooth = 0
+		startcamera()
+		diedconn = newhum.Died:Connect(driverdied)
+	end
+
+	----------------------------------------------------------------------------------
+	-- Ground contact (once per frame per wheel)
+	----------------------------------------------------------------------------------
+
+	local function probe(w)
+		local bounds = w.bounds
+		local cframe = bounds.CFrame
+		local up, right, look = cframe.UpVector, cframe.RightVector, cframe.LookVector
+		local start = cframe.Position - up * w.rayStart
+		local dir = up * -w.rayLength
+		local scale = w.sampleScale
+
+		local n, best = 0, -math.huge
+		for i = 1, #SAMPLES do
+			local o = SAMPLES[i]
+			local origin = start
+			if i > 1 then
+				origin = start + right * (o.X * scale) + look * (o.Y * scale)
+			end
+			local res = workspace:Raycast(origin, dir, rayparams)
+			if res then
+				n += 1
+				local h = (res.Position - start):Dot(up)
+				hitH[n] = h
+				hitP[n] = res.Position
+				hitN[n] = res.Normal
+				hitM[n] = res.Material
+				hitI[n] = res.Instance
+				if h > best then
+					best = h
+				end
+			end
+		end
+
+		if n == 0 then
+			w.grounded = false
+			w.compression = 0
+			w.normalForce = 0
+			if w.tireForce then
+				w.tireForce.Force = Vector3.zero
+			end
+			return
+		end
+
+		-- average the highest cluster of hits; vote on the surface material
+		local possum, normsum, kept = Vector3.zero, Vector3.zero, 0
+		local inst
+		table.clear(matVotes)
+		local topmat, topcount = nil, 0
+		for i = 1, n do
+			local m = hitM[i]
+			local c = (matVotes[m] or 0) + 1
+			matVotes[m] = c
+			if c > topcount then
+				topmat, topcount = m, c
+			end
+			if best - hitH[i] <= 0.05 then
+				possum += hitP[i]
+				normsum += hitN[i]
+				kept += 1
+				inst = inst or hitI[i]
+			end
+		end
+
+		local cpos = possum / kept
+		local normal = normsum.Magnitude > 1e-6 and normsum.Unit or Vector3.yAxis
+		local groundVel = Vector3.zero
+		if inst and inst ~= workspace.Terrain and not inst.Anchored then
+			groundVel = inst:GetVelocityAtPosition(cpos)
+		elseif inst and inst ~= workspace.Terrain then
+			groundVel = inst.AssemblyLinearVelocity
+		end
+
+		local dist = -(cpos - start):Dot(up)
+		local compression = math.max(w.rayLength - dist, 0)
+		local vel = bounds.AssemblyLinearVelocity
+		local vup = (vel - groundVel):Dot(up)
+		local force = math.max(w.tireRate * compression - w.tireDamper * vup, 0)
+
+		w.grounded = true
+		w.cpos = cpos
+		w.normal = normal
+		w.mat = topmat
+		w.groundVel = groundVel
+		w.compression = compression
+		w.normalForce = force
+		w.up = up
+
+		if w.forceAtt then
+			w.forceAtt.WorldPosition = cpos
+		end
+		if w.tireForce then
+			w.tireForce.Force = normal * force
+		end
+
+		-- kinematics at the contact patch, in the road plane
+		local fwd = projectOnPlane(look, normal) or look
+		local side = fwd:Cross(normal)
+		local offset = cpos - bounds.AssemblyCenterOfMass
+		local v = vel + bounds.AssemblyAngularVelocity:Cross(offset) - groundVel
+		w.fwd = fwd
+		w.right = side
+		w.longvel = v:Dot(fwd)
+		w.latvel = v:Dot(side)
+	end
+
+	----------------------------------------------------------------------------------
+	-- Tire forces (per substep)
+	----------------------------------------------------------------------------------
+
+	local function prepareTire(w, dt, loadTarget)
+		local fz = w.fz + (math.max(loadTarget, 0) - w.fz) * smoothing(12, dt)
+		w.fz = fz
+		local mu = FRICTION[w.mat] or 0.6
+		w.mu = mu
+		local fc = stats.frictconfig
+		local grip = w.front and fc.latGripFront or fc.latGripRear
+		local stiff = w.front and fc.latStiffFront or fc.latStiffRear
+		w.Bx, w.Dx = coeffs(tireLong, mu, fz, fc.longGrip or 1, 1)
+		w.By, w.Dy = coeffs(tireLat, mu, fz, grip, stiff)
+		w.kpx = LONG.peak / math.max(w.Bx, 1e-6)
+		w.kpy = LAT.peak / math.max(w.By, 1e-6)
+	end
+
+	local combinedBlend = 0
+
+	-- returns longitudinal force (N), lateral force along `right` (N), longitudinal stiffness
+	local function tireStep(w, surf, dt)
+		local Dx, Dy = w.Dx, w.Dy
+		if Dx <= 0 or Dy <= 0 then
+			return 0, 0, 0
+		end
+		local longvel, latvel = w.longvel, w.latvel
+		local refspeed = math.max(math.abs(longvel), math.abs(surf), 2.5)
+		local slipratio = math.clamp((surf - longvel) / refspeed, -tireLong.maxslip, tireLong.maxslip)
+		local slipangle = math.clamp(math.atan2(latvel, math.max(math.abs(longvel), 2.5)), -tireLat.maxslip, tireLat.maxslip)
+		local stationary = math.abs(longvel) < 0.75 and math.abs(surf) < 0.75 and math.abs(latvel) < 0.75
+		local Bx, By = w.Bx, w.By
+		local fx, fside
+
+		if stationary then
+			-- near standstill the slip definitions break down; hold the car with a viscous
+			-- contact while still letting the driven wheel push
+			local mu = w.mu
+			local drivefx = pacejka(math.clamp(surf / 2.5, -1, 1), tireLong, Bx, Dx)
+			fx = drivefx - longvel * mu * 220
+			fside = -latvel * mu * 220
+			local e = math.sqrt((fx / Dx) ^ 2 + (fside / Dy) ^ 2)
+			if e > 1 then
+				fx /= e
+				fside /= e
+			end
+		else
+			local speed = math.max(math.abs(longvel * STUD), 0.6)
+			w.lagx += (slipratio - w.lagx) * smoothing(speed / tireLong.relax, dt)
+			w.lagy += (slipangle - w.lagy) * smoothing(speed / tireLat.relax, dt)
+			local sx, sy = w.lagx, w.lagy
+
+			local px = pacejka(sx, tireLong, Bx, Dx)
+			local py = pacejka(sy, tireLat, By, Dy)
+			local e = math.sqrt((px / Dx) ^ 2 + (py / Dy) ^ 2)
+			if e > 1 then
+				px /= e
+				py /= e
+			end
+
+			if combinedBlend > 0 then
+				-- normalised combined slip: each direction runs on its pure curve at the
+				-- combined slip magnitude, shared by direction
+				local nx, ny = sx / w.kpx, sy / w.kpy
+				local s = math.sqrt(nx * nx + ny * ny)
+				if s > 1e-6 then
+					local cx = pacejka(s * w.kpx, tireLong, Bx, Dx) * (math.abs(nx) / s) * (sx >= 0 and 1 or -1)
+					local cy = pacejka(s * w.kpy, tireLat, By, Dy) * (math.abs(ny) / s) * (sy >= 0 and 1 or -1)
+					px = lerp(px, cx, combinedBlend)
+					py = lerp(py, cy, combinedBlend)
+					e = math.sqrt((px / Dx) ^ 2 + (py / Dy) ^ 2)
+					if e > 1 then
+						px /= e
+						py /= e
+					end
+				end
+			end
+			fx = px
+			fside = -py
+		end
+
+		w.slipRatio = slipratio
+		w.slipAngle = slipangle
+		local stiffref = stationary and 2.5 or refspeed
+		return fx, fside, Dx * (Bx * tireLong.C) / math.max(stiffref, 0.01)
+	end
+
+	-- wheel spin integration (semi-implicit: tire stiffness acts as damping)
+	local function wheelStep(w, dt, drive, brake, fx, stiffness)
+		local r = w.radius
+		local grounded = w.grounded
+		local reaction = grounded and fx * r or 0
+		local damping = 0
+		if grounded and stiffness > 0 then
+			damping = stiffness * r * r / STUD
+		end
+		local rolling = 0
+		if grounded and math.abs(w.omega) > 0.01 then
+			rolling = w.rollres * w.fz * r * (w.omega > 0 and 1 or -1)
+		end
+		local other = drive - reaction - rolling
+		local denom = w.inertia / dt + damping
+		if brake > 0.01 then
+			local hold = -(other + w.omega * denom)
+			if math.abs(hold) <= brake then
+				w.omega = 0
+				return
+			end
+			other += (hold >= 0 and 1 or -1) * brake
+		end
+		w.omega += other / denom
+	end
+
+	----------------------------------------------------------------------------------
+	-- Simulation step
+	----------------------------------------------------------------------------------
+
+	local driveTorque = { FL = 0, FR = 0, RL = 0, RR = 0 }
+	local brakeTorque = { FL = 0, FR = 0, RL = 0, RR = 0 }
+	local loadTarget = { FL = 0, FR = 0, RL = 0, RR = 0 }
+
+	local simulateFrame
+	local simMs = 0
+	local function simulate(dt)
+		local t0 = os.clock()
+		debug.profilebegin("CarHub.simulate")
+		simulateFrame(dt)
+		debug.profileend()
+		simMs += ((os.clock() - t0) * 1000 - simMs) * 0.05
+	end
+
+	function simulateFrame(dt)
+		if not (car:IsDescendantOf(workspace) and mass.Parent ~= nil and primary.Parent ~= nil) then
+			destroy()
+			return
+		end
+		if dt <= 0 then
+			return
+		end
+		dt = math.min(dt, 0.25)
+		combinedBlend = stats.tires and stats.tires.combinedSlip or 0
+
+		-- handbrake and pedals
+		handbrake = driving and not typing() and (UserInputService:IsKeyDown(Enum.KeyCode.Space) or pad.handbrake == true) or (not driving and handbrake)
+		hbsmooth += ((handbrake and 1 or 0) - hbsmooth) * smoothing(1 / 0.04, dt)
+		if driving then
+			updatepedalvalues(dt)
+		end
+
+		-- steering
+		local steertime = stats.steerResponseTimeInactive
+		local targetsteer = 0
+		local direct = false
+		if driving and not typing() then
+			if mousesteer then
+				local vw = math.max(workspace.CurrentCamera.ViewportSize.X, 1)
+				steerval.Value = math.clamp((UserInputService:GetMouseLocation().X / vw) * 2 - 1, -1, 1)
+				direct = true
+			elseif pad.active and math.abs(pad.steer) > 0.01 then
+				targetsteer = pad.steer
+				steertime = stats.steerResponseTimeActive * 2
+			else
+				local left = UserInputService:IsKeyDown(Enum.KeyCode.A)
+				local right = UserInputService:IsKeyDown(Enum.KeyCode.D)
+				if left ~= right then
+					targetsteer = left and -1 or 1
+					steertime = stats.steerResponseTimeActive
+				end
+			end
+		end
+		if not direct then
+			local cur = steerval.Value
+			if cur < targetsteer then
+				steerval.Value = math.min(cur + steertime * dt, targetsteer)
+			elseif cur > targetsteer then
+				steerval.Value = math.max(cur - steertime * dt, targetsteer)
+			end
+		end
+
+		local vel = mass.AssemblyLinearVelocity
+		kmh = vel.Magnitude * STUD * 3.6
+		if steerslide and slideBase then
+			local st = stats.steering or {}
+			local scale = math.max(1 / (1 + (kmh / (st.falloffKmh or 110)) ^ 2), st.minScale or 0.2)
+			local arm = car:GetAttribute("SteerArm")
+			local travel = arm and arm * math.sin(math.rad(stats.maxSteerDegrees or 36)) or 0.34
+			steerslide.Position = slideBase + Vector3.new(steerval.Value * scale * -travel, 0, 0)
+		end
+
+		-- aero
+		local mps = vel.Magnitude * STUD
+		if drag then
+			if vel.Magnitude > 0.01 then
+				local newtons = 0.5 * stats.aero.rho * stats.aero.Cd * stats.aero.area * mps * mps
+				drag.Force = -vel.Unit * Vector3.new(1, 0.5, 1) * (newtons * N_TO_FORCE)
+			else
+				drag.Force = Vector3.zero
+			end
+		end
+		local fwdmps = -mass.CFrame:VectorToObjectSpace(vel).Z * STUD
+		local q = 0.5 * stats.aero.rho * fwdmps * fwdmps * N_TO_FORCE
+		local down = -primary.CFrame.UpVector
+		if downF then
+			downF.Force = down * (q * (stats.aero.downforceFront or 0))
+		end
+		if downR then
+			downR.Force = down * (q * (stats.aero.downforceRear or 0))
+		end
+
+		-- keep the car at its design gravity even when the world gravity differs
+		local comp = workspace.Gravity - DRIVE_GRAVITY
+		if massGravity then
+			massGravity.Force = math.abs(comp) > 0.01 and Vector3.yAxis * (mass.AssemblyMass * comp) or Vector3.zero
+		end
+		for _, w in ipairs(wheelList) do
+			if w.gravityComp then
+				w.gravityComp.Force = math.abs(comp) > 0.01 and Vector3.yAxis * (w.bounds.AssemblyMass * comp) or Vector3.zero
+			end
+		end
+
+		-- gearbox automation
+		local thrpedal, brkpedal = pedal.thr, pedal.brk
+		local cltpedal = pedal.clt
+		local enginethr = thrpedal
+		-- automated boxes never leave the driver with a dead engine
+		if gearmode ~= "MANUAL" and engine.stalled and driving and thrpedal > 0.1 then
+			engine:restart()
+		end
+		if gearmode ~= "MANUAL" then
+			cltpedal, enginethr = autodrive(dt, thrpedal, brkpedal, drivenomega())
+			pedal.clt = cltpedal
+		end
+		cltval.Value = cltpedal
+
+		-- traction control trims throttle from the last frame's driven-wheel slip
+		local assists = stats.assists or {}
+		if assists.tcs then
+			local slip = 0
+			for _, w in ipairs(wheelList) do
+				if driven[w.name] and w.grounded then
+					slip = math.max(slip, w.slipRatio)
+				end
+			end
+			local target = math.clamp(1 - (slip - 0.12) * 5, 0.15, 1)
+			tcsScale += (target - tcsScale) * smoothing(target < tcsScale and 30 or 6, dt)
+			enginethr *= tcsScale
+		else
+			tcsScale = 1
+		end
+		lastEngineThr = enginethr
+
+		-- contact
+		for _, w in ipairs(wheelList) do
+			probe(w)
+		end
+
+		-- tire loads: static share plus longitudinal and lateral transfer
+		local accel = (vel - prevvel) / dt * STUD
+		prevvel = vel
+		local mcf = mass.CFrame
+		local flook = projectOnPlane(mcf.LookVector, Vector3.yAxis) or mcf.LookVector
+		local fright = flook:Cross(Vector3.yAxis)
+		local along = accel:Dot(flook)
+		local alat = accel:Dot(fright)
+		loadLong = along
+		loadLat = alat
+
+		local static = masskg * DRIVE_GRAVITY * STUD / 4
+		local tires = stats.tires or {}
+		local wf = stats.weightFront or 0.5
+		local wg = tires.weightGrip or 0
+		local staticF = static * lerp(1, 2 * wf, wg)
+		local staticR = static * lerp(1, 2 * (1 - wf), wg)
+		local h = stats.cgHeightMeters or 0.5
+		local wb = math.max(stats.wheelbaseMeters or 2.7, 0.5)
+		local longT = masskg * along * h / wb * 0.5
+		local latK = (tires.lateralTransfer or 0) * masskg * alat * h
+		local chi = tires.rollBalance or 0.5
+		local latF = latK * chi / math.max(stats.trackFrontMeters or 1.5, 0.3)
+		local latR = latK * (1 - chi) / math.max(stats.trackRearMeters or 1.5, 0.3)
+		loadTarget.FL = staticF - longT - latF
+		loadTarget.FR = staticF - longT + latF
+		loadTarget.RL = staticR + longT - latR
+		loadTarget.RR = staticR + longT + latR
+
+		for _, w in ipairs(wheelList) do
+			if w.grounded then
+				prepareTire(w, dt, loadTarget[w.name])
+			end
+			w.fx, w.fy, w.steps = 0, 0, 0
+		end
+
+		-- ABS: per-wheel brake modulation from the last frame's slip
+		local fbrake = brkpedal * stats.brakes.maxTorqueFront
+		local rbrake = brkpedal * stats.brakes.maxTorqueRear
+		local hb = hbsmooth * stats.brakes.handbrakeTorque
+		for _, w in ipairs(wheelList) do
+			if assists.abs and brkpedal > 0.05 and w.grounded and kmh > 8 then
+				local locking = w.slipRatio < -0.14
+				w.absScale = math.clamp(w.absScale + (locking and -10 or 6) * dt, 0.25, 1)
+			else
+				w.absScale = 1
+			end
+			local base = w.front and fbrake or rbrake
+			brakeTorque[w.name] = base * w.absScale + (w.front and 0 or hb)
+		end
+
+		-- drivetrain + wheels, sub-stepped
+		local steps = math.clamp(math.ceil(dt / SUBSTEP), 1, MAX_SUBSTEPS)
+		local subdt = dt / steps
+		local awd = stats.transmission.awd or {}
+		local layout = stats.transmission.type
+		local masswheel = masskg
+
+		for _ = 1, steps do
+			trans:update(subdt)
+			local totalratio = trans:totalratio()
+
+			local dshaftomega, drivencount = 0, 0
+			local inertiasum = 0
+			for _, w in ipairs(wheelList) do
+				if driven[w.name] then
+					dshaftomega += w.omega
+					drivencount += 1
+					inertiasum += w.inertia
+				end
+			end
+			if drivencount > 0 then
+				dshaftomega /= drivencount
+			end
+
+			local clutchtorque = 0
+			if totalratio ~= 0 then
+				local r = drivenradius()
+				local reflected = (masswheel * r * r + inertiasum) / (totalratio * totalratio)
+				clutchtorque = clutch:update(subdt, engine.omega, engine.inertia, dshaftomega * totalratio, reflected, cltpedal)
+			else
+				clutch:update(subdt, engine.omega, engine.inertia, engine.omega, 0, cltpedal)
+			end
+
+			engine:update(subdt, enginethr, clutchtorque)
+			local dshafttorque = trans:outtorque(clutchtorque)
+
+			local fronttorque, reartorque = 0, 0
+			if layout == "AWD" then
+				local fl, fr, rl, rr = wheels.FL, wheels.FR, wheels.RL, wheels.RR
+				local frontShare = awd.frontBias or 0.5
+				if centerdiff and fl and fr and rl and rr then
+					fronttorque, reartorque = centerdiff:split(
+						subdt, dshafttorque,
+						(fl.omega + fr.omega) * 0.5, (rl.omega + rr.omega) * 0.5,
+						fl.inertia + fr.inertia, rl.inertia + rr.inertia,
+						frontShare
+					)
+				else
+					fronttorque, reartorque = dshafttorque * frontShare, dshafttorque * (1 - frontShare)
+				end
+			elseif layout == "FWD" then
+				fronttorque = dshafttorque
+			else
+				reartorque = dshafttorque
+			end
+
+			local fl, fr, rl, rr = wheels.FL, wheels.FR, wheels.RL, wheels.RR
+			driveTorque.FL, driveTorque.FR, driveTorque.RL, driveTorque.RR = 0, 0, 0, 0
+			if (driven.FL or driven.FR) and fl and fr then
+				driveTorque.FL, driveTorque.FR = axlediff:split(subdt, fronttorque, fl.omega, fr.omega, fl.inertia, fr.inertia)
+			end
+			if (driven.RL or driven.RR) and rl and rr then
+				driveTorque.RL, driveTorque.RR = axlediff:split(subdt, reartorque, rl.omega, rr.omega, rl.inertia, rr.inertia)
+			end
+
+			for _, w in ipairs(wheelList) do
+				local fx, fside, stiff = 0, 0, 0
+				if w.grounded then
+					fx, fside, stiff = tireStep(w, w.omega * w.radius / STUD, subdt)
+					w.fx += fx
+					w.fy += fside
+					w.steps += 1
+				end
+				wheelStep(w, subdt, driveTorque[w.name], brakeTorque[w.name], fx, stiff)
+			end
+
+			lastclutch, lastdshaft, lastdomega = clutchtorque, dshafttorque, dshaftomega
+		end
+
+		-- apply the time-averaged tire force for this frame
+		for _, w in ipairs(wheelList) do
+			if w.grounded and w.steps > 0 then
+				local fx, fy = w.fx / w.steps, w.fy / w.steps
+				w.force = (w.fwd * fx + w.right * fy) * N_TO_FORCE
+				if w.frictionForce then
+					w.frictionForce.Force = w.force
+				end
+				local nslip = math.abs(w.slipAngle) / tireLat.maxslip
+				w.totalSlip = math.sqrt(w.slipRatio * w.slipRatio + nslip * nslip)
+			else
+				w.force = Vector3.zero
+				if w.frictionForce then
+					w.frictionForce.Force = Vector3.zero
+				end
+				w.totalSlip = 0
+				w.lagx *= 0.9
+				w.lagy *= 0.9
+			end
+			if w.smoke then
+				local slipping = w.totalSlip > 0.6 and (w.totalSlip >= 0.7 or w.bounds.AssemblyLinearVelocity.Magnitude > 2)
+				w.smoke.Rate = slipping and 50 * math.min(w.totalSlip, 2) or 0
+			end
+		end
+	end
+
+	----------------------------------------------------------------------------------
+	-- Presentation (every rendered frame)
+	----------------------------------------------------------------------------------
+
+	local attrCache = {}
+	local function setAttr(name, value)
+		if attrCache[name] ~= value then
+			attrCache[name] = value
+			car:SetAttribute(name, value)
+		end
+	end
+
+	local function updateDebug()
+		if tiredebug then
+			if not dbgfolder then
+				dbgfolder = Instance.new("Folder")
+				dbgfolder.Name = "TireDebug"
+			end
+			dbgfolder.Parent = cam
+			for _, w in ipairs(wheelList) do
+				local tire = w.bounds
+				local d = dbgparts[w.name]
+				tire.Transparency = 0.6
+				if not d then
+					d = {}
+					local hl = Instance.new("Highlight")
+					hl.Adornee = tire
+					hl.FillTransparency = 0.65
+					hl.OutlineTransparency = 0
+					hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+					hl.Parent = dbgfolder
+					d.hl = hl
+					for key, class in pairs({
+						contact = "SphereHandleAdornment",
+						comp = "CylinderHandleAdornment",
+						facebody = "CylinderHandleAdornment",
+						facehead = "ConeHandleAdornment",
+						forcebody = "CylinderHandleAdornment",
+						forcehead = "ConeHandleAdornment",
+					}) do
+						local a = Instance.new(class)
+						a.Adornee = workspace.Terrain
+						a.AlwaysOnTop = true
+						a.ZIndex = 5
+						a.Visible = false
+						a.Parent = dbgfolder
+						d[key] = a
+					end
+					d.contact.Radius = 0.12
+					d.contact.Color3 = Color3.new(1, 1, 1)
+					d.facebody.Radius = 0.05
+					d.facebody.Color3 = Color3.fromRGB(60, 140, 255)
+					d.facehead.Radius = 0.22
+					d.facehead.Height = -0.6
+					d.facehead.Color3 = Color3.fromRGB(60, 140, 255)
+					d.forcebody.Radius = 0.06
+					d.forcehead.Radius = 0.25
+					d.forcehead.Height = -0.6
+					dbgparts[w.name] = d
+				end
+
+				local slip = math.clamp(w.totalSlip, 0, 1)
+				if w.grounded then
+					local cpos = w.cpos
+					local tcf = tire.CFrame
+					local up = tcf.UpVector
+					local start = tcf.Position - up * w.rayStart
+					if w.startAtt then
+						w.startAtt.WorldPosition = start
+					end
+					if w.endAtt then
+						w.endAtt.WorldPosition = start - up * w.rayLength
+					end
+					local compression = math.clamp(w.compression / w.rayLength, 0, 1)
+					d.hl.FillColor = Color3.fromRGB(0, 255, 120):Lerp(Color3.fromRGB(255, 60, 60), slip)
+					d.hl.OutlineColor = d.hl.FillColor
+					d.contact.Visible = true
+					d.contact.CFrame = CFrame.new(cpos)
+					local sidev = tcf.RightVector * 0.5
+					local ca, cb = start + sidev, cpos + sidev
+					local clen = math.max((cb - ca).Magnitude, 0.01)
+					d.comp.Visible = true
+					d.comp.Height = clen
+					d.comp.Radius = 0.04 + 0.12 * compression
+					d.comp.Color3 = Color3.fromRGB(0, 255, 120):Lerp(Color3.fromRGB(255, 40, 40), compression)
+					d.comp.CFrame = CFrame.lookAt(ca, cb) * CFrame.new(0, 0, -clen / 2)
+					local flat = w.fwd
+					local ftail = cpos + Vector3.yAxis * 0.15
+					local fhead = ftail + flat * 3
+					d.facebody.Visible = true
+					d.facebody.Height = 3
+					d.facebody.CFrame = CFrame.lookAt(ftail, fhead) * CFrame.new(0, 0, -1.5)
+					d.facehead.Visible = true
+					d.facehead.CFrame = CFrame.lookAt(fhead, fhead + flat) * CFrame.Angles(0, math.pi, 0)
+					local gforce = w.force
+					if gforce.Magnitude > 1 then
+						local gdir = gforce.Unit
+						local gcolor = Color3.fromRGB(255, 230, 0):Lerp(Color3.fromRGB(255, 40, 40), slip)
+						local gtail = cpos + Vector3.yAxis * 0.3
+						local ghead = gtail + gdir * 3.5
+						d.forcebody.Visible = true
+						d.forcebody.Height = 3.5
+						d.forcebody.Color3 = gcolor
+						d.forcebody.CFrame = CFrame.lookAt(gtail, ghead) * CFrame.new(0, 0, -1.75)
+						d.forcehead.Visible = true
+						d.forcehead.Color3 = gcolor
+						d.forcehead.CFrame = CFrame.lookAt(ghead, ghead + gdir) * CFrame.Angles(0, math.pi, 0)
+					else
+						d.forcebody.Visible = false
+						d.forcehead.Visible = false
+					end
+				else
+					d.hl.FillColor = Color3.fromRGB(150, 150, 150)
+					d.hl.OutlineColor = d.hl.FillColor
+					for _, key in ipairs({ "contact", "comp", "facebody", "facehead", "forcebody", "forcehead" }) do
+						d[key].Visible = false
+					end
+				end
+			end
+		elseif dbgfolder then
+			dbgfolder.Parent = nil
+			for _, w in ipairs(wheelList) do
+				w.bounds.Transparency = 1
+			end
+		end
+	end
+
+	local function updateAudio(dt)
+		for _, c in pairs(chans) do
+			c.v = 0
+		end
+
+		local now = os.clock()
+		local rpm = engine.omega * TO_RPM
+		local running = driving and not engine.stalled
+		local wheelrpm = math.abs(drivenomega()) * TO_RPM
+		local speed = kmh / 3.6
+		local powered = trans.gear ~= 0 and not trans.shifting
+		local thrpedal, brkpedal, cltpedal = pedal.thr, pedal.brk, pedal.clt
+		local enginethr = lastEngineThr
+
+		local inside = car:GetAttribute("CamInterior") == true or (cam.CFrame.Position - primary.Position).Magnitude < 6
+		sv.interior += ((inside and 1 or 0) - sv.interior) * smoothing(6, dt)
+		local ib = sv.interior
+		local exl = 1 - (mix.exteriorLowpassHz or 20000) / 20000
+		local inl = 1 - (mix.interiorLowpassHz or 2800) / 20000
+		eq.HighGain = math.clamp(-24 * (exl * (1 - ib) + inl * ib), -80, 10)
+		eq.MidGain = -4 * ib
+		eq.LowGain = 3 * ib
+		sg.Volume = 1 + ((mix.interiorVolumeMult or 0.7) - 1) * ib
+
+		if driving and not sv.wasdriving then
+			sv.enteredat = now
+			sv.runat = now + 0.9
+			oneshot(cf.door.open, 0.6)
+			task.delay(0.35, oneshot, cf.door.close, 0.7)
+			task.delay(0.55, oneshot, cf.seatbelt.id, 0.5)
+			task.delay(0.65, oneshot, cf.ignition.id, 0.7)
+			task.delay(0.75, oneshot, cf.start.id, cf.start.volume or 1)
+			local ok, rv = pcall(function()
+				return mix.reverbType and Enum.ReverbType[mix.reverbType]
+			end)
+			if ok and rv and not sv.reverbset then
+				sv.prevreverb = SoundService.AmbientReverb
+				SoundService.AmbientReverb = rv
+				sv.reverbset = true
+			end
+		end
+		if not driving and sv.wasdriving then
+			oneshot(cf.door.open, 0.6)
+			task.delay(0.5, oneshot, cf.door.close, 0.7)
+			car:SetAttribute("Indicator", 0)
+			if sv.reverbset and sv.prevreverb then
+				SoundService.AmbientReverb = sv.prevreverb
+				sv.reverbset = false
+			end
+		end
+		sv.wasdriving = driving
+
+		if running and not sv.wasrunning and now - sv.enteredat > 0.2 then
+			oneshot(cf.start.id, cf.start.volume or 1)
+			sv.runat = now + 0.5
+		end
+		if not running and sv.wasrunning then
+			oneshot(cf.stop.id, cf.stop.volume or 1)
+		end
+		sv.wasrunning = running
+
+		local mtarget = (running and now >= sv.runat) and 1 or 0
+		sv.master += (mtarget - sv.master) * smoothing(mtarget == 1 and 8 or 14, dt)
+		local master = sv.master
+
+		local loadtarget = math.clamp(math.max(enginethr * 1.5, lastclutch / 150), 0, 1)
+		sv.load += (loadtarget - sv.load) * (1 - math.exp(-dt / math.max(snd.engine.loadCrossfadeTime or 0.12, 0.01)))
+		local ld = sv.load
+		sv.power += ((thrpedal > 0.05 and 1 or 0) - sv.power) * smoothing(8, dt)
+
+		local pmin = snd.engine.pitchMin or 0.6
+		local pmax = snd.engine.pitchMax or 2.2
+		local idlefade = chans.idle and math.clamp(1 - (rpm - engine.idlerpm) / 700, 0, 1) or 0
+
+		for _, set in ipairs({ "on", "off" }) do
+			for i, l in ipairs(snd.engine[set]) do
+				local c = chans[set .. i]
+				if c then
+					local fin = 1
+					if (l.fadeInEnd or 0) > (l.fadeInStart or 0) then
+						fin = math.sin(math.clamp((rpm - l.fadeInStart) / (l.fadeInEnd - l.fadeInStart), 0, 1) * math.pi / 2)
+					end
+					local fout = 1
+					if (l.fadeOutEnd or 99999) > (l.fadeOutStart or 99999) then
+						fout = math.cos(math.clamp((rpm - l.fadeOutStart) / (l.fadeOutEnd - l.fadeOutStart), 0, 1) * math.pi / 2)
+					end
+					c.v = l.volume * fin * fout * (set == "on" and ld or (1 - ld)) * master * math.sqrt(1 - idlefade) * (1 - ib * 0.15)
+					c.p = math.clamp(rpm / l.refRPM, pmin, pmax)
+				end
+			end
+		end
+
+		if chans.idle then
+			chans.idle.v = (cf.idle.volume or 1) * master * math.sqrt(idlefade)
+			chans.idle.p = math.clamp(rpm / engine.idlerpm, cf.idle.pitchMin or 0.95, cf.idle.pitchMax or 1.05)
+		end
+		if chans.limiter then
+			chans.limiter.v = (engine.limiting and thrpedal > 0.5) and (cf.limiter.volume or 0.9) * master or 0
+			chans.limiter.p = cf.limiter.pitchFollowsRPM and math.clamp(rpm / 6000, 0.7, 1.3) or 1
+		end
+
+		local thr = math.clamp(enginethr, 0, 1)
+		local function byThrottle(vb)
+			vb = vb or { [0] = 1, [0.5] = 1, [1] = 1 }
+			if thr < 0.5 then
+				return vb[0] + (vb[0.5] - vb[0]) * (thr / 0.5)
+			end
+			return vb[0.5] + (vb[1] - vb[0.5]) * ((thr - 0.5) / 0.5)
+		end
+		if chans.intake then
+			chans.intake.v = (cf.intake.volume or 0.5) * byThrottle(cf.intake.volumeByThrottle) * master * math.clamp(rpm / 1500, 0.2, 1) * (1 + ib * 0.5)
+			chans.intake.p = math.clamp(rpm / (cf.intake.refRPM or 4000), pmin, pmax)
+		end
+		if chans.exhaust then
+			chans.exhaust.v = (cf.exhaust.volume or 0.8) * byThrottle(cf.exhaust.volumeByThrottle) * master * (1 - ib * 0.4)
+			chans.exhaust.p = math.clamp(rpm / (cf.exhaust.refRPM or 3500), pmin, pmax)
+		end
+
+		if thrpedal > 0.5 then
+			sv.popsarmed = true
+			sv.bovarmed = true
+		end
+		if sv.popsarmed and thrpedal < (cf.pops.throttleLiftBelow or 0.05) then
+			sv.popsarmed = false
+			local ids = cf.pops.ids or {}
+			if running and rpm > (cf.pops.minRPM or 3500) and #ids > 0 and math.random() < (cf.pops.chance or 0.35) then
+				for i = 1, math.random(1, 4) do
+					local pv = cf.pops.pitchVariation or 0.15
+					task.delay(
+						(i - 1) * math.random(6, 16) / 100 + math.random() * 0.05,
+						oneshot,
+						ids[math.random(#ids)],
+						(cf.pops.volume or 0.7) * (0.6 + math.random() * 0.4),
+						1 + (math.random() * 2 - 1) * pv
+					)
+				end
+			end
+		end
+
+		local boosttarget = math.clamp((rpm - 2000) / 2500, 0, 1) * math.clamp(thrpedal, 0, 1) * (running and 1 or 0)
+		local spoolup = cf.spool.spoolUpTime or 0.6
+		local spooldown = cf.spool.spoolDownTime or 1.2
+		sv.boost += (boosttarget - sv.boost) * (1 - math.exp(-dt / (boosttarget > sv.boost and spoolup or spooldown)))
+		setAttr("Boost", math.floor(sv.boost * 100 + 0.5) / 100)
+		if chans.turbospool then
+			local tf = sv.boost * math.clamp(rpm / engine.redline, 0.3, 1)
+			chans.turbospool.v = ((cf.spool.volumeMin or 0) + ((cf.spool.volumeMax or 0.5) - (cf.spool.volumeMin or 0)) * sv.boost) * master * (1 + ib * 0.6)
+			chans.turbospool.p = (cf.spool.pitchMin or 0.7) + ((cf.spool.pitchMax or 2.4) - (cf.spool.pitchMin or 0.7)) * tf
+		end
+
+		sv.bovcool = math.max(sv.bovcool - dt, 0)
+		if sv.bovarmed and thrpedal < (cf.blowoff.throttleLiftBelow or 0.1) then
+			sv.bovarmed = false
+			if running and sv.boost >= (cf.blowoff.minBoost or 0.4) and sv.bovcool <= 0 then
+				local fl = cf.flutter.ids or {}
+				if #fl > 0 and math.random() < (cf.flutter.chance or 0.5) then
+					oneshot(fl[math.random(#fl)], (cf.flutter.volume or 0.7) * sv.boost, 0.95 + math.random() * 0.1)
+				else
+					oneshot(cf.blowoff.id, (cf.blowoff.volume or 0.8) * sv.boost, 0.95 + math.random() * 0.1)
+				end
+				sv.boost *= 0.4
+				sv.bovcool = cf.blowoff.cooldown or 0.5
+			end
+		end
+
+		if chans.gearwhine then
+			local gw = cf.whine
+			local g = trans.gear
+			local pm, vm = 1, 1
+			if g < 0 then
+				pm = gw.reverse and gw.reverse.pitchMult or 1
+				vm = gw.reverse and gw.reverse.volumeMult or 1
+			elseif g > 0 then
+				pm = gw.perGearPitchMult and gw.perGearPitchMult[g] or 1
+				vm = gw.perGearVolumeMult and gw.perGearVolumeMult[g] or 1
+			end
+			local wv = ((gw.volumeOnCoast or 0.2) + ((gw.volumeOnPower or 0.35) - (gw.volumeOnCoast or 0.2)) * sv.power) * vm
+			chans.gearwhine.v = wv * math.clamp(wheelrpm / 150, 0, 1) * (powered and 1 or 0) * (1 - cltpedal) * (1 + ib * 0.5)
+			chans.gearwhine.p = math.clamp(wheelrpm / (gw.refWheelRPM or 800) * pm, gw.pitchMin or 0.5, gw.pitchMax or 3)
+		end
+		if chans.diffwhine then
+			local dw = cf.diffwhine
+			chans.diffwhine.v = (dw.volume or 0.2) * math.clamp(wheelrpm / 250, 0, 1) * (0.5 + 0.5 * sv.power) * (1 + ib * 0.3)
+			chans.diffwhine.p = math.clamp(wheelrpm / (dw.refWheelRPM or 800), dw.pitchMin or 0.5, dw.pitchMax or 2.5)
+		end
+		if chans.driveshaft then
+			local dsrpm = wheelrpm * math.abs(trans:totalratio())
+			chans.driveshaft.v = (cf.driveshaft.volume or 0.15) * math.clamp(dsrpm / 1500, 0, 1) * (0.4 + 0.6 * sv.power) * (powered and 1 or 0)
+			chans.driveshaft.p = math.clamp(dsrpm / 3000, 0.5, 2)
+		end
+
+		if trans.gear ~= sv.lastgear then
+			local cl = cf.clunk.ids or {}
+			if driving and trans.gear ~= 0 and #cl > 0 then
+				oneshot(cl[math.random(#cl)], cf.clunk.volume or 0.6, 0.95 + math.random() * 0.1)
+			end
+			sv.lastgear = trans.gear
+		end
+		if cltpedal < 0.4 and sv.lastclutch >= 0.4 and driving and trans.gear ~= 0 then
+			oneshot(cf.clutchengage.id, cf.clutchengage.volume or 0.4, 0.95 + math.random() * 0.1)
+		end
+		sv.lastclutch = cltpedal
+
+		local maxslip, grounded, mat = 0, 0, nil
+		for _, w in ipairs(wheelList) do
+			if w.grounded then
+				grounded += 1
+				maxslip = math.max(maxslip, w.totalSlip)
+				mat = mat or w.mat
+			end
+		end
+		local surface = mat and SURFACES[mat] or "asphalt"
+
+		if chans.squeal then
+			local sq = cf.squeal
+			local f = math.clamp((maxslip - (sq.slipStart or 0.4)) / ((sq.slipFull or 0.9) - (sq.slipStart or 0.4)), 0, 1)
+			chans.squeal.v = f * (sq.volume or 0.8) * (surface == "asphalt" and 1 or 0.15)
+			chans.squeal.p = (sq.pitchMin or 0.9) + ((sq.pitchMax or 1.3) - (sq.pitchMin or 0.9)) * math.clamp(speed / 40, 0, 1)
+		end
+		if chans.skid then
+			local f = math.clamp((maxslip - (cf.skid.slipStart or 0.5)) / 0.5, 0, 1)
+			chans.skid.v = f * (cf.skid.volume or 0.7) * (surface == "asphalt" and 1 or 0.5)
+			chans.skid.p = 0.85 + 0.3 * math.clamp(speed / 40, 0, 1)
+		end
+		for key, rc in pairs(cf.roll) do
+			local c = chans["road" .. key]
+			if c then
+				c.v = (key == surface and grounded > 0) and (rc.volume or 0.3) * math.clamp(speed / 6, 0, 1) * (grounded / 4) or 0
+				c.p = math.clamp(speed / (rc.refSpeed or 25), rc.pitchMin or 0.6, rc.pitchMax or 1.6)
+			end
+		end
+		if chans.kickup then
+			local loose = surface ~= "asphalt" and grounded > 0
+			local f = math.clamp((speed - (cf.kickup.minSpeed or 8)) / 12, 0, 1)
+			chans.kickup.v = loose and (cf.kickup.volume or 0.3) * f * (0.4 + 0.6 * math.clamp(maxslip, 0, 1)) or 0
+			chans.kickup.p = math.clamp(0.8 + speed / 60, 0.8, 1.4)
+		end
+		if chans.bsqueal then
+			local bs = cf.bsqueal
+			local f = math.clamp((brkpedal - (bs.minBrake or 0.5)) / (1 - (bs.minBrake or 0.5)), 0, 1)
+				* math.clamp((speed - (bs.minSpeed or 3)) / 2, 0, 1)
+				* math.clamp(((bs.maxSpeed or 15) - speed) / 4, 0, 1)
+			chans.bsqueal.v = f * (bs.volume or 0.35)
+			chans.bsqueal.p = 0.9 + 0.4 * math.clamp(1 - speed / (bs.maxSpeed or 15), 0, 1)
+		end
+		if handbrake and not sv.hb then
+			oneshot(cf.handbrake.id, cf.handbrake.volume or 0.6)
+		end
+		sv.hb = handbrake
+		if chans.abs then
+			local active = false
+			for _, w in ipairs(wheelList) do
+				if w.absScale < 0.95 then
+					active = true
+				end
+			end
+			chans.abs.v = (active or (brkpedal > 0.8 and speed > 5 and maxslip > 0.35)) and (cf.abs.volume or 0.5) * math.clamp(speed / 15, 0, 1) or 0
+			chans.abs.p = 1
+		end
+		if chans.wind then
+			local wd = cf.wind
+			local f = math.clamp(speed / (wd.refSpeed or 45), 0, 1.5)
+			chans.wind.v = ((wd.volumeMin or 0) + ((wd.volumeMax or 0.7) - (wd.volumeMin or 0)) * math.min(f * f, 1)) * (1 + ib * 0.4)
+			chans.wind.p = math.clamp(speed / (wd.refSpeed or 45), wd.pitchMin or 0.6, wd.pitchMax or 1.8)
+		end
+		if chans.rattle then
+			local rr = cf.rattle.refRPM or 2500
+			chans.rattle.v = (cf.rattle.volume or 0.1) * math.exp(-((rpm - rr) / 500) ^ 2) * master * (1 + ib)
+			chans.rattle.p = 1
+		end
+
+		sv.bottomcool = math.max(sv.bottomcool - dt, 0)
+		local bumps = cf.bump.ids or {}
+		for _, w in ipairs(wheelList) do
+			local n = w.name
+			if not w.grounded then
+				sv.comp[n] = nil
+			else
+				local comp = w.compression
+				local prev = sv.comp[n] or comp
+				sv.comp[n] = comp
+				sv.wheelcool[n] = math.max((sv.wheelcool[n] or 0) - dt, 0)
+				if driving and now - sv.enteredat > 1.5 then
+					local cspeed = (comp - prev) / math.max(dt, 1 / 240) * STUD
+					if cspeed > (cf.bump.minCompressionSpeed or 0.6) and sv.wheelcool[n] <= 0 and #bumps > 0 then
+						oneshot(bumps[math.random(#bumps)], (cf.bump.volume or 0.5) * math.clamp(cspeed / 3, 0.3, 1), 0.9 + math.random() * 0.2)
+						sv.wheelcool[n] = 0.2
+					end
+					if comp / w.rayLength > 0.95 and sv.bottomcool <= 0 then
+						oneshot(cf.bottom.id, cf.bottom.volume or 0.9, 0.95 + math.random() * 0.1)
+						sv.bottomcool = 0.5
+					end
+				end
+			end
+		end
+
+		sv.impactcool = math.max(sv.impactcool - dt, 0)
+		local vel = mass.AssemblyLinearVelocity
+		local accel = (vel - sv.prevvel).Magnitude * STUD / math.max(dt, 1 / 120)
+		sv.prevvel = vel
+		if driving and sv.impactcool <= 0 and now - sv.enteredat > 1.5 then
+			local tier = (accel > 700 and "heavy") or (accel > 300 and "medium") or (accel > 120 and "light") or nil
+			if tier then
+				oneshot(cf.impacts[tier], 0.5 + math.min(accel / 1400, 0.5), 0.9 + math.random() * 0.2)
+				sv.impactcool = 0.3
+			end
+		end
+
+		local ind = car:GetAttribute("Indicator") or 0
+		if ind ~= 0 and driving then
+			sv.indtimer += dt
+			if sv.indtimer >= 0.4 then
+				sv.indtimer -= 0.4
+				sv.indstate = not sv.indstate
+				oneshot(sv.indstate and cf.indicator.on or cf.indicator.off, 0.4)
+			end
+		else
+			sv.indtimer = 0
+			sv.indstate = false
+		end
+
+		for _, c in pairs(chans) do
+			local s = c.s
+			s.Volume += (c.v - s.Volume) * smoothing(c.vk, dt)
+			s.PlaybackSpeed += (c.p - s.PlaybackSpeed) * smoothing(c.pk, dt)
+			if c.v < 0.003 and s.Volume < 0.003 then
+				if s.Playing then
+					s:Pause()
+				end
+			elseif not s.Playing then
+				s:Play()
+			end
+		end
+	end
+
+	local function present(dt)
+		if not alive then
+			return
+		end
+		if char then
+			char:PivotTo(primary.CFrame)
+		end
+
+		for _, w in ipairs(wheelList) do
+			w.roll = (w.roll + math.deg(w.omega) * dt) % 360
+			if w.spinAtt then
+				w.spinAtt.CFrame = CFrame.fromOrientation(math.rad(-w.roll), 0, 0)
+			end
+			if w.rollValue then
+				w.rollValue.Value = w.roll
+			end
+			local attr = SPEED_ATTR[w.name]
+			if attr then
+				setAttr(attr, math.floor(w.omega * w.radius / STUD * 10 + 0.5) / 10)
+			end
+			setAttr(w.name .. "totalSlip", math.floor(w.totalSlip * 100 + 0.5) / 100)
+		end
+
+		Tacho:Update({
+			RPM = engine.omega * TO_RPM,
+			MaxRPM = stats.engine.revLimiter and stats.engine.revLimiter.rpm or engine.redline,
+			RedlineRPM = stats.engine.redlineRPM,
+			Throttle = 1 - pedal.clt,
+			Brake = pedal.brk,
+			KMH = kmh,
+			Gear = trans.gear,
+			Velocity = primary.AssemblyLinearVelocity,
+		})
+
+		updateDebug()
+
+		setAttr("RPM", math.floor(engine.omega * TO_RPM + 0.5))
+		setAttr("EngineStalled", engine.stalled)
+		setAttr("Gear", trans.gear)
+		setAttr("Handbrake", handbrake)
+
+		debug.profilebegin("CarHub.audio")
+		updateAudio(dt)
+		debug.profileend()
+
+		if stats.debug and stats.debug.enabled then
+			car:SetAttribute("Debug_ClutchSlipRadPerSec", clutch.slip)
+			car:SetAttribute("Debug_ClutchTorque", lastclutch)
+			car:SetAttribute("Debug_DriveshaftTorque", lastdshaft)
+			car:SetAttribute("Debug_DriveshaftOmega", lastdomega)
+			car:SetAttribute("Debug_EngineNetTorque", engine.lastnet)
+			car:SetAttribute("Debug_EngineCombustionTorque", engine.lastcomb)
+			car:SetAttribute("Debug_LoadLongAccel", loadLong)
+			car:SetAttribute("Debug_LoadLatAccel", loadLat)
+		end
+	end
+
+	----------------------------------------------------------------------------------
+	-- Input
+	----------------------------------------------------------------------------------
+
+	local function cycleUi()
+		uivisible = uivisible % 3 + 1
+		Tacho:Visibility(uivisible <= 2)
+		local tacho = player.PlayerGui:FindFirstChild("TachoUI")
+		local controls = tacho and tacho:FindFirstChild("ControlsFrame")
+		if controls then
+			controls.Visible = uivisible == 1
+		end
+	end
+
+	table.insert(conns, UserInputService.InputBegan:Connect(function(input, processed)
+		if processed or not driving then
+			return
+		end
+		local key = input.KeyCode
+		if key == Enum.KeyCode.LeftShift then
+			if gearmode == "MANUAL" then
+				pedal.cltT = 1
+			end
+		elseif key == Enum.KeyCode.V then
+			local idx = table.find(gearmodes, gearmode) or 1
+			setgearmode(gearmodes[idx % #gearmodes + 1])
+		elseif key == Enum.KeyCode.E or key == Enum.KeyCode.ButtonR1 then
+			if os.clock() - enteredat > 0.25 then
+				shift(1)
+			end
+		elseif key == Enum.KeyCode.Q or key == Enum.KeyCode.ButtonL1 then
+			shift(-1)
+		elseif key == Enum.KeyCode.M then
+			mousesteer = not mousesteer
+		elseif key == Enum.KeyCode.R then
+			if engine.stalled and (gearmode ~= "MANUAL" or trans.gear == 0 or pedal.clt >= 0.9) then
+				engine:restart()
+			end
+		elseif key == Enum.KeyCode.F or key == Enum.KeyCode.ButtonY then
+			leavecar()
+		elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+			camState.rmb = true
+			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+		elseif key == Enum.KeyCode.B then
+			tiredebug = not tiredebug
+		elseif key == Enum.KeyCode.C then
+			cycleUi()
+		elseif key == Enum.KeyCode.X or key == Enum.KeyCode.DPadUp then
+			camMode = camMode % 3 + 1
+			camState.pos = nil
+			camState.focus = nil
+		elseif key == Enum.KeyCode.ButtonB then
+			pad.handbrake = true
+		end
+	end))
+
+	table.insert(conns, UserInputService.InputEnded:Connect(function(input)
+		if not driving then
+			return
+		end
+		local key = input.KeyCode
+		if key == Enum.KeyCode.LeftShift then
+			if gearmode == "MANUAL" then
+				pedal.cltT = 0
+			end
+		elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+			camState.rmb = false
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		elseif key == Enum.KeyCode.ButtonB then
+			pad.handbrake = false
+		elseif key == Enum.KeyCode.ButtonR2 then
+			pad.thr = 0
+		elseif key == Enum.KeyCode.ButtonL2 then
+			pad.brk = 0
+		elseif key == Enum.KeyCode.Thumbstick1 then
+			pad.steer = 0
+		end
+	end))
+
+	table.insert(conns, UserInputService.InputChanged:Connect(function(input)
+		if not driving then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseMovement and camState.rmb then
+			camState.alpha -= input.Delta.X * 0.0085
+			camState.beta = math.clamp(camState.beta - input.Delta.Y * 0.0085, -1.1, 1.3)
+		elseif input.UserInputType == Enum.UserInputType.MouseWheel then
+			camState.zoom = math.clamp(camState.zoom - input.Position.Z * 3, -14, 25)
+		elseif input.UserInputType == Enum.UserInputType.Gamepad1 then
+			if input.KeyCode == Enum.KeyCode.Thumbstick1 then
+				local x = input.Position.X
+				pad.steer = math.abs(x) > 0.12 and math.sign(x) * (math.abs(x) - 0.12) / 0.88 or 0
+				pad.active = true
+			elseif input.KeyCode == Enum.KeyCode.ButtonR2 then
+				pad.thr = input.Position.Z
+				pad.active = true
+			elseif input.KeyCode == Enum.KeyCode.ButtonL2 then
+				pad.brk = input.Position.Z
+				pad.active = true
+			end
+		end
+	end))
+
+	table.insert(conns, prompt.Triggered:Connect(entercar))
+	table.insert(conns, player.CharacterRemoving:Connect(function()
+		if driving then
+			leavecar()
+		end
+	end))
+	table.insert(conns, car.AncestryChanged:Connect(function()
+		if not car:IsDescendantOf(workspace) then
+			destroy()
+		end
+	end))
+	table.insert(conns, car.Destroying:Connect(destroy))
+
+	----------------------------------------------------------------------------------
+	-- Public surface
+	----------------------------------------------------------------------------------
+
+	local function signature(value)
+		if type(value) ~= "table" then
+			return tostring(value)
+		end
+		local keys = {}
+		for key in pairs(value) do
+			table.insert(keys, key)
+		end
+		table.sort(keys, function(a, b)
+			return tostring(a) < tostring(b)
+		end)
+		local parts = {}
+		for _, key in ipairs(keys) do
+			table.insert(parts, tostring(key) .. "=" .. signature(value[key]))
+		end
+		return "{" .. table.concat(parts, ",") .. "}"
+	end
+	local audioKey = signature(stats.sounds)
+	local previousGearbox = tostring(stats.transmission.gearbox or "MANUAL"):upper()
+
+	function ctl.retune(newStats)
+		local previousMode = stats.camera and stats.camera.mode
+		applyStats(newStats)
+		if newStats.camera and newStats.camera.mode ~= previousMode then
+			camMode = newStats.camera.mode
+			camState.pos = nil
+		end
+		-- only follow the tuned gearbox when the tune itself changed it, so a V-key
+		-- choice made while driving is not undone by unrelated edits
+		local mode = tostring(newStats.transmission.gearbox or gearmode):upper()
+		if mode ~= previousGearbox and table.find(gearmodes, mode) then
+			setgearmode(mode)
+		end
+		previousGearbox = mode
+		local key = signature(newStats.sounds)
+		if key ~= audioKey then
+			audioKey = key
+			buildAudio()
+		end
+	end
+
+	function ctl.telemetry()
+		local slip = {}
+		local load = {}
+		local spin = {}
+		for _, w in ipairs(wheelList) do
+			slip[w.name] = w.totalSlip
+			load[w.name] = w.grounded and w.fz or 0
+			spin[w.name] = { omega = w.omega, slip = w.totalSlip }
+		end
+		return {
+			driving = driving,
+			rpm = engine.omega * TO_RPM,
+			redline = engine.redline,
+			kmh = kmh,
+			gear = trans.gear,
+			shifting = trans.shifting,
+			throttle = pedal.thr,
+			brake = pedal.brk,
+			clutch = pedal.clt,
+			steer = steerval.Value,
+			handbrake = handbrake,
+			stalled = engine.stalled,
+			gearbox = gearmode,
+			slip = slip,
+			load = load,
+			wheels = spin,
+			longG = loadLong / 9.81,
+			latG = loadLat / 9.81,
+			tcs = tcsScale < 0.98,
+			simMs = simMs,
+		}
+	end
+
+	ctl.leave = leavecar
+	ctl.enter = entercar
+	ctl.destroy = destroy
+	function ctl.isDriving()
+		return driving
+	end
+
+	task.delay(0.5, function()
+		if not alive then
+			return
+		end
+		mass.Anchored = false
+		primary.Anchored = false
+		releasecontrols(true)
+		table.insert(conns, RunService.PreSimulation:Connect(simulate))
+		table.insert(conns, RunService.RenderStepped:Connect(present))
+		local function go(c)
+			c:WaitForChild("Humanoid", 5)
+			c:WaitForChild("HumanoidRootPart", 5)
+			entercar()
+		end
+		if player.Character then
+			go(player.Character)
+		else
+			local cconn
+			cconn = player.CharacterAdded:Connect(function(nc)
+				if cconn then
+					cconn:Disconnect()
+				end
+				go(nc)
+			end)
+			table.insert(conns, cconn)
+		end
+	end)
+
+	return ctl
+end
+
+function CarController:Retune(car, stats)
+	local ctl = handled[car]
+	if ctl and ctl.retune then
+		ctl.retune(stats)
+		return true
+	end
+	return false
+end
+
+function CarController:Get(car)
+	return handled[car]
+end
+
+function CarController:Telemetry(car)
+	local ctl = handled[car]
+	return ctl and ctl.telemetry and ctl.telemetry() or nil
+end
+
+function CarController:Release(car)
+	local ctl = handled[car]
+	if ctl and ctl.destroy then
+		ctl.destroy()
+	end
+end
+
+return CarController
