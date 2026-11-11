@@ -46,6 +46,14 @@ local TO_RPM = 30 / math.pi
 local REF_RADIUS = 1.78 -- radius the sample pattern was designed for
 
 local WHEELS = { "FL", "FR", "RL", "RR" }
+
+-- Sound ids this game cannot load (no permission, not approved, missing file). Shared
+-- across cars and respawns so they are only ever tried once.
+local FAILED_SOUNDS = (function()
+	local genv = (getgenv and getgenv()) or _G
+	genv.CarHubFailedSounds = genv.CarHubFailedSounds or {}
+	return genv.CarHubFailedSounds
+end)()
 local SPEED_ATTR = { FR = "frontRws", FL = "frontLws", RR = "rearRws", RL = "rearLws" }
 
 local function grab(url)
@@ -966,7 +974,7 @@ function CarController:HandleCar(car, initialStats)
 		local preload = {}
 		for key, c in pairs(spec) do
 			local id = c.id and resolveSound(c.id)
-			if id then
+			if id and not FAILED_SOUNDS[id] then
 				local s = Instance.new("Sound")
 				s.Name = key
 				s.SoundId = id
@@ -995,15 +1003,20 @@ function CarController:HandleCar(car, initialStats)
 		if chans.turbospool then
 			chans.turbospool.pk = 12
 		end
+		-- learn which assets this game cannot load so they are never retried
 		task.spawn(function()
-			pcall(ContentProvider.PreloadAsync, ContentProvider, preload)
+			pcall(ContentProvider.PreloadAsync, ContentProvider, preload, function(contentId, status)
+				if status ~= Enum.AssetFetchStatus.Success then
+					FAILED_SOUNDS[contentId] = true
+				end
+			end)
 		end)
 	end
 	buildAudio()
 
 	local function oneshot(id, vol, pitch)
 		id = resolveSound(id)
-		if not id then
+		if not id or FAILED_SOUNDS[id] then
 			return
 		end
 		local s = Instance.new("Sound")
@@ -2572,7 +2585,7 @@ function CarController:HandleCar(car, initialStats)
 			sv.indstate = false
 		end
 
-		for _, c in pairs(chans) do
+		for key, c in pairs(chans) do
 			local s = c.s
 			s.Volume += (c.v - s.Volume) * smoothing(c.vk, dt)
 			s.PlaybackSpeed += (c.p - s.PlaybackSpeed) * smoothing(c.pk, dt)
@@ -2581,7 +2594,20 @@ function CarController:HandleCar(car, initialStats)
 					s:Pause()
 				end
 			elseif not s.Playing then
-				s:Play()
+				-- A sound whose asset cannot load never reports Playing, so calling Play()
+				-- every frame re-requests the asset and logs an error each time. Retry
+				-- sparingly and drop the channel once the asset is known to be unusable.
+				if FAILED_SOUNDS[s.SoundId] or (c.tries or 0) >= 4 then
+					FAILED_SOUNDS[s.SoundId] = true
+					s:Destroy()
+					chans[key] = nil
+				elseif now >= (c.retryAt or 0) then
+					s:Play()
+					if not s.IsLoaded then
+						c.tries = (c.tries or 0) + 1
+						c.retryAt = now + 2
+					end
+				end
 			end
 		end
 	end
