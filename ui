@@ -1,0 +1,3315 @@
+--[[
+	UI
+	--
+	The hub panel. A single docked side panel with four views:
+
+	  Drive  build/spawn, live telemetry, controls reference, event log
+	  Build  mesh roles, wheel layout editor with a live 3D preview of the chassis
+	  Tune   presets, sectioned parameters with sliders, derived read-outs, expert overrides
+	  Link   server connection status
+
+	Visual language: warm graphite surfaces, one signal-orange accent, BuilderSans for text
+	and RobotoMono for numbers. Motion is short (120-350 ms) quint easing; nothing bounces.
+]]
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local UI = {}
+
+------------------------------------------------------------------------------------------
+-- Theme
+------------------------------------------------------------------------------------------
+
+local function rgb(r, g, b)
+	return Color3.fromRGB(r, g, b)
+end
+
+local C = {
+	panel = rgb(18, 19, 21),
+	surface = rgb(23, 24, 27),
+	raised = rgb(33, 34, 38),
+	hover = rgb(40, 42, 47),
+	press = rgb(47, 49, 55),
+	line = rgb(44, 46, 51),
+	lineSoft = rgb(34, 35, 39),
+	text = rgb(236, 237, 238),
+	dim = rgb(163, 166, 173),
+	mute = rgb(112, 116, 124),
+	faint = rgb(78, 81, 88),
+	accent = rgb(240, 138, 58),
+	accentHover = rgb(247, 153, 77),
+	accentText = rgb(26, 18, 10),
+	good = rgb(102, 190, 140),
+	warn = rgb(226, 178, 72),
+	bad = rgb(228, 92, 82),
+	info = rgb(120, 162, 214),
+}
+
+local ROLE_COLORS = {
+	BODY = rgb(240, 138, 58),
+	TIRE = rgb(102, 190, 140),
+	RIM = rgb(150, 132, 220),
+	WHEEL = rgb(100, 186, 204),
+	DETAIL = rgb(140, 144, 152),
+}
+
+local FAMILY = "rbxasset://fonts/families/BuilderSans.json"
+local MONO = "rbxasset://fonts/families/RobotoMono.json"
+
+local function font(weight)
+	return Font.new(FAMILY, weight or Enum.FontWeight.Regular)
+end
+local function mono(weight)
+	return Font.new(MONO, weight or Enum.FontWeight.Regular)
+end
+
+local W = {
+	regular = Enum.FontWeight.Regular,
+	medium = Enum.FontWeight.Medium,
+	semibold = Enum.FontWeight.SemiBold,
+	bold = Enum.FontWeight.Bold,
+}
+
+local PAD = 16
+
+------------------------------------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------------------------------------
+
+local function new(class, props, children)
+	local inst = Instance.new(class)
+	local parent
+	for key, value in pairs(props or {}) do
+		if key == "Parent" then
+			parent = value
+		else
+			inst[key] = value
+		end
+	end
+	if inst:IsA("GuiObject") then
+		inst.BorderSizePixel = 0
+		if props == nil or props.BackgroundColor3 == nil and props.BackgroundTransparency == nil then
+			inst.BackgroundTransparency = 1
+		end
+	end
+	for _, child in ipairs(children or {}) do
+		child.Parent = inst
+	end
+	inst.Parent = parent
+	return inst
+end
+
+local function tween(inst, props, time, style, dir)
+	local t = TweenService:Create(inst, TweenInfo.new(time or 0.16, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out), props)
+	t:Play()
+	return t
+end
+
+-- Corners are kept tight: smoothed rectangles, never pills.
+local function corner(radius)
+	return new("UICorner", { CornerRadius = UDim.new(0, math.min(radius or 3, 3)) })
+end
+
+local function stroke(color, transparency, thickness)
+	return new("UIStroke", {
+		Color = color or C.line,
+		Transparency = transparency or 0,
+		Thickness = thickness or 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	})
+end
+
+local function padding(t, r, b, l)
+	return new("UIPadding", {
+		PaddingTop = UDim.new(0, t or 0),
+		PaddingRight = UDim.new(0, r or t or 0),
+		PaddingBottom = UDim.new(0, b or t or 0),
+		PaddingLeft = UDim.new(0, l or r or t or 0),
+	})
+end
+
+local function vlist(gap, align)
+	return new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Vertical,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, gap or 0),
+		HorizontalAlignment = align or Enum.HorizontalAlignment.Left,
+	})
+end
+
+local function hlist(gap, valign, halign)
+	return new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, gap or 0),
+		VerticalAlignment = valign or Enum.VerticalAlignment.Center,
+		HorizontalAlignment = halign or Enum.HorizontalAlignment.Left,
+	})
+end
+
+local function text(parent, value, opts)
+	opts = opts or {}
+	local lbl = new("TextLabel", {
+		Parent = parent,
+		Text = value or "",
+		FontFace = opts.mono and mono(opts.weight) or font(opts.weight),
+		TextSize = opts.size or 14,
+		TextColor3 = opts.color or C.text,
+		TextXAlignment = opts.align or Enum.TextXAlignment.Left,
+		TextYAlignment = opts.valign or Enum.TextYAlignment.Center,
+		TextWrapped = opts.wrap or false,
+		TextTruncate = opts.wrap and Enum.TextTruncate.None or Enum.TextTruncate.AtEnd,
+		RichText = opts.rich or false,
+		Size = opts.sizeUDim or UDim2.new(1, 0, 0, opts.height or 18),
+		Position = opts.position,
+		AutomaticSize = opts.auto,
+		LayoutOrder = opts.order or 0,
+		ZIndex = opts.z or 1,
+		AnchorPoint = opts.anchor,
+		Visible = opts.visible ~= false,
+	})
+	return lbl
+end
+
+local function round(value, step)
+	if not step or step <= 0 then
+		return value
+	end
+	return math.floor(value / step + 0.5) * step
+end
+
+local function decimalsFor(step)
+	if not step or step >= 1 then
+		return 0
+	elseif step >= 0.1 then
+		return 1
+	elseif step >= 0.01 then
+		return 2
+	elseif step >= 0.001 then
+		return 3
+	end
+	return 4
+end
+
+local function formatNumber(value, param)
+	if type(value) ~= "number" then
+		return tostring(value)
+	end
+	if param and param.display == "percent" then
+		local d = param.step and param.step < 0.01 and 1 or 0
+		return string.format("%." .. d .. "f", value * 100)
+	end
+	return string.format("%." .. decimalsFor(param and param.step) .. "f", value)
+end
+
+local function parseNumber(textValue, param)
+	local n = tonumber((textValue or ""):gsub("[%%%s,]", ""))
+	if not n then
+		return nil
+	end
+	if param and param.display == "percent" then
+		return n / 100
+	end
+	return n
+end
+
+local function shortId(id)
+	return (id or ""):match("(%d+)$") or id or "?"
+end
+
+local function bind(signal, fn)
+	local c = signal:Connect(fn)
+	table.insert(UI._links, c)
+	return c
+end
+
+------------------------------------------------------------------------------------------
+-- State
+------------------------------------------------------------------------------------------
+
+UI._links = {}
+local deps
+local gui, panel, content, overlay, toastHost, tooltipLabel
+local visible = false
+local tabs, pages = {}, {}
+local activeTab = nil
+local statusDot, statusText
+local tickers = {}
+
+------------------------------------------------------------------------------------------
+-- Interactive primitives
+------------------------------------------------------------------------------------------
+
+-- hover/press feedback on a background
+local function interactive(button, base, hover, press)
+	button.AutoButtonColor = false
+	button.BackgroundColor3 = base
+	local over = false
+	bind(button.MouseEnter, function()
+		over = true
+		tween(button, { BackgroundColor3 = hover }, 0.12)
+	end)
+	bind(button.MouseLeave, function()
+		over = false
+		tween(button, { BackgroundColor3 = base }, 0.18)
+	end)
+	bind(button.MouseButton1Down, function()
+		tween(button, { BackgroundColor3 = press or hover }, 0.06)
+	end)
+	bind(button.MouseButton1Up, function()
+		tween(button, { BackgroundColor3 = over and hover or base }, 0.14)
+	end)
+	return function(newBase, newHover, newPress)
+		base, hover, press = newBase, newHover or hover, newPress or press
+		tween(button, { BackgroundColor3 = over and hover or base }, 0.14)
+	end
+end
+
+local BUTTON_STYLES = {
+	primary = { C.accent, C.accentHover, rgb(222, 122, 44), C.accentText },
+	secondary = { C.raised, C.hover, C.press, C.text },
+	ghost = { C.panel, C.raised, C.hover, C.dim },
+	danger = { C.raised, rgb(70, 38, 36), rgb(84, 42, 40), C.bad },
+}
+
+local function button(parent, label, opts)
+	opts = opts or {}
+	local style = BUTTON_STYLES[opts.style or "secondary"]
+	local btn = new("TextButton", {
+		Parent = parent,
+		Text = label,
+		FontFace = font(opts.weight or W.semibold),
+		TextSize = opts.textSize or 14,
+		TextColor3 = style[4],
+		Size = opts.size or UDim2.new(1, 0, 0, 34),
+		Position = opts.position,
+		AnchorPoint = opts.anchor,
+		LayoutOrder = opts.order or 0,
+		AutomaticSize = opts.auto,
+		ZIndex = opts.z or 1,
+		BackgroundTransparency = 0,
+	}, { corner(opts.radius or 6) })
+	if opts.auto then
+		padding(0, 12, 0, 12).Parent = btn
+	end
+	local restyle = interactive(btn, style[1], style[2], style[3])
+	local scale = new("UIScale", { Parent = btn })
+	bind(btn.MouseButton1Down, function()
+		tween(scale, { Scale = 0.97 }, 0.08)
+	end)
+	bind(btn.MouseButton1Up, function()
+		tween(scale, { Scale = 1 }, 0.2, Enum.EasingStyle.Back)
+	end)
+	bind(btn.MouseLeave, function()
+		tween(scale, { Scale = 1 }, 0.16)
+	end)
+	if opts.onClick then
+		bind(btn.Activated, opts.onClick)
+	end
+	local api = { instance = btn }
+	function api.setStyle(name)
+		local s = BUTTON_STYLES[name]
+		restyle(s[1], s[2], s[3])
+		tween(btn, { TextColor3 = s[4] }, 0.14)
+	end
+	function api.setText(value)
+		btn.Text = value
+	end
+	function api.setEnabled(enabled)
+		btn.Active = enabled
+		btn.AutoButtonColor = false
+		tween(btn, { TextTransparency = enabled and 0 or 0.55 }, 0.14)
+	end
+	return api
+end
+
+local function iconButton(parent, glyph, opts)
+	opts = opts or {}
+	local btn = new("TextButton", {
+		Parent = parent,
+		Text = glyph,
+		FontFace = font(W.medium),
+		TextSize = opts.textSize or 16,
+		TextColor3 = opts.color or C.dim,
+		Size = opts.size or UDim2.fromOffset(28, 28),
+		Position = opts.position,
+		AnchorPoint = opts.anchor,
+		LayoutOrder = opts.order or 0,
+		ZIndex = opts.z or 1,
+		BackgroundTransparency = 0,
+		Visible = opts.visible ~= false,
+	}, { corner(6) })
+	interactive(btn, opts.base or C.panel, C.raised, C.hover)
+	bind(btn.MouseEnter, function()
+		tween(btn, { TextColor3 = C.text }, 0.12)
+	end)
+	bind(btn.MouseLeave, function()
+		tween(btn, { TextColor3 = opts.color or C.dim }, 0.18)
+	end)
+	if opts.onClick then
+		bind(btn.Activated, opts.onClick)
+	end
+	return btn
+end
+
+local function card(parent, opts)
+	opts = opts or {}
+	local frame = new("Frame", {
+		Parent = parent,
+		BackgroundColor3 = opts.color or C.surface,
+		BackgroundTransparency = opts.flat and 1 or 0,
+		Size = opts.size or UDim2.new(1, 0, 0, 0),
+		AutomaticSize = opts.size and Enum.AutomaticSize.None or Enum.AutomaticSize.Y,
+		LayoutOrder = opts.order or 0,
+		ClipsDescendants = opts.clip or false,
+	}, { corner(3) })
+	if opts.pad ~= false then
+		padding(opts.pad or 12).Parent = frame
+	end
+	return frame
+end
+
+local function sectionLabel(parent, label, order, right)
+	local row = new("Frame", { Parent = parent, Size = UDim2.new(1, 0, 0, 20), LayoutOrder = order or 0 })
+	text(row, label:upper(), { size = 11, weight = W.bold, color = C.mute, sizeUDim = UDim2.new(1, -120, 1, 0) })
+	if right then
+		right.AnchorPoint = Vector2.new(1, 0.5)
+		right.Position = UDim2.new(1, 0, 0.5, 0)
+		right.Parent = row
+	end
+	return row
+end
+
+local function toggle(parent, value, onChange, opts)
+	opts = opts or {}
+	local track = new("TextButton", {
+		Parent = parent,
+		Text = "",
+		Size = UDim2.fromOffset(34, 20),
+		Position = opts.position,
+		AnchorPoint = opts.anchor,
+		BackgroundColor3 = value and C.accent or C.raised,
+		BackgroundTransparency = 0,
+		AutoButtonColor = false,
+		LayoutOrder = opts.order or 0,
+	}, { corner(10), stroke(C.line, value and 1 or 0) })
+	local knob = new("Frame", {
+		Parent = track,
+		Size = UDim2.fromOffset(14, 14),
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, value and 17 or 3, 0.5, 0),
+		BackgroundColor3 = value and C.accentText or C.dim,
+		BackgroundTransparency = 0,
+	}, { corner(7) })
+	local state = value
+	local function render(animate)
+		local t = animate and 0.2 or 0
+		tween(track, { BackgroundColor3 = state and C.accent or C.raised }, t)
+		tween(track:FindFirstChildOfClass("UIStroke"), { Transparency = state and 1 or 0 }, t)
+		tween(knob, { Position = UDim2.new(0, state and 17 or 3, 0.5, 0), BackgroundColor3 = state and C.accentText or C.dim }, t)
+	end
+	bind(track.Activated, function()
+		state = not state
+		render(true)
+		if onChange then
+			onChange(state)
+		end
+	end)
+	return {
+		instance = track,
+		set = function(v)
+			if v ~= state then
+				state = v
+				render(true)
+			end
+		end,
+	}
+end
+
+-- Segmented control with a sliding highlight.
+local function segmented(parent, options, labels, value, onChange, opts)
+	opts = opts or {}
+	local holder = new("Frame", {
+		Parent = parent,
+		BackgroundColor3 = C.raised,
+		BackgroundTransparency = 0,
+		Size = opts.size or UDim2.new(1, 0, 0, 30),
+		Position = opts.position,
+		AnchorPoint = opts.anchor,
+		LayoutOrder = opts.order or 0,
+	}, { corner(7), padding(2) })
+	local n = #options
+	local highlight = new("Frame", {
+		Parent = holder,
+		BackgroundColor3 = C.hover,
+		BackgroundTransparency = 0,
+		Size = UDim2.new(1 / n, 0, 1, 0),
+		ZIndex = 1,
+	}, { corner(5), stroke(C.line) })
+	local buttons = {}
+	local current = value
+	local function place(animate)
+		local index = table.find(options, current)
+		highlight.Visible = index ~= nil
+		if index then
+			local target = UDim2.new((index - 1) / n, 0, 0, 0)
+			if animate then
+				tween(highlight, { Position = target }, 0.24)
+			else
+				highlight.Position = target
+			end
+		end
+		for i, b in ipairs(buttons) do
+			tween(b, { TextColor3 = options[i] == current and C.text or C.mute }, animate and 0.18 or 0)
+		end
+	end
+	for i, option in ipairs(options) do
+		local b = new("TextButton", {
+			Parent = holder,
+			Text = labels and labels[i] or tostring(option),
+			FontFace = font(W.semibold),
+			TextSize = opts.textSize or 13,
+			TextColor3 = C.mute,
+			Size = UDim2.new(1 / n, 0, 1, 0),
+			Position = UDim2.new((i - 1) / n, 0, 0, 0),
+			ZIndex = 2,
+			AutoButtonColor = false,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+		})
+		bind(b.MouseEnter, function()
+			if options[i] ~= current then
+				tween(b, { TextColor3 = C.dim }, 0.12)
+			end
+		end)
+		bind(b.MouseLeave, function()
+			if options[i] ~= current then
+				tween(b, { TextColor3 = C.mute }, 0.18)
+			end
+		end)
+		bind(b.Activated, function()
+			if current == option then
+				return
+			end
+			current = option
+			place(true)
+			if onChange then
+				onChange(option)
+			end
+		end)
+		buttons[i] = b
+	end
+	place(false)
+	return {
+		instance = holder,
+		set = function(v)
+			if v ~= current then
+				current = v
+				place(true)
+			end
+		end,
+		-- for controls created before the handler's dependencies exist
+		setHandler = function(fn)
+			onChange = fn
+		end,
+	}
+end
+
+-- Text input with focus ring.
+local function input(parent, opts)
+	opts = opts or {}
+	local box = new("TextBox", {
+		Parent = parent,
+		Text = opts.text or "",
+		PlaceholderText = opts.placeholder or "",
+		PlaceholderColor3 = C.faint,
+		ClearTextOnFocus = false,
+		FontFace = opts.mono and mono(W.medium) or font(W.medium),
+		TextSize = opts.textSize or 13,
+		TextColor3 = C.text,
+		TextXAlignment = opts.align or Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		BackgroundColor3 = C.raised,
+		BackgroundTransparency = 0,
+		Size = opts.size or UDim2.new(1, 0, 0, 30),
+		Position = opts.position,
+		AnchorPoint = opts.anchor,
+		LayoutOrder = opts.order or 0,
+		MultiLine = opts.multiline or false,
+		TextWrapped = opts.multiline or false,
+		TextYAlignment = opts.multiline and Enum.TextYAlignment.Top or Enum.TextYAlignment.Center,
+		ZIndex = opts.z or 1,
+	}, { corner(6), padding(opts.multiline and 8 or 0, 9, opts.multiline and 8 or 0, 9) })
+	local ring = stroke(C.line)
+	ring.Parent = box
+	bind(box.Focused, function()
+		tween(ring, { Color = C.accent }, 0.14)
+	end)
+	bind(box.FocusLost, function()
+		tween(ring, { Color = C.line }, 0.2)
+	end)
+	return box, ring
+end
+
+------------------------------------------------------------------------------------------
+-- Overlay: dropdowns, tooltip, modal
+------------------------------------------------------------------------------------------
+
+local closePopup
+
+local function openPopup(anchor, build, width)
+	if closePopup then
+		closePopup()
+	end
+	local catcher = new("TextButton", {
+		Parent = overlay,
+		Text = "",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		ZIndex = 50,
+		AutoButtonColor = false,
+	})
+	local abs, size = anchor.AbsolutePosition, anchor.AbsoluteSize
+	local scale = gui:FindFirstChildOfClass("UIScale")
+	local s = scale and scale.Scale or 1
+	local pop = new("Frame", {
+		Parent = overlay,
+		BackgroundColor3 = C.raised,
+		BackgroundTransparency = 0,
+		Position = UDim2.fromOffset(abs.X / s, (abs.Y + size.Y + 4) / s),
+		Size = UDim2.fromOffset((width or size.X) / s, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		ZIndex = 51,
+	}, { corner(8), stroke(C.line), padding(4) })
+	local list = new("ScrollingFrame", {
+		Parent = pop,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.None,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = C.faint,
+		ZIndex = 52,
+	}, { vlist(2) })
+	local count = build(list)
+	list.Size = UDim2.new(1, 0, 0, math.min(count, 8) * 30 + math.max(math.min(count, 8) - 1, 0) * 2)
+	local scaleObj = new("UIScale", { Parent = pop, Scale = 0.96 })
+	pop.BackgroundTransparency = 1
+	tween(pop, { BackgroundTransparency = 0 }, 0.12)
+	tween(scaleObj, { Scale = 1 }, 0.16)
+	local closing = false
+	local function close()
+		if closing then
+			return
+		end
+		closing = true
+		closePopup = nil
+		catcher:Destroy()
+		tween(scaleObj, { Scale = 0.97 }, 0.1)
+		local t = tween(pop, { BackgroundTransparency = 1 }, 0.1)
+		for _, d in ipairs(pop:GetDescendants()) do
+			if d:IsA("TextButton") or d:IsA("TextLabel") then
+				tween(d, { TextTransparency = 1, BackgroundTransparency = 1 }, 0.08)
+			end
+		end
+		t.Completed:Once(function()
+			pop:Destroy()
+		end)
+	end
+	closePopup = close
+	catcher.Activated:Connect(close)
+	return close
+end
+
+local function menuItem(list, label, selected, onPick, close, order, sub)
+	local b = new("TextButton", {
+		Parent = list,
+		Text = "",
+		Size = UDim2.new(1, -4, 0, 30),
+		BackgroundTransparency = 0,
+		LayoutOrder = order or 0,
+		ZIndex = 53,
+	}, { corner(5) })
+	interactive(b, C.raised, C.hover, C.press)
+	text(b, label, {
+		size = 13,
+		weight = selected and W.semibold or W.medium,
+		color = selected and C.text or C.dim,
+		position = UDim2.fromOffset(10, 0),
+		sizeUDim = UDim2.new(1, sub and -90 or -30, 1, 0),
+		z = 54,
+	})
+	if sub then
+		text(b, sub, { size = 12, color = C.mute, align = Enum.TextXAlignment.Right, position = UDim2.new(1, -86, 0, 0), sizeUDim = UDim2.new(0, 76, 1, 0), z = 54 })
+	end
+	if selected then
+		new("Frame", {
+			Parent = b,
+			BackgroundColor3 = C.accent,
+			BackgroundTransparency = 0,
+			Size = UDim2.fromOffset(3, 14),
+			AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.new(0, 2, 0.5, 0),
+			ZIndex = 54,
+		}, { corner(2) })
+	end
+	b.Activated:Connect(function()
+		close()
+		onPick()
+	end)
+	return b
+end
+
+local function dropdown(parent, getOptions, value, onChange, opts)
+	opts = opts or {}
+	local btn = new("TextButton", {
+		Parent = parent,
+		Text = "",
+		Size = opts.size or UDim2.new(1, 0, 0, 30),
+		Position = opts.position,
+		AnchorPoint = opts.anchor,
+		LayoutOrder = opts.order or 0,
+		BackgroundTransparency = 0,
+	}, { corner(6), stroke(C.line) })
+	interactive(btn, C.raised, C.hover, C.press)
+	local lbl = text(btn, "", { size = 13, weight = W.medium, position = UDim2.fromOffset(10, 0), sizeUDim = UDim2.new(1, -34, 1, 0) })
+	-- chevron drawn from two bars (font glyph coverage for arrows is unreliable)
+	local chevron = new("Frame", { Parent = btn, Size = UDim2.fromOffset(10, 6), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(1, -16, 0.5, 0) })
+	for i, rot in ipairs({ 40, -40 }) do
+		new("Frame", {
+			Parent = chevron,
+			BackgroundColor3 = C.mute,
+			BackgroundTransparency = 0,
+			Size = UDim2.fromOffset(7, 2),
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(i == 1 and 0.3 or 0.7, 0, 0.5, 0),
+			Rotation = rot,
+		}, { corner(1) })
+	end
+	local current = value
+	local function labelFor(v)
+		for _, o in ipairs(getOptions()) do
+			if o.value == v then
+				return o.label
+			end
+		end
+		return tostring(v or (opts.placeholder or "-"))
+	end
+	local function render()
+		lbl.Text = labelFor(current)
+		lbl.TextColor3 = current == nil and C.faint or C.text
+	end
+	render()
+	bind(btn.Activated, function()
+		openPopup(btn, function(list)
+			local options = getOptions()
+			for i, o in ipairs(options) do
+				menuItem(list, o.label, o.value == current, function()
+					current = o.value
+					render()
+					if onChange then
+						onChange(o.value)
+					end
+				end, function()
+					if closePopup then
+						closePopup()
+					end
+				end, i, o.sub)
+			end
+			if #options == 0 then
+				text(list, opts.empty or "Nothing here yet", { size = 13, color = C.mute, height = 30, z = 53 })
+				return 1
+			end
+			return #options
+		end, opts.popupWidth)
+	end)
+	return {
+		instance = btn,
+		set = function(v)
+			current = v
+			render()
+		end,
+		refresh = render,
+	}
+end
+
+local function attachTooltip(target, message)
+	if not message or message == "" then
+		return
+	end
+	local token = 0
+	bind(target.MouseEnter, function()
+		token += 1
+		local mine = token
+		task.delay(0.45, function()
+			if mine ~= token or not tooltipLabel then
+				return
+			end
+			tooltipLabel.Text = message
+			local abs = target.AbsolutePosition
+			local scale = gui:FindFirstChildOfClass("UIScale")
+			local s = scale and scale.Scale or 1
+			tooltipLabel.Parent.Position = UDim2.fromOffset(abs.X / s, (abs.Y + target.AbsoluteSize.Y + 6) / s)
+			tooltipLabel.Parent.Visible = true
+			tooltipLabel.Parent.BackgroundTransparency = 1
+			tooltipLabel.TextTransparency = 1
+			tween(tooltipLabel.Parent, { BackgroundTransparency = 0 }, 0.14)
+			tween(tooltipLabel, { TextTransparency = 0 }, 0.14)
+		end)
+	end)
+	bind(target.MouseLeave, function()
+		token += 1
+		if tooltipLabel then
+			tooltipLabel.Parent.Visible = false
+		end
+	end)
+end
+
+-- Centered modal card over a dimmed panel.
+local function modal(title, buildBody, actions)
+	local scrim = new("TextButton", {
+		Parent = overlay,
+		Text = "",
+		AutoButtonColor = false,
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 1,
+		ZIndex = 60,
+	})
+	tween(scrim, { BackgroundTransparency = 0.45 }, 0.2)
+	local box = new("Frame", {
+		Parent = scrim,
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(400, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = C.surface,
+		BackgroundTransparency = 0,
+		ZIndex = 61,
+	}, { corner(10), stroke(C.line), padding(18), vlist(12) })
+	local scale = new("UIScale", { Parent = box, Scale = 0.95 })
+	tween(scale, { Scale = 1 }, 0.24)
+	text(box, title, { size = 17, weight = W.bold, height = 22, order = 1, z = 62 })
+	local body = new("Frame", { Parent = box, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 2, ZIndex = 62 }, { vlist(8) })
+	buildBody(body)
+	local row = new("Frame", { Parent = box, Size = UDim2.new(1, 0, 0, 34), LayoutOrder = 3, ZIndex = 62 }, { hlist(8, nil, Enum.HorizontalAlignment.Right) })
+	local function close()
+		tween(scale, { Scale = 0.97 }, 0.12)
+		tween(scrim, { BackgroundTransparency = 1 }, 0.15).Completed:Once(function()
+			scrim:Destroy()
+		end)
+		box.Visible = false
+	end
+	for i, a in ipairs(actions) do
+		local b = button(row, a.label, { style = a.style, size = UDim2.fromOffset(0, 34), auto = Enum.AutomaticSize.X, order = i, z = 63 })
+		b.instance.Activated:Connect(function()
+			if not a.keepOpen then
+				close()
+			end
+			if a.onClick then
+				a.onClick(close)
+			end
+		end)
+	end
+	return close
+end
+
+------------------------------------------------------------------------------------------
+-- Toasts
+------------------------------------------------------------------------------------------
+
+local TOAST_COLORS = { ok = C.good, fail = C.bad, info = C.info, warn = C.warn }
+
+function UI.notify(kind, message)
+	if not toastHost then
+		return
+	end
+	local item = new("Frame", {
+		Parent = toastHost,
+		BackgroundColor3 = C.surface,
+		BackgroundTransparency = 1,
+		Size = UDim2.fromOffset(0, 38),
+		AutomaticSize = Enum.AutomaticSize.X,
+		LayoutOrder = -os.clock() * 1000,
+	}, { corner(8), padding(0, 14, 0, 12), hlist(10) })
+	local line = item:FindFirstChildOfClass("UIListLayout")
+	line.VerticalAlignment = Enum.VerticalAlignment.Center
+	local s = stroke(C.line, 1)
+	s.Parent = item
+	local dot = new("Frame", {
+		Parent = item,
+		BackgroundColor3 = TOAST_COLORS[kind] or C.info,
+		BackgroundTransparency = 1,
+		Size = UDim2.fromOffset(8, 8),
+		LayoutOrder = 1,
+	}, { corner(4) })
+	local lbl = new("TextLabel", {
+		Parent = item,
+		Text = message,
+		FontFace = font(W.medium),
+		TextSize = 14,
+		TextColor3 = C.text,
+		TextTransparency = 1,
+		AutomaticSize = Enum.AutomaticSize.X,
+		Size = UDim2.fromOffset(0, 38),
+		LayoutOrder = 2,
+	})
+	local scale = new("UIScale", { Parent = item, Scale = 0.94 })
+	tween(item, { BackgroundTransparency = 0 }, 0.2)
+	tween(s, { Transparency = 0 }, 0.2)
+	tween(dot, { BackgroundTransparency = 0 }, 0.2)
+	tween(lbl, { TextTransparency = 0 }, 0.2)
+	tween(scale, { Scale = 1 }, 0.26, Enum.EasingStyle.Back)
+
+	local items = {}
+	for _, child in ipairs(toastHost:GetChildren()) do
+		if child:IsA("Frame") then
+			table.insert(items, child)
+		end
+	end
+	if #items > 3 then
+		table.sort(items, function(a, b)
+			return a.LayoutOrder > b.LayoutOrder
+		end)
+		items[1]:Destroy()
+	end
+	task.delay(3.4, function()
+		if not item.Parent then
+			return
+		end
+		tween(item, { BackgroundTransparency = 1 }, 0.25)
+		tween(s, { Transparency = 1 }, 0.25)
+		tween(dot, { BackgroundTransparency = 1 }, 0.25)
+		tween(scale, { Scale = 0.96 }, 0.25)
+		tween(lbl, { TextTransparency = 1 }, 0.25).Completed:Once(function()
+			item:Destroy()
+		end)
+	end)
+end
+
+------------------------------------------------------------------------------------------
+-- Generic page scaffolding
+------------------------------------------------------------------------------------------
+
+local function scrollPage(parent)
+	local scroll = new("ScrollingFrame", {
+		Parent = parent,
+		Size = UDim2.fromScale(1, 1),
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = C.faint,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+		VerticalScrollBarInset = Enum.ScrollBarInset.None,
+		BackgroundTransparency = 1,
+	}, { padding(4, PAD, 20, PAD), vlist(12) })
+	return scroll
+end
+
+local function keyValue(parent, key, order)
+	local row = new("Frame", { Parent = parent, Size = UDim2.new(1, 0, 0, 22), LayoutOrder = order or 0 })
+	text(row, key, { size = 13, color = C.mute, sizeUDim = UDim2.new(0.42, 0, 1, 0) })
+	local value = text(row, "-", { size = 13, weight = W.medium, mono = true, align = Enum.TextXAlignment.Right, position = UDim2.new(0.42, 0, 0, 0), sizeUDim = UDim2.new(0.58, 0, 1, 0) })
+	return value
+end
+
+local function divider(parent, order)
+	return new("Frame", { Parent = parent, BackgroundColor3 = C.lineSoft, BackgroundTransparency = 0, Size = UDim2.new(1, 0, 0, 1), LayoutOrder = order or 0 })
+end
+
+------------------------------------------------------------------------------------------
+-- Line graph built from rotated frames
+------------------------------------------------------------------------------------------
+
+local function graph(parent, height, order)
+	local frame = new("Frame", {
+		Parent = parent,
+		Size = UDim2.new(1, 0, 0, height),
+		LayoutOrder = order or 0,
+		ClipsDescendants = true,
+	})
+	local plot = new("Frame", { Parent = frame, Size = UDim2.new(1, -40, 1, -20), Position = UDim2.fromOffset(32, 4) })
+	local grid = {}
+	for i = 0, 3 do
+		grid[i] = new("Frame", {
+			Parent = plot,
+			BackgroundColor3 = C.lineSoft,
+			BackgroundTransparency = 0,
+			Size = UDim2.new(1, 0, 0, 1),
+			Position = UDim2.new(0, 0, i / 3, 0),
+		})
+	end
+	local segs = {}
+	local labels = {}
+	local api = {}
+
+	local function label(key, value, pos, opts)
+		local l = labels[key]
+		if not l then
+			l = text(frame, "", { size = 11, mono = true, color = C.mute, height = 14 })
+			labels[key] = l
+		end
+		l.Text = value
+		l.Position = pos
+		l.Size = UDim2.fromOffset(opts and opts.w or 40, 14)
+		l.TextXAlignment = opts and opts.align or Enum.TextXAlignment.Left
+		l.TextColor3 = opts and opts.color or C.mute
+	end
+
+	-- series = { {points = {{x,y}...}, color, width} }, ranges in data units
+	function api.draw(series, xr, yr, axis)
+		local w, h = plot.AbsoluteSize.X, plot.AbsoluteSize.Y
+		if w < 2 or h < 2 then
+			task.defer(function()
+				if plot.AbsoluteSize.X >= 2 then
+					api.draw(series, xr, yr, axis)
+				end
+			end)
+			return
+		end
+		local used = 0
+		for _, s in ipairs(series) do
+			local pts = s.points
+			for i = 1, #pts - 1 do
+				used += 1
+				local seg = segs[used]
+				if not seg then
+					seg = new("Frame", { Parent = plot, BackgroundTransparency = 0, AnchorPoint = Vector2.new(0.5, 0.5), ZIndex = 2 })
+					segs[used] = seg
+				end
+				local x1 = (pts[i][1] - xr[1]) / (xr[2] - xr[1]) * w
+				local y1 = h - (pts[i][2] - yr[1]) / (yr[2] - yr[1]) * h
+				local x2 = (pts[i + 1][1] - xr[1]) / (xr[2] - xr[1]) * w
+				local y2 = h - (pts[i + 1][2] - yr[1]) / (yr[2] - yr[1]) * h
+				local dx, dy = x2 - x1, y2 - y1
+				local len = math.sqrt(dx * dx + dy * dy)
+				seg.Visible = true
+				seg.BackgroundColor3 = s.color
+				seg.BackgroundTransparency = s.transparency or 0
+				seg.Size = UDim2.fromOffset(len + 1, s.width or 2)
+				seg.Position = UDim2.fromOffset((x1 + x2) / 2, (y1 + y2) / 2)
+				seg.Rotation = math.deg(math.atan2(dy, dx))
+			end
+		end
+		for i = used + 1, #segs do
+			segs[i].Visible = false
+		end
+		if axis then
+			for i = 0, 3 do
+				local v = yr[2] - (yr[2] - yr[1]) * i / 3
+				label("y" .. i, axis.y and axis.y(v) or string.format("%d", v), UDim2.new(0, 0, 0, 4 + h * i / 3 - 7), { w = 28, align = Enum.TextXAlignment.Right })
+			end
+			for i = 0, 2 do
+				local v = xr[1] + (xr[2] - xr[1]) * i / 2
+				local x = 32 + w * i / 2
+				label("x" .. i, axis.x and axis.x(v) or string.format("%d", v), UDim2.new(0, x - (i == 2 and 40 or i == 1 and 20 or 0), 1, -14), {
+					w = 40,
+					align = i == 2 and Enum.TextXAlignment.Right or i == 1 and Enum.TextXAlignment.Center or Enum.TextXAlignment.Left,
+				})
+			end
+		end
+	end
+	api.instance = frame
+	return api
+end
+
+------------------------------------------------------------------------------------------
+-- DRIVE
+------------------------------------------------------------------------------------------
+
+local STATE_LABELS = {
+	IDLE = { "Ready to build", C.mute },
+	INITIALIZING = { "Building", C.warn },
+	ACTIVE = { "Active", C.good },
+	FAILED = { "Failed", C.bad },
+	ENDED = { "Ended", C.mute },
+}
+
+local CONTROLS = {
+	{ "W  S", "Throttle · brake" },
+	{ "A  D", "Steer" },
+	{ "Space", "Handbrake" },
+	{ "Shift", "Clutch (manual)" },
+	{ "E  Q", "Shift up · down" },
+	{ "V", "Gearbox mode" },
+	{ "R", "Restart engine" },
+	{ "F", "Leave car" },
+	{ "X", "Camera mode" },
+	{ "M", "Mouse steering" },
+	{ "C", "Cycle gauges" },
+	{ "B", "Tire debug" },
+	{ "RMB", "Orbit camera" },
+}
+
+local function buildDrive(page)
+	local CarInit, Tuning = deps.CarInit, deps.Tuning
+	local scroll = scrollPage(page)
+
+	-- hero
+	local hero = card(scroll, { order = 1, flat = true, pad = 0 })
+	vlist(12).Parent = hero
+	local head = new("Frame", { Parent = hero, Size = UDim2.new(1, 0, 0, 40), LayoutOrder = 1 })
+	local title = text(head, "No car", { size = 20, weight = W.bold, height = 24 })
+	local subtitle = text(head, "", { size = 13, color = C.dim, position = UDim2.fromOffset(0, 24), height = 16 })
+	local action = button(hero, "Build car", { style = "primary", order = 2, size = UDim2.new(1, 0, 0, 38) })
+	local keyHint = text(action.instance, "N", { size = 12, weight = W.bold, mono = true, color = C.accentText, align = Enum.TextXAlignment.Right, position = UDim2.new(1, -40, 0, 0), sizeUDim = UDim2.new(0, 28, 1, 0) })
+	keyHint.TextTransparency = 0.45
+	bind(action.instance.Activated, function()
+		if CarInit.canRebuild() and CarInit.layoutDirty then
+			local ok, why = CarInit.rebuild()
+			if not ok then
+				UI.notify("info", why)
+			end
+			return
+		end
+		local ok, why = CarInit.request()
+		if not ok then
+			UI.notify("info", why)
+		end
+	end)
+
+	-- telemetry
+	local tele = card(scroll, { order = 2 })
+	vlist(12).Parent = tele
+	local top = new("Frame", { Parent = tele, Size = UDim2.new(1, 0, 0, 56), LayoutOrder = 1 })
+	local speed = text(top, "0", { size = 44, weight = W.bold, mono = true, sizeUDim = UDim2.new(0.5, 0, 0, 46) })
+	text(top, "km/h", { size = 12, color = C.mute, position = UDim2.fromOffset(0, 42), height = 14 })
+	local gear = text(top, "N", { size = 44, weight = W.bold, mono = true, align = Enum.TextXAlignment.Right, position = UDim2.new(0.5, 0, 0, 0), sizeUDim = UDim2.new(0.5, 0, 0, 46) })
+	local box = text(top, "Manual", { size = 12, color = C.mute, align = Enum.TextXAlignment.Right, position = UDim2.new(0.5, 0, 0, 42), sizeUDim = UDim2.new(0.5, 0, 0, 14) })
+
+	local rpmRow = new("Frame", { Parent = tele, Size = UDim2.new(1, 0, 0, 30), LayoutOrder = 2 })
+	local rpmText = text(rpmRow, "0 rpm", { size = 12, mono = true, color = C.dim, height = 14 })
+	local rpmTrack = new("Frame", { Parent = rpmRow, BackgroundColor3 = C.raised, BackgroundTransparency = 0, Size = UDim2.new(1, 0, 0, 8), Position = UDim2.fromOffset(0, 20) }, { corner(4) })
+	local redZone = new("Frame", { Parent = rpmTrack, BackgroundColor3 = C.bad, BackgroundTransparency = 0.7, Size = UDim2.new(0.1, 0, 1, 0), Position = UDim2.new(0.9, 0, 0, 0) }, { corner(4) })
+	local rpmFill = new("Frame", { Parent = rpmTrack, BackgroundColor3 = C.text, BackgroundTransparency = 0, Size = UDim2.new(0, 0, 1, 0), ZIndex = 2 }, { corner(4) })
+
+	local pedals = new("Frame", { Parent = tele, Size = UDim2.new(1, 0, 0, 36), LayoutOrder = 3 }, { hlist(10) })
+	local function pedalBar(name, color, i)
+		local f = new("Frame", { Parent = pedals, Size = UDim2.new(1 / 3, -7, 1, 0), LayoutOrder = i })
+		text(f, name, { size = 11, weight = W.bold, color = C.mute, height = 14 })
+		local track = new("Frame", { Parent = f, BackgroundColor3 = C.raised, BackgroundTransparency = 0, Size = UDim2.new(1, 0, 0, 6), Position = UDim2.fromOffset(0, 22) }, { corner(3) })
+		return new("Frame", { Parent = track, BackgroundColor3 = color, BackgroundTransparency = 0, Size = UDim2.new(0, 0, 1, 0) }, { corner(3) })
+	end
+	local thrBar = pedalBar("THROTTLE", C.good, 1)
+	local brkBar = pedalBar("BRAKE", C.bad, 2)
+	local cltBar = pedalBar("CLUTCH", C.info, 3)
+
+	local lower = new("Frame", { Parent = tele, Size = UDim2.new(1, 0, 0, 96), LayoutOrder = 4 })
+	local tires = new("Frame", { Parent = lower, Size = UDim2.fromOffset(64, 74) })
+	local cells = {}
+	for i, name in ipairs({ "FL", "FR", "RL", "RR" }) do
+		local col = (i - 1) % 2
+		local row = (i - 1) // 2
+		cells[name] = new("Frame", {
+			Parent = tires,
+			BackgroundColor3 = C.raised,
+			BackgroundTransparency = 0,
+			Size = UDim2.fromOffset(16, 28),
+			Position = UDim2.fromOffset(col * 40 + 4, row * 42 + 2),
+		}, { corner(4) })
+	end
+	new("Frame", { Parent = tires, BackgroundColor3 = C.lineSoft, BackgroundTransparency = 0, Size = UDim2.fromOffset(20, 62), Position = UDim2.fromOffset(22, 6) }, { corner(4) })
+	local stats = new("Frame", { Parent = lower, Size = UDim2.new(1, -84, 1, 0), Position = UDim2.fromOffset(84, 0) }, { vlist(2) })
+	local longG = keyValue(stats, "Long. g", 1)
+	local latG = keyValue(stats, "Lat. g", 2)
+	local aids = keyValue(stats, "Steer", 3)
+	local simCost = keyValue(stats, "Sim cost", 4)
+
+	local idleNote = text(tele, "Telemetry appears once the car is built.", { size = 13, color = C.mute, order = 5, height = 18 })
+
+	-- facts
+	local facts = card(scroll, { order = 3 })
+	vlist(4).Parent = facts
+	sectionLabel(facts, "Session", 0)
+	local fSource = keyValue(facts, "Loader", 1)
+	local fLayout = keyValue(facts, "Layout", 2)
+	local fBuild = keyValue(facts, "Build time", 3)
+	local fAttempts = keyValue(facts, "Attempts", 4)
+	local fTune = keyValue(facts, "Tune", 5)
+
+	-- controls
+	local controls = card(scroll, { order = 4 })
+	vlist(6).Parent = controls
+	sectionLabel(controls, "Controls", 0)
+	local grid = new("Frame", { Parent = controls, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 1 }, {
+		new("UIGridLayout", { CellSize = UDim2.new(0.5, -6, 0, 26), CellPadding = UDim2.fromOffset(12, 4), SortOrder = Enum.SortOrder.LayoutOrder }),
+	})
+	for i, entry in ipairs(CONTROLS) do
+		local cell = new("Frame", { Parent = grid, LayoutOrder = i })
+		local key = new("TextLabel", {
+			Parent = cell,
+			Text = entry[1],
+			FontFace = mono(W.medium),
+			TextSize = 11,
+			TextColor3 = C.text,
+			BackgroundColor3 = C.raised,
+			BackgroundTransparency = 0,
+			Size = UDim2.fromOffset(52, 20),
+			Position = UDim2.fromOffset(0, 3),
+		}, { corner(4), stroke(C.line) })
+		text(cell, entry[2], { size = 12, color = C.dim, position = UDim2.fromOffset(60, 0), sizeUDim = UDim2.new(1, -60, 1, 0) })
+	end
+
+	-- log
+	local logCard = card(scroll, { order = 5 })
+	vlist(6).Parent = logCard
+	local logOpen = Tuning.state.ui.logOpen == true
+	local logToggle = new("TextButton", { Parent = nil, Text = logOpen and "Hide" or "Show", FontFace = font(W.semibold), TextSize = 12, TextColor3 = C.dim, Size = UDim2.fromOffset(44, 20) })
+	sectionLabel(logCard, "Event log", 0, logToggle)
+	local logBody = text(logCard, "", { size = 12, mono = true, color = C.dim, wrap = true, auto = Enum.AutomaticSize.Y, height = 0, order = 1, valign = Enum.TextYAlignment.Top, rich = true })
+	logBody.Visible = logOpen
+	bind(logToggle.Activated, function()
+		logOpen = not logOpen
+		Tuning.state.ui.logOpen = logOpen
+		logToggle.Text = logOpen and "Hide" or "Show"
+		logBody.Visible = logOpen
+	end)
+
+	local LOG_COLORS = { FAILED = "#E45C52", ACTIVE = "#66BE8C", INITIALIZING = "#E2B248", INFO = "#70787C" }
+	local function refresh()
+		local state = CarInit.state
+		local meta = STATE_LABELS[state] or STATE_LABELS.IDLE
+		local layout = CarInit.layout
+		title.Text = CarInit.car and "Car active" or state == "ENDED" and "Car removed" or "No car"
+		subtitle.Text = CarInit.message
+		subtitle.TextColor3 = state == "FAILED" and C.bad or C.dim
+
+		local canBuild = CarInit.canInitialize()
+		local canRebuild = CarInit.canRebuild() and CarInit.layoutDirty
+		if state == "INITIALIZING" then
+			action.setText("Building…")
+			action.setStyle("secondary")
+			action.setEnabled(false)
+			keyHint.Visible = false
+		elseif canRebuild then
+			action.setText("Rebuild chassis")
+			action.setStyle("primary")
+			action.setEnabled(true)
+			keyHint.Visible = false
+		elseif canBuild then
+			action.setText(state == "FAILED" and "Retry build" or "Build car")
+			action.setStyle("primary")
+			action.setEnabled(true)
+			keyHint.Visible = true
+		else
+			action.setText(state == "ACTIVE" and "Car is running" or "Respawn to build again")
+			action.setStyle("secondary")
+			action.setEnabled(false)
+			keyHint.Visible = false
+		end
+
+		fSource.Text = CarInit.loader
+		fLayout.Text = layout and (layout.source or "-") or "-"
+		fBuild.Text = CarInit.buildMs and (CarInit.buildMs .. " ms") or "-"
+		fAttempts.Text = tostring(CarInit.attempts)
+		local changes = Tuning.modifiedCount()
+		fTune.Text = Tuning.presetName() .. (changes > 0 and (" + " .. changes) or "")
+
+		local lines = {}
+		for i = math.max(1, #CarInit.log - 14), #CarInit.log do
+			local e = CarInit.log[i]
+			local color = LOG_COLORS[e.state] or "#A3A6AD"
+			table.insert(lines, string.format('<font color="#707780">%6.2f</font>  <font color="%s">%s</font>', e.t, color, e.message:gsub("&", "&amp;"):gsub("<", "&lt;")))
+		end
+		logBody.Text = #lines > 0 and table.concat(lines, "\n") or '<font color="#707780">Nothing yet</font>'
+	end
+
+	local lastTick = 0
+	local function tick()
+		local now = os.clock()
+		if now - lastTick < 1 / 15 then
+			return
+		end
+		lastTick = now
+		local t = CarInit.telemetry()
+		local live = t ~= nil
+		idleNote.Visible = not live
+		top.Visible, rpmRow.Visible, pedals.Visible, lower.Visible = live, live, live, live
+		if not t then
+			return
+		end
+		speed.Text = string.format("%d", math.floor(t.kmh + 0.5))
+		gear.Text = t.gear < 0 and "R" or t.gear == 0 and "N" or tostring(t.gear)
+		gear.TextColor3 = t.shifting and C.mute or C.text
+		local names = { MANUAL = "Manual", ASSISTED = "Assisted", AUTOMATIC = "Automatic" }
+		box.Text = (names[t.gearbox] or t.gearbox) .. (t.stalled and " · stalled" or "")
+		box.TextColor3 = t.stalled and C.bad or C.mute
+		local maxRpm = math.max(t.redline * 1.08, 1000)
+		rpmText.Text = string.format("%d rpm", math.floor(t.rpm / 10 + 0.5) * 10)
+		rpmFill.Size = UDim2.new(math.clamp(t.rpm / maxRpm, 0, 1), 0, 1, 0)
+		rpmFill.BackgroundColor3 = t.rpm >= t.redline * 0.97 and C.bad or C.text
+		redZone.Position = UDim2.new(t.redline / maxRpm, 0, 0, 0)
+		redZone.Size = UDim2.new(1 - t.redline / maxRpm, 0, 1, 0)
+		thrBar.Size = UDim2.new(t.throttle, 0, 1, 0)
+		brkBar.Size = UDim2.new(t.brake, 0, 1, 0)
+		cltBar.Size = UDim2.new(t.clutch, 0, 1, 0)
+		for name, cell in pairs(cells) do
+			local s = math.clamp((t.slip[name] or 0), 0, 1.2) / 1.2
+			cell.BackgroundColor3 = C.raised:Lerp(s > 0.5 and C.bad or C.warn, math.clamp(s * 1.6, 0, 1))
+		end
+		longG.Text = string.format("%+.2f", t.longG)
+		latG.Text = string.format("%+.2f", t.latG)
+		aids.Text = string.format("%+.2f%s", t.steer, t.tcs and " · TC" or "")
+		simCost.Text = t.simMs and string.format("%.2f ms", t.simMs) or "-"
+	end
+
+	bind(CarInit.changed.Event, refresh)
+	bind(CarInit.layoutChanged.Event, refresh)
+	bind(Tuning.changed.Event, function()
+		if activeTab == "Drive" then
+			refresh()
+		end
+	end)
+	refresh()
+	return refresh, tick
+end
+
+------------------------------------------------------------------------------------------
+-- BUILD
+------------------------------------------------------------------------------------------
+
+local ROLE_ORDER = { "BODY", "TIRE", "RIM", "WHEEL", "DETAIL", "NONE" }
+local ROLE_LABELS = { "Body", "Tire", "Rim", "Wheel", "Detail", "None" }
+
+local LAYOUT_FIELDS = {
+	{ key = "wheelbase", label = "Wheelbase", min = 6, max = 30, step = 0.05 },
+	{ key = "center", label = "Axle offset", min = -6, max = 6, step = 0.05, hint = "Moves both axles forward (−) or back (+) under the body." },
+	{ key = "trackFront", label = "Front track", min = 3, max = 16, step = 0.05 },
+	{ key = "trackRear", label = "Rear track", min = 3, max = 16, step = 0.05 },
+	{ key = "wheelY", label = "Wheel height", min = -8, max = 2, step = 0.02, hint = "Wheel centre height relative to the body centre." },
+	{ key = "radiusFront", label = "Front radius", min = 0.6, max = 5, step = 0.01 },
+	{ key = "radiusRear", label = "Rear radius", min = 0.6, max = 5, step = 0.01 },
+	{ key = "widthFront", label = "Front width", min = 0.3, max = 4, step = 0.01 },
+	{ key = "widthRear", label = "Rear width", min = 0.3, max = 4, step = 0.01 },
+}
+
+local SOURCE_LABELS = {
+	profile = "Saved profile",
+	detected = "Detected from wheels",
+	known = "Stock layout",
+	estimated = "Estimated from body",
+	custom = "Edited",
+}
+
+local function layoutGet(layout, key)
+	if key == "wheelbase" then
+		return layout.rearZ - layout.frontZ
+	elseif key == "center" then
+		return (layout.frontZ + layout.rearZ) / 2
+	end
+	return layout[key]
+end
+
+local function layoutSet(CarInit, layout, key, value)
+	if key == "wheelbase" then
+		local c = (layout.frontZ + layout.rearZ) / 2
+		CarInit.setLayoutField("frontZ", c - value / 2)
+		CarInit.setLayoutField("rearZ", c + value / 2)
+	elseif key == "center" then
+		local wb = layout.rearZ - layout.frontZ
+		CarInit.setLayoutField("frontZ", value - wb / 2)
+		CarInit.setLayoutField("rearZ", value + wb / 2)
+	else
+		CarInit.setLayoutField(key, value)
+	end
+end
+
+-- Compact slider row used by both Build and Tune.
+local function sliderRow(parent, opts)
+	local row = new("Frame", { Parent = parent, Size = UDim2.new(1, 0, 0, 52), LayoutOrder = opts.order or 0 })
+	local marker = new("Frame", {
+		Parent = row,
+		BackgroundColor3 = C.accent,
+		BackgroundTransparency = 0,
+		Size = UDim2.fromOffset(2, 14),
+		Position = UDim2.fromOffset(-8, 4),
+		Visible = false,
+	}, { corner(1) })
+	local lbl = text(row, opts.label, { size = 13, weight = W.medium, color = C.dim, sizeUDim = UDim2.new(1, -170, 0, 22) })
+	attachTooltip(lbl, opts.hint)
+	local unit = text(row, opts.unit or "", { size = 12, color = C.mute, align = Enum.TextXAlignment.Right, position = UDim2.new(1, -168, 0, 0), sizeUDim = UDim2.new(0, 36, 0, 22) })
+	local tag = text(row, "AUTO", { size = 10, weight = W.bold, color = C.info, align = Enum.TextXAlignment.Right, position = UDim2.new(1, -208, 0, 0), sizeUDim = UDim2.new(0, 36, 0, 22), visible = false })
+	local box = input(row, { mono = true, align = Enum.TextXAlignment.Right, size = UDim2.fromOffset(76, 24), position = UDim2.new(1, -126, 0, -1), textSize = 13 })
+	local reset = iconButton(row, "Reset", { size = UDim2.fromOffset(42, 24), position = UDim2.new(1, -42, 0, -1), textSize = 11, visible = false })
+	attachTooltip(reset, "Reset")
+
+	local track = new("TextButton", { Parent = row, Text = "", AutoButtonColor = false, Size = UDim2.new(1, 0, 0, 20), Position = UDim2.fromOffset(0, 28) })
+	local rail = new("Frame", { Parent = track, BackgroundColor3 = C.raised, BackgroundTransparency = 0, Size = UDim2.new(1, 0, 0, 4), AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 0, 0.5, 0) }, { corner(2) })
+	local fill = new("Frame", { Parent = rail, BackgroundColor3 = C.accent, BackgroundTransparency = 0, Size = UDim2.new(0, 0, 1, 0) }, { corner(2) })
+	local knob = new("Frame", {
+		Parent = track,
+		BackgroundColor3 = C.text,
+		BackgroundTransparency = 0,
+		Size = UDim2.fromOffset(14, 14),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0, 0, 0.5, 0),
+		ZIndex = 2,
+	}, { corner(7) })
+	local knobScale = new("UIScale", { Parent = knob })
+
+	local min, max, step = opts.min, opts.max, opts.step
+	local current = opts.value
+	local dragging = false
+
+	local function fraction(v)
+		return math.clamp((v - min) / math.max(max - min, 1e-9), 0, 1)
+	end
+	local function render(v, animate)
+		local f = fraction(v)
+		if animate then
+			tween(fill, { Size = UDim2.new(f, 0, 1, 0) }, 0.2)
+			tween(knob, { Position = UDim2.new(f, 0, 0.5, 0) }, 0.2)
+		else
+			fill.Size = UDim2.new(f, 0, 1, 0)
+			knob.Position = UDim2.new(f, 0, 0.5, 0)
+		end
+		if not box:IsFocused() then
+			box.Text = opts.format and opts.format(v) or formatNumber(v, opts.param)
+		end
+	end
+
+	local function fromX(x)
+		local abs, size = rail.AbsolutePosition.X, rail.AbsoluteSize.X
+		local f = math.clamp((x - abs) / math.max(size, 1), 0, 1)
+		return round(min + f * (max - min), step)
+	end
+
+	bind(track.InputBegan, function(io)
+		if io.UserInputType ~= Enum.UserInputType.MouseButton1 and io.UserInputType ~= Enum.UserInputType.Touch then
+			return
+		end
+		dragging = true
+		tween(knobScale, { Scale = 1.25 }, 0.12)
+		local v = fromX(io.Position.X)
+		current = v
+		render(v, false)
+		opts.onChange(v)
+	end)
+	bind(UserInputService.InputChanged, function(io)
+		if dragging and (io.UserInputType == Enum.UserInputType.MouseMovement or io.UserInputType == Enum.UserInputType.Touch) then
+			local v = fromX(io.Position.X)
+			if v ~= current then
+				current = v
+				render(v, false)
+				opts.onChange(v)
+			end
+		end
+	end)
+	bind(UserInputService.InputEnded, function(io)
+		if dragging and (io.UserInputType == Enum.UserInputType.MouseButton1 or io.UserInputType == Enum.UserInputType.Touch) then
+			dragging = false
+			tween(knobScale, { Scale = 1 }, 0.18)
+			if opts.onCommit then
+				opts.onCommit(current)
+			end
+		end
+	end)
+	bind(box.FocusLost, function()
+		local v = opts.parse and opts.parse(box.Text) or parseNumber(box.Text, opts.param)
+		if v then
+			current = v
+			opts.onChange(v)
+			if opts.onCommit then
+				opts.onCommit(v)
+			end
+		end
+		render(current, true)
+	end)
+	if opts.onReset then
+		bind(reset.Activated, opts.onReset)
+	end
+
+	local api = { instance = row }
+	function api.set(v, modified, auto)
+		if not dragging and v ~= nil then
+			current = v
+			render(v, true)
+		end
+		reset.Visible = modified == true
+		marker.Visible = modified == true
+		lbl.TextColor3 = modified and C.text or C.dim
+		tag.Visible = auto == true
+		unit.Position = UDim2.new(1, -168, 0, 0)
+	end
+	render(current, false)
+	return api
+end
+
+local function buildBuild(page)
+	local CarInit, Tuning, Chassis = deps.CarInit, deps.Tuning, deps.Chassis
+	local scroll = scrollPage(page)
+
+	-- preview -------------------------------------------------------------------------
+	local view = card(scroll, { order = 1, pad = false, size = UDim2.new(1, 0, 0, 232), clip = true })
+	local viewport = new("ViewportFrame", {
+		Parent = view,
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = rgb(23, 24, 27),
+		BackgroundTransparency = 0,
+		Ambient = rgb(150, 150, 155),
+		LightColor = rgb(255, 250, 244),
+		LightDirection = Vector3.new(-0.6, -1, -0.4),
+		Active = true,
+	}, { corner(3) })
+	local camera = new("Camera", { Parent = viewport, FieldOfView = 40 })
+	viewport.CurrentCamera = camera
+	local stage = new("Model", { Parent = viewport })
+	local overlayModel = new("Model", { Parent = viewport })
+	local emptyLabel = text(view, "Waiting for the VFX car…", { size = 13, color = C.mute, align = Enum.TextXAlignment.Center, sizeUDim = UDim2.fromScale(1, 1), z = 3 })
+	local chips = new("Frame", { Parent = view, Size = UDim2.new(1, -20, 0, 26), Position = UDim2.fromOffset(10, 10), ZIndex = 3 }, { hlist(6) })
+	local sourceChip = new("TextLabel", {
+		Parent = chips,
+		Text = "",
+		FontFace = font(W.semibold),
+		TextSize = 12,
+		TextColor3 = C.dim,
+		BackgroundColor3 = C.panel,
+		BackgroundTransparency = 0.15,
+		Size = UDim2.fromOffset(0, 24),
+		AutomaticSize = Enum.AutomaticSize.X,
+		ZIndex = 3,
+	}, { corner(12), padding(0, 10, 0, 10) })
+	local showChassis = Tuning.state.ui.showChassis ~= false
+	local chassisToggle = new("TextButton", {
+		Parent = view,
+		Text = "Chassis",
+		FontFace = font(W.semibold),
+		TextSize = 12,
+		TextColor3 = showChassis and C.accentText or C.dim,
+		BackgroundColor3 = showChassis and C.accent or C.panel,
+		BackgroundTransparency = 0.1,
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -10, 0, 10),
+		Size = UDim2.fromOffset(70, 24),
+		ZIndex = 3,
+		AutoButtonColor = false,
+	}, { corner(12) })
+	text(view, "Drag to orbit · scroll to zoom", { size = 11, color = C.faint, align = Enum.TextXAlignment.Right, position = UDim2.new(0, 10, 1, -22), sizeUDim = UDim2.new(1, -20, 0, 14), z = 3 })
+
+	-- wide panels: viewport fills the left, controls get a fixed column on the right
+	local SIDE = 360
+	local function relayout()
+		local width = page.AbsoluteSize.X / (gui:FindFirstChildOfClass("UIScale") and gui:FindFirstChildOfClass("UIScale").Scale or 1)
+		if width >= 760 then
+			view.Parent = page
+			view.Size = UDim2.new(1, -SIDE - PAD * 2, 1, -12)
+			view.Position = UDim2.fromOffset(PAD, 0)
+			scroll.Size = UDim2.new(0, SIDE + PAD, 1, 0)
+			scroll.Position = UDim2.new(1, -SIDE - PAD, 0, 0)
+			local pad = scroll:FindFirstChildOfClass("UIPadding")
+			pad.PaddingLeft = UDim.new(0, 0)
+		else
+			view.Parent = scroll
+			view.Size = UDim2.new(1, 0, 0, 232)
+			view.Position = UDim2.new()
+			scroll.Size = UDim2.fromScale(1, 1)
+			scroll.Position = UDim2.new()
+			local pad = scroll:FindFirstChildOfClass("UIPadding")
+			pad.PaddingLeft = UDim.new(0, PAD)
+		end
+	end
+	bind(page:GetPropertyChangedSignal("AbsoluteSize"), relayout)
+	task.defer(relayout)
+
+	local yaw, pitch, distance = math.rad(-140), math.rad(-16), 30
+	local zoomLow, zoomHigh = 8, 120
+	local focus = Vector3.zero
+	local function placeCamera()
+		camera.CFrame = CFrame.new(focus) * CFrame.Angles(0, yaw, 0) * CFrame.Angles(pitch, 0, 0) * CFrame.new(0, 0, distance)
+	end
+	placeCamera()
+
+	bind(viewport.InputBegan, function(io)
+		if io.UserInputType ~= Enum.UserInputType.MouseButton1 and io.UserInputType ~= Enum.UserInputType.Touch then
+			return
+		end
+		local last = io.Position
+		local move
+		move = UserInputService.InputChanged:Connect(function(change)
+			if change.UserInputType == Enum.UserInputType.MouseMovement or change.UserInputType == Enum.UserInputType.Touch then
+				local d = change.Position - last
+				last = change.Position
+				yaw -= d.X * 0.01
+				pitch = math.clamp(pitch - d.Y * 0.008, -1.35, 0.3)
+				placeCamera()
+			end
+		end)
+		local ended
+		ended = io.Changed:Connect(function()
+			if io.UserInputState == Enum.UserInputState.End then
+				move:Disconnect()
+				ended:Disconnect()
+			end
+		end)
+	end)
+	bind(viewport.InputChanged, function(io)
+		if io.UserInputType == Enum.UserInputType.MouseWheel then
+			distance = math.clamp(distance * (1 - io.Position.Z * 0.1), zoomLow, zoomHigh)
+			placeCamera()
+		end
+	end)
+
+	-- parts ---------------------------------------------------------------------------
+	local partsCard = card(scroll, { order = 2 })
+	vlist(10).Parent = partsCard
+	local partsTools = new("Frame", { Size = UDim2.fromOffset(170, 22) }, { hlist(6, nil, Enum.HorizontalAlignment.Right) })
+	sectionLabel(partsCard, "Meshes", 0, partsTools)
+	local autoBtn = button(partsTools, "Auto-assign", { style = "ghost", size = UDim2.fromOffset(0, 22), auto = Enum.AutomaticSize.X, textSize = 12, order = 1 })
+	local rescanBtn = button(partsTools, "Rescan", { style = "ghost", size = UDim2.fromOffset(0, 22), auto = Enum.AutomaticSize.X, textSize = 12, order = 2 })
+	local partList = new("Frame", { Parent = partsCard, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 1 }, { vlist(2) })
+	local roleBar = segmented(partsCard, ROLE_ORDER, ROLE_LABELS, nil, nil, { order = 2, textSize = 12 })
+	local roleHint = text(partsCard, "Select a mesh to assign its role.", { size = 12, color = C.mute, order = 3, wrap = true, auto = Enum.AutomaticSize.Y, height = 0 })
+
+	-- layout --------------------------------------------------------------------------
+	local layoutCard = card(scroll, { order = 3 })
+	vlist(6).Parent = layoutCard
+	local layoutTools = new("Frame", { Size = UDim2.fromOffset(190, 22) }, { hlist(6, nil, Enum.HorizontalAlignment.Right) })
+	sectionLabel(layoutCard, "Wheel layout", 0, layoutTools)
+	local saveProfileBtn = button(layoutTools, "Save profile", { style = "ghost", size = UDim2.fromOffset(0, 22), auto = Enum.AutomaticSize.X, textSize = 12, order = 1 })
+	local redetectBtn = button(layoutTools, "Re-detect", { style = "ghost", size = UDim2.fromOffset(0, 22), auto = Enum.AutomaticSize.X, textSize = 12, order = 2 })
+	local summary = text(layoutCard, "", { size = 12, mono = true, color = C.dim, order = 1, height = 16 })
+	local sliders = {}
+	for i, field in ipairs(LAYOUT_FIELDS) do
+		sliders[field.key] = sliderRow(layoutCard, {
+			label = field.label,
+			unit = "st",
+			min = field.min,
+			max = field.max,
+			step = field.step,
+			value = 0,
+			order = i + 1,
+			hint = field.hint,
+			param = { step = field.step },
+			onChange = function(v)
+				local layout = CarInit.layout
+				if layout then
+					layoutSet(CarInit, layout, field.key, v)
+				end
+			end,
+		})
+	end
+	local dirtyNote = text(layoutCard, "Layout changed - rebuild the chassis to apply it to the running car.", { size = 12, color = C.warn, order = 50, wrap = true, auto = Enum.AutomaticSize.Y, height = 0, visible = false })
+	local rebuildBtn = button(layoutCard, "Rebuild chassis", { style = "primary", order = 51 })
+	rebuildBtn.instance.Visible = false
+	bind(rebuildBtn.instance.Activated, function()
+		local ok, why = CarInit.rebuild()
+		if not ok then
+			UI.notify("info", why)
+		end
+	end)
+
+	-- preview contents ----------------------------------------------------------------
+	local selected
+	local previewParts = {}
+	local rows = {}
+
+	local function line(a, b, color, thickness)
+		local len = (b - a).Magnitude
+		if len < 1e-3 then
+			return
+		end
+		new("Part", {
+			Parent = overlayModel,
+			Anchored = true,
+			Material = Enum.Material.SmoothPlastic,
+			Color = color,
+			Size = Vector3.new(thickness, thickness, len),
+			CFrame = CFrame.lookAt((a + b) / 2, b),
+			Transparency = 0.05,
+		})
+	end
+
+	local function drawChassis()
+		overlayModel:ClearAllChildren()
+		local layout = CarInit.layout
+		if not (layout and showChassis) then
+			return
+		end
+		local origin = CFrame.new(0, layout.wheelY, (layout.frontZ + layout.rearZ) / 2)
+		local col = C.accent
+		local soft = rgb(214, 216, 222)
+		local t = math.max(layout.radiusFront * 0.05, 0.06)
+		local function P(v)
+			return origin:PointToWorldSpace(v)
+		end
+		for _, name in ipairs(Chassis.ORDER) do
+			local pts = Chassis.corner(layout, name)
+			line(P(pts.hubStrut), P(pts.strutTop), col, t * 1.6)
+			for _, link in ipairs(pts.links) do
+				line(P(link.hub), P(link.body), soft, t)
+			end
+			if pts.steerArm and pts.rackEnd then
+				line(P(pts.steerArm), P(pts.rackEnd), rgb(226, 178, 72), t)
+			end
+			local width = pts.front and layout.widthFront or layout.widthRear
+			new("Part", {
+				Parent = overlayModel,
+				Anchored = true,
+				Shape = Enum.PartType.Cylinder,
+				Size = Vector3.new(width * 1.02, pts.radius * 2, pts.radius * 2),
+				CFrame = CFrame.new(P(pts.center)),
+				Color = col,
+				Transparency = 0.82,
+				Material = Enum.Material.SmoothPlastic,
+			})
+		end
+		local fl, fr = Chassis.corner(layout, "FL"), Chassis.corner(layout, "FR")
+		local rl, rr = Chassis.corner(layout, "RL"), Chassis.corner(layout, "RR")
+		line(P(fl.center), P(fr.center), soft, t * 0.8)
+		line(P(rl.center), P(rr.center), soft, t * 0.8)
+		if fl.rackEnd then
+			line(P(fl.rackEnd), P(fr.rackEnd), rgb(226, 178, 72), t * 1.4)
+		end
+	end
+
+	local function paintSelection()
+		for part, info in pairs(previewParts) do
+			local dim = selected ~= nil and info.id ~= selected
+			part.LocalTransparencyModifier = dim and 0.85 or 0
+		end
+	end
+
+	local function rebuildPreview()
+		stage:ClearAllChildren()
+		table.clear(previewParts)
+		local scan = CarInit.scan
+		local layout = CarInit.layout
+		if not scan or not scan.folder then
+			emptyLabel.Text = "No VFX car found for the run token."
+			emptyLabel.Visible = true
+			drawChassis()
+			return
+		end
+		local body
+		for _, id in ipairs(scan.order) do
+			if CarInit.roleOf(id) == "BODY" then
+				body = scan.groups[id].parts[1]
+			end
+		end
+		local bodyFrame = body and body.CFrame or CFrame.new()
+		local placedWheels = {}
+		local count = 0
+		for _, id in ipairs(scan.order) do
+			local group = scan.groups[id]
+			local role, side = CarInit.roleOf(id)
+			for _, part in ipairs(group.parts) do
+				local isWheel = role == "TIRE" or role == "RIM" or role == "WHEEL"
+				if not (isWheel and layout) then
+					local copy = part:Clone()
+					if copy then
+						for _, child in ipairs(copy:GetChildren()) do
+							if not (child:IsA("SpecialMesh") or child:IsA("SurfaceAppearance") or child:IsA("Decal") or child:IsA("Texture")) then
+								child:Destroy()
+							end
+						end
+						copy.Anchored = true
+						copy.CFrame = bodyFrame:ToObjectSpace(part.CFrame)
+						copy.Parent = stage
+						previewParts[copy] = { id = id }
+						count += 1
+					end
+				end
+			end
+			-- wheels are drawn where the layout puts them
+			if layout and (role == "TIRE" or role == "RIM" or role == "WHEEL") then
+				local template = group.parts[1]
+				for _, name in ipairs(Chassis.ORDER) do
+					local info = Chassis.CORNERS[name]
+					local wantSide = info.side < 0 and "L" or "R"
+					local partSide = side or (bodyFrame:PointToObjectSpace(template.Position).X < 0 and "L" or "R")
+					local key = name .. role
+					if partSide == wantSide and not placedWheels[key] then
+						placedWheels[key] = true
+						local half = (info.front and layout.trackFront or layout.trackRear) / 2
+						local copy = template:Clone()
+						for _, child in ipairs(copy:GetChildren()) do
+							if not (child:IsA("SpecialMesh") or child:IsA("SurfaceAppearance") or child:IsA("Decal") or child:IsA("Texture")) then
+								child:Destroy()
+							end
+						end
+						copy.Anchored = true
+						copy.CFrame = CFrame.new(info.side * half, layout.wheelY, info.front and layout.frontZ or layout.rearZ)
+						copy.Parent = stage
+						previewParts[copy] = { id = id }
+						count += 1
+					end
+				end
+			end
+		end
+		emptyLabel.Visible = count == 0
+		emptyLabel.Text = count == 0 and "The VFX folder has no mesh parts." or ""
+		if layout then
+			local size = layout.bodySize or Vector3.new(10, 6, 23)
+			focus = Vector3.new(0, layout.wheelY * 0.4, (layout.frontZ + layout.rearZ) / 4)
+			distance = math.clamp(size.Magnitude * 1.25, zoomLow, zoomHigh)
+			placeCamera()
+		end
+		paintSelection()
+		drawChassis()
+	end
+
+	local function paintRows()
+		for id, row in pairs(rows) do
+			local role = CarInit.roleOf(id)
+			local color = role and ROLE_COLORS[role] or C.faint
+			tween(row.button, { BackgroundColor3 = id == selected and C.hover or C.surface }, 0.14)
+			row.dot.BackgroundColor3 = color
+			row.tag.Text = role and (role:sub(1, 1) .. role:sub(2):lower()) or "Unassigned"
+			row.tag.TextColor3 = role and color or C.mute
+		end
+		local role = selected and CarInit.roleOf(selected)
+		roleBar.set(selected and (role or "NONE") or nil)
+		roleHint.Text = selected and ("Mesh " .. shortId(selected) .. (CarInit.hasCustom() and "" or " · using built-in roles; any change switches to a custom definition"))
+			or "Select a mesh to assign its role. Tire + rim, or one wheel mesh per corner."
+	end
+
+	local function buildRows()
+		for _, child in ipairs(partList:GetChildren()) do
+			if child:IsA("GuiObject") then
+				child:Destroy()
+			end
+		end
+		table.clear(rows)
+		local scan = CarInit.scan
+		if not scan or #scan.order == 0 then
+			text(partList, scan and scan.folder and "No mesh parts found." or "No VFX folder yet. Trigger the car move, then Rescan.", { size = 13, color = C.mute, height = 28, wrap = true })
+			return
+		end
+		for i, id in ipairs(scan.order) do
+			local group = scan.groups[id]
+			local b = new("TextButton", {
+				Parent = partList,
+				Text = "",
+				Size = UDim2.new(1, 0, 0, 30),
+				BackgroundColor3 = C.surface,
+				BackgroundTransparency = 0,
+				AutoButtonColor = false,
+				LayoutOrder = i,
+			}, { corner(6) })
+			local dot = new("Frame", { Parent = b, Size = UDim2.fromOffset(8, 8), AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 10, 0.5, 0), BackgroundTransparency = 0 }, { corner(4) })
+			local size = group.size
+			text(b, shortId(id), { size = 13, mono = true, weight = W.medium, position = UDim2.fromOffset(26, 0), sizeUDim = UDim2.new(0.45, -26, 1, 0) })
+			text(b, ("×%d%s"):format(#group.parts, size and string.format("  %.1f×%.1f×%.1f", size.X, size.Y, size.Z) or ""), { size = 12, mono = true, color = C.mute, position = UDim2.new(0.45, 0, 0, 0), sizeUDim = UDim2.new(0.33, 0, 1, 0) })
+			local tag = text(b, "", { size = 12, weight = W.semibold, align = Enum.TextXAlignment.Right, position = UDim2.new(0.78, 0, 0, 0), sizeUDim = UDim2.new(0.22, -10, 1, 0) })
+			bind(b.MouseEnter, function()
+				if id ~= selected then
+					tween(b, { BackgroundColor3 = C.raised }, 0.1)
+				end
+			end)
+			bind(b.MouseLeave, function()
+				tween(b, { BackgroundColor3 = id == selected and C.hover or C.surface }, 0.16)
+			end)
+			bind(b.Activated, function()
+				selected = selected ~= id and id or nil
+				paintRows()
+				paintSelection()
+			end)
+			rows[id] = { button = b, dot = dot, tag = tag }
+		end
+		paintRows()
+	end
+
+	local function refreshLayout()
+		local layout = CarInit.layout
+		for _, field in ipairs(LAYOUT_FIELDS) do
+			local slider = sliders[field.key]
+			slider.instance.Visible = layout ~= nil
+			if layout then
+				slider.set(layoutGet(layout, field.key), false, false)
+			end
+		end
+		if layout then
+			local S = 0.28
+			summary.Text = string.format("wb %.2f m · track %.2f/%.2f m · tire Ø %.2f m", (layout.rearZ - layout.frontZ) * S, layout.trackFront * S, layout.trackRear * S, layout.radiusFront * 2 * S)
+			sourceChip.Text = SOURCE_LABELS[layout.source] or "Layout"
+		else
+			summary.Text = "Layout resolves once a body mesh is assigned."
+			sourceChip.Text = "No layout"
+		end
+		local dirty = CarInit.layoutDirty and CarInit.canRebuild()
+		dirtyNote.Visible = dirty
+		rebuildBtn.instance.Visible = dirty
+	end
+
+	local scanning = false
+	local function rescan(forceLayout)
+		if scanning then
+			return
+		end
+		scanning = true
+		task.spawn(function()
+			local ok, err = pcall(function()
+				if CarInit.canInitialize() or not CarInit.scan then
+					CarInit.scanFolder()
+				end
+				CarInit.resolveLayout(forceLayout)
+			end)
+			scanning = false
+			if not ok then
+				warn("Build preview: " .. tostring(err))
+			end
+			buildRows()
+			refreshLayout()
+			rebuildPreview()
+		end)
+	end
+
+	bind(autoBtn.instance.Activated, function()
+		if not CarInit.canInitialize() then
+			UI.notify("info", "Roles are locked once the car is built")
+			return
+		end
+		if CarInit.autoAssign() then
+			UI.notify("ok", "Roles assigned from mesh shapes")
+		else
+			UI.notify("warn", "Could not tell the parts apart - assign them by hand")
+		end
+	end)
+	bind(rescanBtn.instance.Activated, function()
+		rescan(true)
+	end)
+	bind(saveProfileBtn.instance.Activated, function()
+		if CarInit.saveProfile() then
+			UI.notify("ok", Tuning.hasFiles() and "Layout saved for this body" or "Layout saved for this session")
+		else
+			UI.notify("info", "Nothing to save yet")
+		end
+	end)
+	bind(redetectBtn.instance.Activated, function()
+		task.spawn(function()
+			CarInit.forgetProfile()
+			refreshLayout()
+			rebuildPreview()
+		end)
+	end)
+	bind(chassisToggle.Activated, function()
+		showChassis = not showChassis
+		Tuning.state.ui.showChassis = showChassis
+		tween(chassisToggle, { BackgroundColor3 = showChassis and C.accent or C.panel, TextColor3 = showChassis and C.accentText or C.dim }, 0.16)
+		drawChassis()
+	end)
+
+	roleBar.setHandler(function(role)
+		if not selected then
+			UI.notify("info", "Select a mesh first")
+			roleBar.set(nil)
+			return
+		end
+		if not CarInit.canInitialize() then
+			UI.notify("info", "Roles are locked once the car is built")
+			paintRows()
+			return
+		end
+		if not CarInit.hasCustom() then
+			-- seed the custom definition with the built-in roles so nothing is lost
+			for _, id in ipairs(CarInit.scan and CarInit.scan.order or {}) do
+				local r = CarInit.roleOf(id)
+				CarInit.roles[id] = r
+			end
+		end
+		CarInit.setRole(selected, role ~= "NONE" and role or nil)
+	end)
+
+	local pendingLayout = false
+	bind(CarInit.layoutChanged.Event, function()
+		refreshLayout()
+		if pendingLayout then
+			return
+		end
+		pendingLayout = true
+		task.delay(0.05, function()
+			pendingLayout = false
+			rebuildPreview()
+		end)
+	end)
+	bind(CarInit.rolesChanged.Event, function()
+		paintRows()
+		task.spawn(function()
+			pcall(CarInit.resolveLayout, true)
+			refreshLayout()
+			rebuildPreview()
+		end)
+	end)
+	bind(CarInit.changed.Event, function()
+		refreshLayout()
+	end)
+
+	local loaded = false
+	return function()
+		if not loaded then
+			loaded = true
+			rescan(false)
+		else
+			refreshLayout()
+		end
+	end
+end
+
+------------------------------------------------------------------------------------------
+-- TUNE
+------------------------------------------------------------------------------------------
+
+local function buildTune(page)
+	local Tuning, Spec = deps.Tuning, deps.Spec
+	local ui = Tuning.state.ui
+	ui.tier = ui.tier or "basic"
+	ui.section = ui.section or "overview"
+
+	-- header: preset, tier, search
+	local header = new("Frame", { Parent = page, Size = UDim2.new(1, 0, 0, 112), BackgroundTransparency = 1 }, { padding(4, PAD, 0, PAD) })
+	local presetOptions = function()
+		local out = {}
+		for _, p in ipairs(Spec.presets) do
+			table.insert(out, { value = p.name, label = p.name, sub = p.note and #p.note < 26 and p.note or nil })
+		end
+		return out
+	end
+	text(header, "PRESET", { size = 11, weight = W.bold, color = C.mute, height = 14 })
+	local presetPick = dropdown(header, presetOptions, Tuning.presetName(), function(name)
+		Tuning.applyPreset(name)
+		UI.notify("ok", "Preset: " .. name)
+	end, { size = UDim2.new(0.55, -6, 0, 30), position = UDim2.fromOffset(0, 18), popupWidth = 260 })
+	text(header, "DETAIL", { size = 11, weight = W.bold, color = C.mute, position = UDim2.new(0.55, 6, 0, 0), sizeUDim = UDim2.new(0.45, -6, 0, 14) })
+	local tierPick = segmented(header, { "basic", "advanced" }, { "Basic", "Advanced" }, ui.tier, nil, { size = UDim2.new(0.45, -6, 0, 30), position = UDim2.new(0.55, 6, 0, 18) })
+	local search = input(header, { placeholder = "Search parameters", size = UDim2.new(1, 0, 0, 30), position = UDim2.fromOffset(0, 56) })
+	search.Parent = header
+	local resultNote = text(header, "", { size = 11, color = C.mute, position = UDim2.fromOffset(0, 90), height = 14 })
+
+	-- section chips
+	local chipBar = new("ScrollingFrame", {
+		Parent = page,
+		Size = UDim2.new(1, 0, 0, 34),
+		Position = UDim2.fromOffset(0, 112),
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.X,
+		ScrollingDirection = Enum.ScrollingDirection.X,
+		ScrollBarThickness = 0,
+		BackgroundTransparency = 1,
+	}, { padding(2, PAD, 4, PAD), hlist(6) })
+	local sectionList = { { id = "overview", label = "Overview" } }
+	for _, s in ipairs(Spec.sections) do
+		table.insert(sectionList, s)
+	end
+	table.insert(sectionList, { id = "expert", label = "Expert" })
+	local chips = {}
+
+	local bodyHolder = new("Frame", { Parent = page, Size = UDim2.new(1, 0, 1, -146 - 58), Position = UDim2.fromOffset(0, 146), ClipsDescendants = true })
+	new("Frame", { Parent = page, BackgroundColor3 = C.lineSoft, BackgroundTransparency = 0, Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 0, 146) })
+
+	-- footer: configs
+	local footer = new("Frame", { Parent = page, BackgroundColor3 = C.panel, BackgroundTransparency = 0, Size = UDim2.new(1, 0, 0, 58), Position = UDim2.new(0, 0, 1, -58) }, { padding(12, PAD, 14, PAD) })
+	new("Frame", { Parent = footer, BackgroundColor3 = C.lineSoft, BackgroundTransparency = 0, Size = UDim2.new(1, 2 * PAD, 0, 1), Position = UDim2.new(0, -PAD, 0, -12) })
+	local footerRow = new("Frame", { Parent = footer, Size = UDim2.fromScale(1, 1) }, { hlist(6) })
+	local configName = input(footerRow, { placeholder = "Config name", size = UDim2.new(1, -244, 1, 0), order = 1 })
+	local saveBtn = button(footerRow, "Save", { size = UDim2.fromOffset(52, 32), order = 2, textSize = 13 })
+	local loadBtn = button(footerRow, "Load", { size = UDim2.fromOffset(52, 32), order = 3, textSize = 13 })
+	local shareBtn = button(footerRow, "Share", { size = UDim2.fromOffset(58, 32), order = 4, textSize = 13 })
+	local resetBtn = button(footerRow, "Reset", { style = "danger", size = UDim2.fromOffset(58, 32), order = 5, textSize = 13 })
+
+	local body -- current scrolling frame
+	local rowRefs = {} -- id -> refresh fn
+	local derivedRefs = {} -- refresh fns that depend on everything
+	local currentSection = ui.section
+
+	local function sectionModified(id)
+		if id == "overview" then
+			return Tuning.modifiedCount() > 0
+		elseif id == "expert" then
+			local n = 0
+			for _ in pairs(Tuning.state.raw) do
+				n += 1
+			end
+			return n > 0
+		end
+		return Tuning.modifiedCount(id) > 0
+	end
+
+	local function paintChips(animate)
+		for id, chip in pairs(chips) do
+			local on = id == currentSection
+			local t = animate and 0.16 or 0
+			tween(chip.button, { BackgroundColor3 = on and C.text or C.raised, TextColor3 = on and C.panel or C.dim }, t)
+			chip.dot.Visible = sectionModified(id)
+			chip.dot.BackgroundColor3 = on and C.accent or C.accent
+		end
+	end
+
+	-- row builders -------------------------------------------------------------------
+
+	local function paramValueChanged(param)
+		local fn = rowRefs[param.id]
+		if fn then
+			fn()
+		end
+	end
+
+	local function numberRow(parent, param, order)
+		local slider = sliderRow(parent, {
+			label = param.label,
+			unit = param.display == "percent" and "%" or param.unit,
+			min = param.min,
+			max = param.max,
+			step = param.step,
+			value = Tuning.get(param.id),
+			order = order,
+			hint = param.hint,
+			param = param,
+			onChange = function(v)
+				Tuning.set(param.id, v)
+			end,
+			onReset = function()
+				Tuning.reset(param.id)
+			end,
+		})
+		rowRefs[param.id] = function()
+			slider.set(Tuning.get(param.id), Tuning.isModified(param.id), Tuning.isAuto(param.id))
+		end
+		rowRefs[param.id]()
+	end
+
+	local function simpleRow(parent, param, order, height)
+		local row = new("Frame", { Parent = parent, Size = UDim2.new(1, 0, 0, height or 34), LayoutOrder = order })
+		local marker = new("Frame", { Parent = row, BackgroundColor3 = C.accent, BackgroundTransparency = 0, Size = UDim2.fromOffset(2, 14), Position = UDim2.fromOffset(-8, 9), Visible = false }, { corner(1) })
+		local lbl = text(row, param.label, { size = 13, weight = W.medium, color = C.dim, sizeUDim = UDim2.new(0.42, 0, 0, 32) })
+		attachTooltip(lbl, param.hint)
+		local reset = iconButton(row, "Reset", { size = UDim2.fromOffset(42, 24), position = UDim2.new(1, -42, 0, 4), textSize = 11, visible = false })
+		bind(reset.Activated, function()
+			Tuning.reset(param.id)
+		end)
+		return row, function(modified)
+			marker.Visible = modified
+			reset.Visible = modified
+			lbl.TextColor3 = modified and C.text or C.dim
+		end
+	end
+
+	local function boolRow(parent, param, order)
+		local row, mark = simpleRow(parent, param, order)
+		local sw = toggle(row, Tuning.get(param.id) == true, function(v)
+			Tuning.set(param.id, v)
+		end, { anchor = Vector2.new(1, 0.5), position = UDim2.new(1, -50, 0, 16) })
+		rowRefs[param.id] = function()
+			sw.set(Tuning.get(param.id) == true)
+			mark(Tuning.isModified(param.id))
+		end
+		rowRefs[param.id]()
+	end
+
+	local function enumRow(parent, param, order)
+		local row, mark = simpleRow(parent, param, order)
+		local control
+		if #param.options <= 3 then
+			control = segmented(row, param.options, param.labels, Tuning.get(param.id), function(v)
+				Tuning.set(param.id, v)
+			end, { size = UDim2.new(0.58, -50, 0, 28), position = UDim2.new(0.42, 0, 0, 3), textSize = 12 })
+		else
+			control = dropdown(row, function()
+				local out = {}
+				for i, o in ipairs(param.options) do
+					table.insert(out, { value = o, label = param.labels and param.labels[i] or o })
+				end
+				return out
+			end, Tuning.get(param.id), function(v)
+				Tuning.set(param.id, v)
+			end, { size = UDim2.new(0.58, -50, 0, 28), position = UDim2.new(0.42, 0, 0, 3) })
+		end
+		rowRefs[param.id] = function()
+			control.set(Tuning.get(param.id))
+			mark(Tuning.isModified(param.id))
+		end
+		rowRefs[param.id]()
+	end
+
+	local function packRow(parent, param, order)
+		local row, mark = simpleRow(parent, param, order)
+		local function options()
+			local out = { { value = "auto", label = "Automatic", sub = "best match" } }
+			for _, pack in ipairs(Tuning.packs()) do
+				table.insert(out, { value = pack.key, label = pack.label, sub = #pack.layers .. " loops" })
+			end
+			return out
+		end
+		local control = dropdown(row, options, Tuning.get(param.id), function(v)
+			Tuning.set(param.id, v)
+		end, { size = UDim2.new(0.58, -50, 0, 28), position = UDim2.new(0.42, 0, 0, 3), popupWidth = 300, empty = "No engine loops in CarSounds" })
+		rowRefs[param.id] = function()
+			control.set(Tuning.get(param.id))
+			mark(Tuning.isModified(param.id))
+		end
+		rowRefs[param.id]()
+	end
+
+	local function soundRow(parent, param, order)
+		local row, mark = simpleRow(parent, param, order)
+		local box = input(row, { size = UDim2.new(0.58, -50, 0, 28), position = UDim2.new(0.42, 0, 0, 3), placeholder = "Name or asset id", textSize = 12 })
+		local function show()
+			local v = Tuning.get(param.id)
+			box.Text = (v == "rbxassetid://0" or v == nil) and "" or tostring(v)
+		end
+		local suggestionToken = 0
+		bind(box.Focused, function()
+			suggestionToken += 1
+		end)
+		bind(box:GetPropertyChangedSignal("Text"), function()
+			if not box:IsFocused() then
+				return
+			end
+			suggestionToken += 1
+			local mine = suggestionToken
+			task.delay(0.15, function()
+				if mine ~= suggestionToken or not box:IsFocused() then
+					return
+				end
+				local found = Tuning.searchSounds(box.Text, 8)
+				if #found == 0 then
+					if closePopup then
+						closePopup()
+					end
+					return
+				end
+				openPopup(box, function(list)
+					for i, name in ipairs(found) do
+						menuItem(list, name, false, function()
+							Tuning.set(param.id, name)
+							show()
+						end, function()
+							if closePopup then
+								closePopup()
+							end
+						end, i)
+					end
+					return #found
+				end)
+			end)
+		end)
+		bind(box.FocusLost, function(enter)
+			task.delay(0.15, function()
+				if box:IsFocused() then
+					return
+				end
+				if box.Text ~= "" and not Tuning.set(param.id, box.Text) then
+					UI.notify("warn", "Unknown sound: " .. box.Text)
+				elseif box.Text == "" then
+					Tuning.set(param.id, "rbxassetid://0")
+				end
+				show()
+			end)
+		end)
+		rowRefs[param.id] = function()
+			if not box:IsFocused() then
+				show()
+			end
+			mark(Tuning.isModified(param.id))
+		end
+		rowRefs[param.id]()
+	end
+
+	local function gearsRow(parent, param, order)
+		local holder = new("Frame", { Parent = parent, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = order }, { vlist(6) })
+		local headRow, mark = simpleRow(holder, param, 1, 30)
+		local list = new("Frame", { Parent = holder, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 2 }, { vlist(4) })
+		local gen = new("Frame", { Parent = holder, BackgroundColor3 = C.raised, BackgroundTransparency = 0, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 3 }, { corner(6), padding(10), vlist(8) })
+		text(gen, "GENERATE A SET", { size = 11, weight = W.bold, color = C.mute, height = 14, order = 0 })
+		local genRow = new("Frame", { Parent = gen, Size = UDim2.new(1, 0, 0, 44), LayoutOrder = 1 }, { hlist(6, Enum.VerticalAlignment.Top) })
+		local function genField(label, value, i)
+			local f = new("Frame", { Parent = genRow, Size = UDim2.new(0.25, -5, 1, 0), LayoutOrder = i })
+			text(f, label, { size = 11, color = C.mute, height = 14 })
+			local b = input(f, { text = value, mono = true, size = UDim2.new(1, 0, 0, 26), position = UDim2.fromOffset(0, 16), textSize = 12, align = Enum.TextXAlignment.Center })
+			return b
+		end
+		local gears = Tuning.get(param.id)
+		local gCount = genField("Gears", tostring(#gears), 1)
+		local gFirst = genField("1st", string.format("%.2f", gears[1]), 2)
+		local gTop = genField("Top", string.format("%.2f", gears[#gears]), 3)
+		local gSpread = genField("Spacing", "0.8", 4)
+		attachTooltip(gSpread, "0 = even steps, higher = tighter top gears")
+		local genBtn = button(gen, "Generate", { size = UDim2.new(1, 0, 0, 30), order = 2, textSize = 13 })
+		bind(genBtn.instance.Activated, function()
+			local n, first, topR, spread = tonumber(gCount.Text), tonumber(gFirst.Text), tonumber(gTop.Text), tonumber(gSpread.Text)
+			if not (n and first and topR and spread) or first <= topR then
+				UI.notify("warn", "1st must be a larger ratio than top")
+				return
+			end
+			Tuning.set(param.id, Spec.generateGears(n, first, topR, spread))
+		end)
+
+		local function render()
+			for _, child in ipairs(list:GetChildren()) do
+				if child:IsA("GuiObject") then
+					child:Destroy()
+				end
+			end
+			local values = Tuning.get(param.id)
+			local readouts = Tuning.readouts()
+			local speeds = readouts and readouts.gearSpeeds or {}
+			local top = 1
+			for _, s in ipairs(speeds) do
+				top = math.max(top, s)
+			end
+			for i, ratio in ipairs(values) do
+				local r = new("Frame", { Parent = list, Size = UDim2.new(1, 0, 0, 28), LayoutOrder = i })
+				text(r, "Gear " .. i, { size = 13, color = C.dim, sizeUDim = UDim2.new(0, 56, 1, 0) })
+				local b = input(r, { text = string.format("%.2f", ratio), mono = true, align = Enum.TextXAlignment.Center, size = UDim2.fromOffset(64, 26), position = UDim2.fromOffset(60, 1), textSize = 12 })
+				local barBg = new("Frame", { Parent = r, BackgroundColor3 = C.raised, BackgroundTransparency = 0, Size = UDim2.new(1, -218, 0, 6), Position = UDim2.new(0, 134, 0.5, -3) }, { corner(3) })
+				local bar = new("Frame", { Parent = barBg, BackgroundColor3 = C.accent, BackgroundTransparency = 0.15, Size = UDim2.new(0, 0, 1, 0) }, { corner(3) })
+				tween(bar, { Size = UDim2.new((speeds[i] or 0) / top, 0, 1, 0) }, 0.3)
+				text(r, speeds[i] and string.format("%d km/h", speeds[i]) or "", { size = 12, mono = true, color = C.mute, align = Enum.TextXAlignment.Right, position = UDim2.new(1, -78, 0, 0), sizeUDim = UDim2.new(0, 50, 1, 0) })
+				local del = iconButton(r, "×", { size = UDim2.fromOffset(24, 24), position = UDim2.new(1, -24, 0, 2), visible = #values > 1 })
+				bind(del.Activated, function()
+					local copy = table.clone(values)
+					table.remove(copy, i)
+					Tuning.set(param.id, copy)
+				end)
+				bind(b.FocusLost, function()
+					local v = tonumber(b.Text)
+					if v and v > 0 then
+						local copy = table.clone(values)
+						copy[i] = v
+						Tuning.set(param.id, copy)
+					else
+						b.Text = string.format("%.2f", ratio)
+					end
+				end)
+			end
+			if #values < 10 then
+				local add = button(list, "Add gear", { style = "ghost", size = UDim2.new(1, 0, 0, 26), order = 99, textSize = 12 })
+				bind(add.instance.Activated, function()
+					local copy = table.clone(values)
+					table.insert(copy, math.floor(copy[#copy] * 0.82 * 100 + 0.5) / 100)
+					Tuning.set(param.id, copy)
+				end)
+			end
+			mark(Tuning.isModified(param.id))
+		end
+		rowRefs[param.id] = render
+		table.insert(derivedRefs, render)
+		render()
+	end
+
+	local function curveRow(parent, param, order)
+		local holder = new("Frame", { Parent = parent, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = order }, { vlist(6) })
+		local _, mark = simpleRow(holder, param, 1, 30)
+		local list = new("Frame", { Parent = holder, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 2 }, { vlist(4) })
+		local function render()
+			for _, child in ipairs(list:GetChildren()) do
+				if child:IsA("GuiObject") then
+					child:Destroy()
+				end
+			end
+			local custom = Tuning.get(param.id)
+			if Tuning.get("engine.curveMode") ~= "Custom" or type(custom) ~= "table" then
+				text(list, "Switch Curve to Custom to edit points. The shaped curve is copied as a starting point.", { size = 12, color = C.mute, wrap = true, auto = Enum.AutomaticSize.Y, height = 0, order = 1 })
+				mark(Tuning.isModified(param.id))
+				return
+			end
+			for i, p in ipairs(custom) do
+				local r = new("Frame", { Parent = list, Size = UDim2.new(1, 0, 0, 28), LayoutOrder = i })
+				local rpmBox = input(r, { text = tostring(math.floor(p.rpm)), mono = true, align = Enum.TextXAlignment.Center, size = UDim2.new(0.5, -34, 0, 26), textSize = 12 })
+				local tqBox = input(r, { text = string.format("%.0f", p.torque), mono = true, align = Enum.TextXAlignment.Center, size = UDim2.new(0.5, -34, 0, 26), position = UDim2.new(0.5, -28, 0, 0), textSize = 12 })
+				text(r, "Nm", { size = 11, color = C.mute, position = UDim2.new(1, -56, 0, 0), sizeUDim = UDim2.new(0, 24, 1, 0) })
+				local del = iconButton(r, "×", { size = UDim2.fromOffset(24, 24), position = UDim2.new(1, -24, 0, 1), visible = #custom > 2 })
+				local function commit()
+					local copy = {}
+					for j, q in ipairs(custom) do
+						copy[j] = { rpm = q.rpm, torque = q.torque }
+					end
+					copy[i] = { rpm = tonumber(rpmBox.Text) or p.rpm, torque = tonumber(tqBox.Text) or p.torque }
+					if not Tuning.set(param.id, copy) then
+						UI.notify("warn", "Each rpm can only appear once")
+						render()
+					end
+				end
+				bind(rpmBox.FocusLost, commit)
+				bind(tqBox.FocusLost, commit)
+				bind(del.Activated, function()
+					local copy = {}
+					for j, q in ipairs(custom) do
+						if j ~= i then
+							table.insert(copy, { rpm = q.rpm, torque = q.torque })
+						end
+					end
+					Tuning.set(param.id, copy)
+				end)
+			end
+			local add = button(list, "Add point", { style = "ghost", size = UDim2.new(1, 0, 0, 26), order = 999, textSize = 12 })
+			bind(add.instance.Activated, function()
+				local copy = {}
+				for j, q in ipairs(custom) do
+					copy[j] = { rpm = q.rpm, torque = q.torque }
+				end
+				local last = copy[#copy]
+				table.insert(copy, { rpm = last.rpm + 500, torque = last.torque * 0.9 })
+				Tuning.set(param.id, copy)
+			end)
+			mark(Tuning.isModified(param.id))
+		end
+		rowRefs[param.id] = render
+		rowRefs["engine.curveMode#curve"] = render
+		render()
+	end
+
+	-- graphs ---------------------------------------------------------------------------
+
+	local function torqueGraph(parent, order)
+		local wrap = card(parent, { order = order })
+		vlist(6).Parent = wrap
+		local legend = new("Frame", { Parent = wrap, Size = UDim2.new(1, 0, 0, 18), LayoutOrder = 1 })
+		local tLabel = text(legend, "", { size = 12, weight = W.semibold, color = C.accent, sizeUDim = UDim2.new(0.5, 0, 1, 0) })
+		local pLabel = text(legend, "", { size = 12, weight = W.semibold, color = C.text, align = Enum.TextXAlignment.Right, position = UDim2.new(0.5, 0, 0, 0), sizeUDim = UDim2.new(0.5, 0, 1, 0) })
+		local g = graph(wrap, 150, 2)
+		local function render()
+			local r = Tuning.readouts()
+			if not r then
+				return
+			end
+			local idle, red = Tuning.get("engine.idle"), Tuning.get("engine.redline")
+			local tq, pw = {}, {}
+			local maxT, maxP = 1, 1
+			for i = 0, 48 do
+				local rpm = idle + (red - idle) * i / 48
+				local t = Spec.torqueAt(r.points, rpm)
+				local p = t * rpm / 9549 * 1.341
+				tq[#tq + 1] = { rpm, t }
+				pw[#pw + 1] = { rpm, p }
+				maxT, maxP = math.max(maxT, t), math.max(maxP, p)
+			end
+			local top = math.max(maxT, maxP) * 1.12
+			g.draw({
+				{ points = pw, color = C.text, width = 2, transparency = 0.15 },
+				{ points = tq, color = C.accent, width = 2 },
+			}, { idle, red }, { 0, top }, {
+				x = function(v)
+					return string.format("%.1fk", v / 1000)
+				end,
+				y = function(v)
+					return string.format("%d", v)
+				end,
+			})
+			tLabel.Text = string.format("%d Nm @ %d", r.peakTorque, r.peakTorqueRpm)
+			pLabel.Text = string.format("%d hp @ %d", r.peakPowerHp, r.peakPowerRpm)
+		end
+		table.insert(derivedRefs, render)
+		render()
+	end
+
+	local function overview(parent)
+		local specs = card(parent, { order = 1 })
+		vlist(10).Parent = specs
+		sectionLabel(specs, "At a glance", 0)
+		local grid = new("Frame", { Parent = specs, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 1 }, {
+			new("UIGridLayout", { CellSize = UDim2.new(1 / 3, -8, 0, 52), CellPadding = UDim2.fromOffset(12, 10), SortOrder = Enum.SortOrder.LayoutOrder }),
+		})
+		local cells = {}
+		local function stat(key, label, i)
+			local f = new("Frame", { Parent = grid, LayoutOrder = i })
+			text(f, label, { size = 11, weight = W.bold, color = C.mute, height = 14 })
+			cells[key] = text(f, "-", { size = 20, weight = W.bold, mono = true, position = UDim2.fromOffset(0, 16), height = 24 })
+			cells[key .. "Sub"] = text(f, "", { size = 11, color = C.mute, position = UDim2.fromOffset(0, 38), height = 14 })
+		end
+		stat("power", "POWER", 1)
+		stat("torque", "TORQUE", 2)
+		stat("mass", "MASS", 3)
+		stat("ptw", "HP / TONNE", 4)
+		stat("top", "TOP SPEED", 5)
+		stat("drive", "DRIVE", 6)
+		local function render()
+			local r, stats = Tuning.readouts()
+			if not r then
+				return
+			end
+			cells.power.Text = string.format("%d", r.peakPowerHp)
+			cells.powerSub.Text = string.format("hp @ %d rpm", r.peakPowerRpm)
+			cells.torque.Text = string.format("%d", r.peakTorque)
+			cells.torqueSub.Text = string.format("Nm @ %d rpm", r.peakTorqueRpm)
+			cells.mass.Text = string.format("%d", r.mass)
+			cells.massSub.Text = string.format("kg · %d%% front", Tuning.get("chassis.weightFront") * 100)
+			cells.ptw.Text = string.format("%d", r.powerToWeight)
+			cells.ptwSub.Text = "hp per tonne"
+			cells.top.Text = string.format("%d", r.topSpeedKmh)
+			cells.topSub.Text = "km/h, drag limited"
+			cells.drive.Text = stats.transmission.type
+			local diffs = { OPEN = "Open", LIMITED = "LSD", TORSEN = "Torsen", CLUTCH_LSD = "Clutch LSD", LOCKED = "Locked", WELDED = "Welded" }
+			cells.driveSub.Text = (diffs[stats.transmission.differential.type] or "") .. " · " .. #Tuning.get("gearbox.gears") .. "-speed"
+		end
+		table.insert(derivedRefs, render)
+		render()
+
+		torqueGraph(parent, 2)
+
+		local chassisCard = card(parent, { order = 3 })
+		vlist(4).Parent = chassisCard
+		sectionLabel(chassisCard, "Derived chassis values", 0)
+		local springs = keyValue(chassisCard, "Spring rate F / R", 1)
+		local corners = keyValue(chassisCard, "Corner mass F / R", 2)
+		local brakes = keyValue(chassisCard, "Brake torque F / R", 3)
+		local inertia = keyValue(chassisCard, "Wheel inertia", 4)
+		local clutch = keyValue(chassisCard, "Clutch capacity", 5)
+		local function renderDerived()
+			local r, stats = Tuning.readouts()
+			if not r then
+				return
+			end
+			springs.Text = string.format("%.0f / %.0f N/mm", r.springFront, r.springRear)
+			corners.Text = string.format("%.0f / %.0f kg", r.cornerFront, r.cornerRear)
+			brakes.Text = string.format("%.0f / %.0f Nm", r.brakeFront, r.brakeRear)
+			inertia.Text = string.format("%.3f kg·m²", stats.wheelInertia)
+			clutch.Text = string.format("%.0f Nm", stats.clutch.maxTorque)
+		end
+		table.insert(derivedRefs, renderDerived)
+		renderDerived()
+
+		local note = card(parent, { order = 4 })
+		text(note, "Springs, dampers, brake torques, clutch capacity and the engine sound crossfades are derived from the values you set, so changing mass or wheel size keeps the car balanced. Anything marked AUTO follows its inputs until you override it.", {
+			size = 12,
+			color = C.dim,
+			wrap = true,
+			auto = Enum.AutomaticSize.Y,
+			height = 0,
+		})
+	end
+
+	local function expert(parent)
+		local info = card(parent, { order = 0 })
+		text(info, "Direct overrides on the final physics table. Use these for values without a friendly control; they win over everything else.", { size = 12, color = C.dim, wrap = true, auto = Enum.AutomaticSize.Y, height = 0 })
+		local listHolder = new("Frame", { Parent = parent, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 1 }, { vlist(2) })
+		local function render()
+			for _, child in ipairs(listHolder:GetChildren()) do
+				if child:IsA("GuiObject") then
+					child:Destroy()
+				end
+			end
+			local rows = Tuning.rawRows(search.Text)
+			local limit = 160
+			for i, r in ipairs(rows) do
+				if i > limit then
+					text(listHolder, (#rows - limit) .. " more - refine the search", { size = 12, color = C.mute, height = 24, order = i })
+					break
+				end
+				local row = new("Frame", { Parent = listHolder, Size = UDim2.new(1, 0, 0, 28), LayoutOrder = i })
+				text(row, r.id, { size = 12, mono = true, color = r.overridden and C.text or C.dim, sizeUDim = UDim2.new(1, -166, 1, 0) })
+				local box = input(row, { text = tostring(r.value), mono = true, align = Enum.TextXAlignment.Right, size = UDim2.fromOffset(112, 24), position = UDim2.new(1, -158, 0, 2), textSize = 12 })
+				local reset = iconButton(row, "Reset", { size = UDim2.fromOffset(42, 24), position = UDim2.new(1, -42, 0, 2), textSize = 11, visible = r.overridden })
+				bind(box.FocusLost, function()
+					local v
+					if r.kind == "number" then
+						v = tonumber(box.Text)
+					elseif r.kind == "boolean" then
+						v = box.Text:lower() == "true"
+					else
+						v = box.Text
+					end
+					if v == nil then
+						box.Text = tostring(r.value)
+						return
+					end
+					if v ~= r.value then
+						Tuning.setRaw(r.path, v)
+					end
+				end)
+				bind(reset.Activated, function()
+					Tuning.clearRaw(r.id)
+				end)
+			end
+			if #rows == 0 then
+				text(listHolder, "No matching values.", { size = 13, color = C.mute, height = 28 })
+			end
+		end
+		rowRefs["#expert"] = render
+		render()
+	end
+
+	-- section rendering ---------------------------------------------------------------
+
+	local function matches(param, needle)
+		if needle == "" then
+			return true
+		end
+		return param.label:lower():find(needle, 1, true) ~= nil or param.id:lower():find(needle, 1, true) ~= nil
+			or (param.group or ""):lower():find(needle, 1, true) ~= nil
+	end
+
+	local function render(animate)
+		if closePopup then
+			closePopup()
+		end
+		table.clear(rowRefs)
+		table.clear(derivedRefs)
+		local old = body
+		body = scrollPage(bodyHolder)
+		body.Position = UDim2.fromOffset(0, animate and 10 or 0)
+		if animate then
+			tween(body, { Position = UDim2.fromOffset(0, 0) }, 0.26)
+		end
+		if old then
+			old:Destroy()
+		end
+
+		local needle = search.Text:lower():gsub("^%s+", ""):gsub("%s+$", "")
+		local tier = ui.tier
+		resultNote.Text = ""
+
+		if currentSection == "overview" and needle == "" then
+			overview(body)
+			return
+		elseif currentSection == "expert" then
+			expert(body)
+			return
+		end
+
+		-- parameters (searching spans every section)
+		local groups, order = {}, {}
+		local shown, hidden = 0, 0
+		for _, param in ipairs(Spec.params) do
+			local inSection = needle ~= "" or param.section == currentSection
+			if inSection and matches(param, needle) then
+				if tier == "advanced" or param.tier == "basic" or needle ~= "" or Tuning.isModified(param.id) then
+					local key = (needle ~= "" and (param.section .. " · ") or "") .. (param.group or "")
+					if not groups[key] then
+						groups[key] = {}
+						table.insert(order, key)
+					end
+					table.insert(groups[key], param)
+					shown += 1
+				else
+					hidden += 1
+				end
+			end
+		end
+		if needle ~= "" then
+			resultNote.Text = shown .. " match" .. (shown == 1 and "" or "es")
+		end
+
+		local o = 0
+		if currentSection == "engine" and needle == "" then
+			o += 1
+			torqueGraph(body, o)
+		end
+		for _, key in ipairs(order) do
+			o += 1
+			local group = card(body, { order = o })
+			vlist(6).Parent = group
+			local sectionReset
+			if needle == "" then
+				sectionReset = new("TextButton", { Text = "Reset", FontFace = font(W.semibold), TextSize = 12, TextColor3 = C.mute, Size = UDim2.fromOffset(44, 20), AutoButtonColor = false })
+			end
+			sectionLabel(group, key ~= "" and key or "General", 0, sectionReset)
+			if sectionReset then
+				local ids = {}
+				for _, p in ipairs(groups[key]) do
+					table.insert(ids, p.id)
+				end
+				local function paintReset()
+					local any = false
+					for _, id in ipairs(ids) do
+						if Tuning.isModified(id) then
+							any = true
+						end
+					end
+					sectionReset.Visible = any
+				end
+				bind(sectionReset.Activated, function()
+					for _, id in ipairs(ids) do
+						Tuning.reset(id)
+					end
+				end)
+				table.insert(derivedRefs, paintReset)
+				paintReset()
+			end
+			for i, param in ipairs(groups[key]) do
+				local kind = param.kind
+				if kind == "number" then
+					numberRow(group, param, i)
+				elseif kind == "bool" then
+					boolRow(group, param, i)
+				elseif kind == "enum" then
+					enumRow(group, param, i)
+				elseif kind == "pack" then
+					packRow(group, param, i)
+				elseif kind == "sound" then
+					soundRow(group, param, i)
+				elseif kind == "gears" then
+					gearsRow(group, param, i)
+				elseif kind == "curve" then
+					curveRow(group, param, i)
+				end
+			end
+		end
+		if shown == 0 then
+			text(body, needle ~= "" and "Nothing matches that search." or "Everything here is advanced. Switch Detail to Advanced to see it.", { size = 13, color = C.mute, height = 40, wrap = true, order = 1 })
+		elseif hidden > 0 and needle == "" then
+			o += 1
+			local more = button(body, ("Show %d advanced setting%s"):format(hidden, hidden == 1 and "" or "s"), { style = "ghost", order = o, size = UDim2.new(1, 0, 0, 32), textSize = 13 })
+			bind(more.instance.Activated, function()
+				ui.tier = "advanced"
+				tierPick.set("advanced")
+				render(true)
+			end)
+		end
+	end
+
+	for i, s in ipairs(sectionList) do
+		local b = new("TextButton", {
+			Parent = chipBar,
+			Text = s.label,
+			FontFace = font(W.semibold),
+			TextSize = 13,
+			TextColor3 = C.dim,
+			BackgroundColor3 = C.raised,
+			BackgroundTransparency = 0,
+			Size = UDim2.fromOffset(0, 28),
+			AutomaticSize = Enum.AutomaticSize.X,
+			AutoButtonColor = false,
+			LayoutOrder = i,
+		}, { corner(14), padding(0, 12, 0, 12) })
+		local dot = new("Frame", { Parent = b, BackgroundColor3 = C.accent, BackgroundTransparency = 0, Size = UDim2.fromOffset(5, 5), Position = UDim2.new(1, -2, 0, 4), Visible = false }, { corner(3) })
+		bind(b.MouseEnter, function()
+			if s.id ~= currentSection then
+				tween(b, { BackgroundColor3 = C.hover }, 0.1)
+			end
+		end)
+		bind(b.MouseLeave, function()
+			if s.id ~= currentSection then
+				tween(b, { BackgroundColor3 = C.raised }, 0.16)
+			end
+		end)
+		bind(b.Activated, function()
+			if currentSection == s.id and search.Text == "" then
+				return
+			end
+			currentSection = s.id
+			ui.section = s.id
+			search.Text = ""
+			paintChips(true)
+			render(true)
+		end)
+		chips[s.id] = { button = b, dot = dot }
+	end
+
+	tierPick.setHandler(function(v)
+		ui.tier = v
+		render(true)
+	end)
+
+	local searchToken = 0
+	bind(search:GetPropertyChangedSignal("Text"), function()
+		searchToken += 1
+		local mine = searchToken
+		task.delay(0.18, function()
+			if mine == searchToken then
+				render(false)
+			end
+		end)
+	end)
+
+	-- live updates: targeted row refresh + coalesced derived refresh
+	local derivedQueued = false
+	bind(Tuning.changed.Event, function(id)
+		if id == "configs" then
+			return
+		end
+		if id == nil or id == "sounds" then
+			presetPick.set(Tuning.presetName())
+			if activeTab == "Tune" then
+				render(false)
+			end
+			paintChips(false)
+			return
+		end
+		if type(id) == "string" and id:sub(1, 4) == "raw:" then
+			local fn = rowRefs["#expert"]
+			if fn then
+				fn()
+			end
+		else
+			local param = Spec.byId[id]
+			if param then
+				paramValueChanged(param)
+			end
+			if id == "engine.curveMode" then
+				if Tuning.get("engine.curveMode") == "Custom" and Tuning.get("engine.curve") == nil then
+					local r = Tuning.readouts()
+					if r then
+						local copy = {}
+						for i, p in ipairs(r.points) do
+							copy[i] = { rpm = math.floor(p.rpm + 0.5), torque = math.floor(p.torque + 0.5) }
+						end
+						Tuning.set("engine.curve", copy)
+					end
+				end
+				local fn = rowRefs["engine.curveMode#curve"]
+				if fn then
+					fn()
+				end
+			end
+			-- auto values can depend on this one
+			for pid, fn in pairs(rowRefs) do
+				local p = Spec.byId[pid]
+				if p and p.auto and Tuning.isAuto(pid) then
+					fn()
+				end
+			end
+		end
+		paintChips(false)
+		if not derivedQueued then
+			derivedQueued = true
+			task.delay(0.08, function()
+				derivedQueued = false
+				for _, fn in ipairs(derivedRefs) do
+					fn()
+				end
+			end)
+		end
+	end)
+
+	bind(saveBtn.instance.Activated, function()
+		local ok, msg = Tuning.save(configName.Text)
+		UI.notify(ok and "ok" or "warn", msg or (ok and "Saved" or "Could not save"))
+	end)
+	bind(loadBtn.instance.Activated, function()
+		openPopup(loadBtn.instance, function(list)
+			local names = Tuning.list()
+			for i, name in ipairs(names) do
+				menuItem(list, name, false, function()
+					local ok, msg = Tuning.load(name)
+					configName.Text = name
+					UI.notify(ok and "ok" or "warn", ok and ("Loaded " .. name) or msg)
+				end, function()
+					if closePopup then
+						closePopup()
+					end
+				end, i)
+			end
+			if #names == 0 then
+				text(list, "  No saved configs yet", { size = 13, color = C.mute, height = 30, z = 53 })
+				return 1
+			end
+			return #names
+		end, 220)
+	end)
+	bind(shareBtn.instance.Activated, function()
+		local exportText = Tuning.export()
+		local field
+		modal("Share tune", function(b)
+			text(b, "Copy this to share the tune, or paste one here and import it.", { size = 13, color = C.dim, wrap = true, auto = Enum.AutomaticSize.Y, height = 0, order = 1, z = 62 })
+			field = input(b, { text = exportText, multiline = true, mono = true, size = UDim2.new(1, 0, 0, 150), order = 2, textSize = 11, z = 62 })
+		end, {
+			{ label = "Close", style = "ghost" },
+			{
+				label = "Import",
+				style = "primary",
+				onClick = function()
+					if field.Text == exportText then
+						UI.notify("info", "Paste a tune first")
+						return
+					end
+					local ok, err = Tuning.import(field.Text)
+					UI.notify(ok and "ok" or "warn", ok and "Tune imported" or err)
+				end,
+			},
+		})
+	end)
+	bind(resetBtn.instance.Activated, function()
+		modal("Reset the tune?", function(b)
+			text(b, ("This clears %d change%s and returns to the %s preset."):format(Tuning.modifiedCount(), Tuning.modifiedCount() == 1 and "" or "s", Tuning.presetName()), { size = 13, color = C.dim, wrap = true, auto = Enum.AutomaticSize.Y, height = 0, z = 62 })
+		end, {
+			{ label = "Cancel", style = "ghost" },
+			{
+				label = "Reset",
+				style = "danger",
+				onClick = function()
+					Tuning.resetAll()
+					UI.notify("ok", "Tune reset")
+				end,
+			},
+		})
+	end)
+
+	paintChips(false)
+	local built = false
+	return function()
+		if not built then
+			built = true
+			render(false)
+		end
+	end
+end
+
+------------------------------------------------------------------------------------------
+-- LINK
+------------------------------------------------------------------------------------------
+
+local LINK_STATES = {
+	DISCONNECTED = { "Offline", C.bad },
+	CONNECTING = { "Connecting", C.warn },
+	CONNECTED = { "Online", C.good },
+}
+
+local function buildLink(page)
+	local Connection, Net = deps.Connection, deps.Net
+	local root = new("Frame", { Parent = page, Size = UDim2.fromScale(1, 1) }, { padding(10, PAD, 12, PAD), vlist(10) })
+
+	local head = new("Frame", { Parent = root, Size = UDim2.new(1, 0, 0, 20), LayoutOrder = 1 })
+	local dot = new("Frame", { Parent = head, BackgroundTransparency = 0, Size = UDim2.fromOffset(7, 7), AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 0, 0.5, 0) }, { corner(3) })
+	local state = text(head, "", { size = 14, weight = W.semibold, position = UDim2.fromOffset(15, 0), sizeUDim = UDim2.new(0.5, -15, 1, 0) })
+	local latency = text(head, "", { size = 12, mono = true, color = C.mute, align = Enum.TextXAlignment.Right, position = UDim2.new(0.5, 0, 0, 0), sizeUDim = UDim2.new(0.5, 0, 1, 0) })
+	local detail = text(root, "", { size = 12, color = C.mute, order = 2, wrap = true, auto = Enum.AutomaticSize.Y, height = 0 })
+
+	divider(root, 3)
+	local list = new("ScrollingFrame", {
+		Parent = root,
+		Size = UDim2.new(1, 0, 1, -110),
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollBarThickness = 2,
+		ScrollBarImageColor3 = C.faint,
+		LayoutOrder = 4,
+	}, { vlist(0) })
+
+	local foot = new("Frame", { Parent = root, Size = UDim2.new(1, 0, 0, 22), LayoutOrder = 5 }, { hlist(14) })
+	local function link(label, order, onClick)
+		local b = new("TextButton", { Parent = foot, Text = label, FontFace = font(W.semibold), TextSize = 12, TextColor3 = C.dim, AutoButtonColor = false, Size = UDim2.fromOffset(0, 22), AutomaticSize = Enum.AutomaticSize.X, LayoutOrder = order })
+		bind(b.MouseEnter, function()
+			tween(b, { TextColor3 = C.text }, 0.1)
+		end)
+		bind(b.MouseLeave, function()
+			tween(b, { TextColor3 = C.dim }, 0.16)
+		end)
+		bind(b.Activated, onClick)
+		return b
+	end
+	link("Reconnect", 1, function()
+		if Net then
+			Net.reconnect()
+		end
+	end)
+	local loop
+	if RunService:IsStudio() and Net then
+		loop = link("Loopback test: off", 2, function()
+			Net.loopback(not Net.isLoopback())
+		end)
+		attachTooltip(loop, "Mirrors your own car back as a fake peer so replication can be tested without a relay.")
+	end
+
+	return function()
+		local meta = LINK_STATES[Connection.status] or LINK_STATES.DISCONNECTED
+		dot.BackgroundColor3 = meta[2]
+		state.Text = meta[1]
+		latency.Text = Connection.latency and string.format("%d ms", Connection.latency * 1000) or ""
+		detail.Text = Connection.detail ~= "" and Connection.detail or ""
+		if loop then
+			loop.Text = "Loopback test: " .. (Net.isLoopback() and "on" or "off")
+		end
+		for _, child in ipairs(list:GetChildren()) do
+			if child:IsA("GuiObject") then
+				child:Destroy()
+			end
+		end
+		for i, entry in ipairs(Connection.players) do
+			local r = new("Frame", { Parent = list, Size = UDim2.new(1, 0, 0, 26), LayoutOrder = i })
+			text(r, entry.name, { size = 13, color = entry.present and C.text or C.mute, sizeUDim = UDim2.new(1, -60, 1, 0) })
+			text(r, entry.hasCar and "car" or "-", { size = 12, color = entry.hasCar and C.accent or C.faint, align = Enum.TextXAlignment.Right, position = UDim2.new(1, -60, 0, 0), sizeUDim = UDim2.new(0, 60, 1, 0) })
+		end
+		if #Connection.players == 0 then
+			text(list, Connection.status == "CONNECTED" and "No other hub users in this server." or "", { size = 12, color = C.faint, height = 26 })
+		end
+	end
+end
+
+------------------------------------------------------------------------------------------
+-- Shell
+------------------------------------------------------------------------------------------
+
+local TAB_NAMES = { "Drive", "Build", "Tune", "Link" }
+local MARGIN = 10
+local TAB_WIDTH = 64
+local HEADER = 78
+
+-- Per-view default panel sizes. Build opens nearly full-screen; Link is a small card.
+local DEFAULT_SIZES = {
+	Drive = UDim2.new(0, 360, 1, -2 * MARGIN),
+	Build = UDim2.new(1, -2 * MARGIN, 1, -2 * MARGIN),
+	Tune = UDim2.new(0, 410, 1, -2 * MARGIN),
+	Link = UDim2.new(0, 320, 0, 300),
+}
+local MIN_SIZE = Vector2.new(300, 220)
+local uiScale
+
+local function logicalScreen()
+	local s = uiScale and uiScale.Scale or 1
+	local abs = gui and gui.AbsoluteSize or Vector2.new(1280, 720)
+	return abs / s
+end
+
+local function sizeFor(name)
+	local saved = deps.Tuning.state.ui.sizes and deps.Tuning.state.ui.sizes[name]
+	if saved then
+		local screen = logicalScreen()
+		local w = math.clamp(saved[1], MIN_SIZE.X, math.max(screen.X - 2 * MARGIN, MIN_SIZE.X))
+		local h = math.clamp(saved[2], MIN_SIZE.Y, math.max(screen.Y - 2 * MARGIN, MIN_SIZE.Y))
+		return UDim2.fromOffset(w, h)
+	end
+	return DEFAULT_SIZES[name] or DEFAULT_SIZES.Drive
+end
+
+local function selectTab(name, animate)
+	if activeTab == name then
+		return
+	end
+	local previous = activeTab
+	activeTab = name
+	if closePopup then
+		closePopup()
+	end
+	deps.Tuning.state.ui.tab = name
+	for i, tabName in ipairs(TAB_NAMES) do
+		local tab = tabs[tabName]
+		local on = tabName == name
+		tween(tab.button, { TextColor3 = on and C.text or C.mute }, animate and 0.16 or 0)
+		if on then
+			local target = UDim2.new(0, PAD + (i - 1) * TAB_WIDTH + 2, 1, -2)
+			if animate then
+				tween(tabs.indicator, { Position = target }, 0.26)
+			else
+				tabs.indicator.Position = target
+			end
+		end
+	end
+	local size = sizeFor(name)
+	if animate then
+		tween(panel, { Size = size }, 0.32)
+	else
+		panel.Size = size
+	end
+	local page = pages[name]
+	if previous and pages[previous] then
+		pages[previous].frame.Visible = false
+	end
+	page.frame.Visible = true
+	if animate then
+		page.frame.Position = UDim2.fromOffset(0, 6)
+		tween(page.frame, { Position = UDim2.fromOffset(0, 0) }, 0.24)
+	end
+	if page.refresh then
+		page.refresh()
+	end
+end
+
+local function setStatus()
+	local CarInit = deps.CarInit
+	local meta = STATE_LABELS[CarInit.state] or STATE_LABELS.IDLE
+	local label = meta[1]
+	if CarInit.state == "ACTIVE" then
+		local t = CarInit.telemetry()
+		label = t and t.driving and "Driving" or "Parked"
+	end
+	statusText.Text = label
+	tween(statusDot, { BackgroundColor3 = meta[2] }, 0.2)
+end
+
+-- Bottom-left grip (the panel hangs from the top-right corner).
+local function resizeGrip()
+	local grip = new("TextButton", {
+		Parent = panel,
+		Text = "",
+		AutoButtonColor = false,
+		AnchorPoint = Vector2.new(0, 1),
+		Position = UDim2.new(0, 0, 1, 0),
+		Size = UDim2.fromOffset(18, 18),
+		ZIndex = 20,
+	})
+	for i = 1, 2 do
+		new("Frame", {
+			Parent = grip,
+			BackgroundColor3 = C.faint,
+			BackgroundTransparency = 0,
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromOffset(4 + i * 3, 11 - i * 3),
+			Size = UDim2.fromOffset(i * 6, 1),
+			Rotation = 45,
+			ZIndex = 21,
+		})
+	end
+	attachTooltip(grip, "Drag to resize · double-click to reset")
+	local lastClick = 0
+	bind(grip.InputBegan, function(io)
+		if io.UserInputType ~= Enum.UserInputType.MouseButton1 and io.UserInputType ~= Enum.UserInputType.Touch then
+			return
+		end
+		local now = os.clock()
+		if now - lastClick < 0.3 then
+			local sizes = deps.Tuning.state.ui.sizes
+			if sizes then
+				sizes[activeTab] = nil
+			end
+			tween(panel, { Size = sizeFor(activeTab) }, 0.28)
+			return
+		end
+		lastClick = now
+		local scale = uiScale and uiScale.Scale or 1
+		local start = io.Position
+		local startSize = panel.AbsoluteSize / scale
+		local move = UserInputService.InputChanged:Connect(function(change)
+			if change.UserInputType ~= Enum.UserInputType.MouseMovement and change.UserInputType ~= Enum.UserInputType.Touch then
+				return
+			end
+			local d = (change.Position - start) / scale
+			local screen = logicalScreen()
+			local w = math.clamp(startSize.X - d.X, MIN_SIZE.X, screen.X - 2 * MARGIN)
+			local h = math.clamp(startSize.Y + d.Y, MIN_SIZE.Y, screen.Y - 2 * MARGIN)
+			panel.Size = UDim2.fromOffset(w, h)
+		end)
+		local ended
+		ended = io.Changed:Connect(function()
+			if io.UserInputState == Enum.UserInputState.End then
+				move:Disconnect()
+				ended:Disconnect()
+				local s = panel.AbsoluteSize / (uiScale and uiScale.Scale or 1)
+				local ui = deps.Tuning.state.ui
+				ui.sizes = ui.sizes or {}
+				ui.sizes[activeTab] = { math.floor(s.X + 0.5), math.floor(s.Y + 0.5) }
+			end
+		end)
+	end)
+end
+
+function UI.build(modules)
+	deps = modules
+	-- `parentGui` lets the panel be previewed outside a play session
+	local playerGui = modules.parentGui or Players.LocalPlayer:WaitForChild("PlayerGui")
+	local old = playerGui:FindFirstChild("HubUI")
+	if old then
+		old:Destroy()
+	end
+
+	-- respect the top bar instead of offsetting by hand (the old double offset pushed
+	-- the panel off the bottom of the screen)
+	gui = new("ScreenGui", {
+		Name = "HubUI",
+		ResetOnSpawn = false,
+		DisplayOrder = 100,
+		IgnoreGuiInset = false,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	})
+	pcall(function()
+		gui.ScreenInsets = Enum.ScreenInsets.CoreUISafeInsets
+	end)
+	gui.Parent = playerGui
+	uiScale = new("UIScale", { Parent = gui })
+	local function rescale()
+		local vp = gui.AbsoluteSize
+		if vp.X < 2 then
+			vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280, 800)
+		end
+		uiScale.Scale = math.clamp(math.min(vp.Y / 820, vp.X / 1100), 0.7, 1)
+	end
+	rescale()
+	bind(gui:GetPropertyChangedSignal("AbsoluteSize"), function()
+		rescale()
+		if panel and activeTab then
+			panel.Size = sizeFor(activeTab)
+		end
+	end)
+
+	panel = new("CanvasGroup", {
+		Parent = gui,
+		Name = "Panel",
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, 40, 0, MARGIN),
+		Size = DEFAULT_SIZES.Drive,
+		BackgroundColor3 = C.panel,
+		BackgroundTransparency = 0,
+		Visible = false,
+		GroupTransparency = 1,
+	}, { corner(3), stroke(C.lineSoft) })
+
+	-- header: title + status on one line, text tabs below
+	local header = new("Frame", { Parent = panel, Size = UDim2.new(1, 0, 0, HEADER) })
+	local brand = new("Frame", { Parent = header, Size = UDim2.new(1, -2 * PAD + 6, 0, 24), Position = UDim2.fromOffset(PAD, 12) })
+	text(brand, "Car Hub", { size = 15, weight = W.bold, sizeUDim = UDim2.new(0, 90, 1, 0) })
+	local status = new("Frame", { Parent = brand, Size = UDim2.new(1, -150, 1, 0), Position = UDim2.fromOffset(90, 0) }, { hlist(6) })
+	statusDot = new("Frame", { Parent = status, BackgroundColor3 = C.mute, BackgroundTransparency = 0, Size = UDim2.fromOffset(6, 6), LayoutOrder = 1 }, { corner(3) })
+	statusText = new("TextLabel", { Parent = status, Text = "", FontFace = font(W.medium), TextSize = 12, TextColor3 = C.mute, Size = UDim2.fromOffset(0, 24), AutomaticSize = Enum.AutomaticSize.X, LayoutOrder = 2 })
+	iconButton(brand, "×", { anchor = Vector2.new(1, 0.5), position = UDim2.new(1, 0, 0.5, 0), size = UDim2.fromOffset(24, 24), textSize = 18, onClick = function()
+		UI.toggle()
+	end })
+
+	local tabBar = new("Frame", { Parent = header, Size = UDim2.new(1, 0, 0, 32), Position = UDim2.fromOffset(0, HEADER - 32) })
+	new("Frame", { Parent = tabBar, BackgroundColor3 = C.lineSoft, BackgroundTransparency = 0, Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 1, -1) })
+	for i, name in ipairs(TAB_NAMES) do
+		local b = new("TextButton", {
+			Parent = tabBar,
+			Text = name,
+			FontFace = font(W.semibold),
+			TextSize = 13,
+			TextColor3 = C.mute,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Size = UDim2.new(0, TAB_WIDTH, 1, -2),
+			Position = UDim2.new(0, PAD + (i - 1) * TAB_WIDTH + 2, 0, 0),
+			AutoButtonColor = false,
+		})
+		bind(b.MouseEnter, function()
+			if activeTab ~= name then
+				tween(b, { TextColor3 = C.dim }, 0.1)
+			end
+		end)
+		bind(b.MouseLeave, function()
+			if activeTab ~= name then
+				tween(b, { TextColor3 = C.mute }, 0.16)
+			end
+		end)
+		bind(b.Activated, function()
+			selectTab(name, true)
+		end)
+		tabs[name] = { button = b, width = b.TextBounds.X }
+	end
+	tabs.indicator = new("Frame", {
+		Parent = tabBar,
+		BackgroundColor3 = C.accent,
+		BackgroundTransparency = 0,
+		Size = UDim2.fromOffset(18, 2),
+		Position = UDim2.new(0, PAD + 2, 1, -2),
+		ZIndex = 2,
+	})
+
+	content = new("Frame", { Parent = panel, Size = UDim2.new(1, 0, 1, -HEADER - 4), Position = UDim2.fromOffset(0, HEADER + 4), ClipsDescendants = true })
+	local builders = { Drive = buildDrive, Build = buildBuild, Tune = buildTune, Link = buildLink }
+	for _, name in ipairs(TAB_NAMES) do
+		local frame = new("Frame", { Parent = content, Name = name, Size = UDim2.fromScale(1, 1), Visible = false })
+		local refresh, tick = builders[name](frame)
+		pages[name] = { frame = frame, refresh = refresh }
+		if tick then
+			tickers[name] = tick
+		end
+	end
+	resizeGrip()
+
+	overlay = new("Frame", { Parent = gui, Name = "Overlay", Size = UDim2.fromScale(1, 1), ZIndex = 50 })
+	local tip = new("Frame", {
+		Parent = overlay,
+		BackgroundColor3 = C.raised,
+		BackgroundTransparency = 0,
+		Size = UDim2.fromOffset(0, 0),
+		AutomaticSize = Enum.AutomaticSize.XY,
+		Visible = false,
+		ZIndex = 70,
+	}, { corner(3), stroke(C.line), padding(6, 9, 6, 9), new("UISizeConstraint", { MaxSize = Vector2.new(260, 400) }) })
+	tooltipLabel = new("TextLabel", {
+		Parent = tip,
+		Text = "",
+		FontFace = font(W.medium),
+		TextSize = 12,
+		TextColor3 = C.text,
+		TextWrapped = true,
+		AutomaticSize = Enum.AutomaticSize.XY,
+		Size = UDim2.fromOffset(0, 0),
+		ZIndex = 71,
+	}, { new("UISizeConstraint", { MaxSize = Vector2.new(242, 400) }) })
+
+	toastHost = new("Frame", {
+		Parent = gui,
+		Name = "Toasts",
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.new(0.5, 0, 1, -24),
+		Size = UDim2.fromOffset(600, 200),
+		ZIndex = 80,
+	}, {
+		new("UIListLayout", {
+			FillDirection = Enum.FillDirection.Vertical,
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			VerticalAlignment = Enum.VerticalAlignment.Bottom,
+			HorizontalAlignment = Enum.HorizontalAlignment.Center,
+			Padding = UDim.new(0, 6),
+		}),
+	})
+
+	selectTab(deps.Tuning.state.ui.tab or "Drive", false)
+
+	bind(deps.CarInit.changed.Event, function(state)
+		setStatus()
+		if state == "INITIALIZING" then
+			UI.notify("info", deps.CarInit.message)
+		elseif state == "ACTIVE" then
+			UI.notify("ok", deps.CarInit.message)
+		elseif state == "FAILED" then
+			UI.notify("fail", deps.CarInit.message)
+		elseif state == "ENDED" then
+			UI.notify("info", deps.CarInit.message)
+		end
+	end)
+	bind(deps.Connection.changed.Event, function()
+		if visible and activeTab == "Link" then
+			pages.Link.refresh()
+		end
+	end)
+	local statusClock = 0
+	bind(RunService:IsRunning() and RunService.RenderStepped or RunService.Heartbeat, function()
+		if not visible then
+			return
+		end
+		local tick = tickers[activeTab]
+		if tick then
+			tick()
+		end
+		local now = os.clock()
+		if now - statusClock > 0.5 then
+			statusClock = now
+			setStatus()
+		end
+	end)
+	setStatus()
+end
+
+function UI.select(name)
+	if pages[name] then
+		selectTab(name, visible)
+	end
+end
+
+local panelTween
+function UI.toggle()
+	if not panel then
+		return
+	end
+	visible = not visible
+	if panelTween then
+		panelTween:Cancel()
+	end
+	if closePopup then
+		closePopup()
+	end
+	local shown = UDim2.new(1, -MARGIN, 0, MARGIN)
+	local away = UDim2.new(1, 20, 0, MARGIN)
+	if visible then
+		panel.Visible = true
+		panel.Position = away
+		panel.GroupTransparency = 1
+		panelTween = tween(panel, { Position = shown, GroupTransparency = 0 }, 0.3)
+		local page = pages[activeTab]
+		if page and page.refresh then
+			page.refresh()
+		end
+		setStatus()
+	else
+		panelTween = tween(panel, { Position = away, GroupTransparency = 1 }, 0.18, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+		panelTween.Completed:Once(function(state)
+			if state == Enum.PlaybackState.Completed and not visible then
+				panel.Visible = false
+			end
+		end)
+	end
+end
+
+function UI.destroy()
+	for _, link in ipairs(UI._links) do
+		link:Disconnect()
+	end
+	table.clear(UI._links)
+	if gui then
+		gui:Destroy()
+	end
+	gui, panel, overlay, toastHost = nil, nil, nil, nil
+end
+
+return UI
