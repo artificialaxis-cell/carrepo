@@ -1256,6 +1256,13 @@ local function buildDrive(page)
 	end
 
 	bind(CarInit.changed.Event, refresh)
+	if CarInit.logged then
+		bind(CarInit.logged.Event, function()
+			if visible and activeTab == "Drive" then
+				refresh()
+			end
+		end)
+	end
 	bind(CarInit.layoutChanged.Event, refresh)
 	bind(Tuning.changed.Event, function()
 		if activeTab == "Drive" then
