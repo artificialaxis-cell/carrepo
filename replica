@@ -1,0 +1,565 @@
+--[[
+	Replica
+	-------
+	Rebuilds other players' cars from what Net receives and animates them.
+
+	Remote cars are purely kinematic: anchored, non-colliding parts moved every frame
+	with workspace:BulkMoveTo. Motion is reconstructed from a snapshot buffer played
+	back slightly in the past (Hermite position, slerped rotation, interpolated wheel
+	travel/steer/camber) with short velocity extrapolation when packets are late.
+
+	Safety
+	  * cars are only shown for users that are actually in this server
+	  * mesh/texture ids must exist somewhere in this game (or in the hub's own
+	    defaults); anything else renders as a plain neutral block
+	  * part counts, sizes and offsets are bounded by the codec
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Replica = {}
+
+local deps
+local cars = {} -- sid -> car
+local folder
+local allow = {} -- numeric asset id -> true
+local allowScanned = 0
+local heartbeat
+
+local ROLE_NAMES = { [0] = "Body", "Detail", "Tire", "Rim", "Wheel" }
+-- stock car wheel meshes (the body id comes from Chassis.KNOWN)
+local STOCK_MESHES = {
+	"rbxassetid://119053245327360",
+	"rbxassetid://92888021068167",
+	"rbxassetid://96974934664830",
+	"rbxassetid://92689262045313",
+}
+local CORNERS = { "FL", "FR", "RL", "RR" }
+local BUFFER_SIZE = 32
+
+------------------------------------------------------------------------------------------
+-- Asset allow-list
+------------------------------------------------------------------------------------------
+
+local function addAsset(id)
+	local n = deps and deps.Net.assetNumber(id)
+	if n and n > 0 then
+		allow[n] = true
+	end
+end
+
+local function scanAssets(root)
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("SpecialMesh") then
+			addAsset(d.MeshId)
+			addAsset(d.TextureId)
+		elseif d:IsA("MeshPart") then
+			addAsset(d.MeshId)
+			addAsset(d.TextureID)
+		end
+	end
+end
+
+local function refreshAllowList(force)
+	local now = os.clock()
+	if not force and now - allowScanned < 5 then
+		return
+	end
+	allowScanned = now
+	-- anything this game already shows is fair to show again (only runs when an unknown
+	-- id arrives, at most every 5 s)
+	for _, root in ipairs({ ReplicatedStorage, workspace }) do
+		pcall(scanAssets, root)
+	end
+	for id in pairs(deps.Chassis.KNOWN) do
+		addAsset(id)
+	end
+	for _, id in ipairs(STOCK_MESHES) do
+		addAsset(id)
+	end
+end
+
+local function allowed(id)
+	if id == 0 or _G.CarHubTrustAllAssets == true then
+		return true
+	end
+	if allow[id] then
+		return true
+	end
+	refreshAllowList(false)
+	return allow[id] == true
+end
+
+------------------------------------------------------------------------------------------
+-- Building a remote car
+------------------------------------------------------------------------------------------
+
+local function makePart(spec, parent)
+	local part = Instance.new("Part")
+	part.Name = ROLE_NAMES[spec.role] or "Part"
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.Massless = true
+	part.Size = spec.size
+	part.Color = spec.color
+	part.Material = spec.material
+	part.Transparency = spec.transparency
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+	local meshOk = spec.meshType ~= Enum.MeshType.FileMesh or (allowed(spec.meshId) and allowed(spec.textureId))
+	if meshOk then
+		local mesh = Instance.new("SpecialMesh")
+		mesh.MeshType = spec.meshType
+		if spec.meshType == Enum.MeshType.FileMesh then
+			mesh.MeshId = "rbxassetid://" .. string.format("%d", spec.meshId)
+			if spec.textureId > 0 then
+				mesh.TextureId = "rbxassetid://" .. string.format("%d", spec.textureId)
+			end
+		end
+		mesh.Scale = spec.scale
+		mesh.Offset = spec.offset
+		mesh.VertexColor = spec.vertexColor
+		mesh.Parent = part
+	else
+		-- unknown asset: show the footprint, never the content
+		part.Size = Vector3.new(math.abs(spec.scale.X), math.abs(spec.scale.Y), math.abs(spec.scale.Z)) * 0.6
+		part.Material = Enum.Material.SmoothPlastic
+		part.Color = Color3.fromRGB(90, 92, 98)
+		part.Transparency = 0.4
+	end
+	part.Parent = parent
+	return part
+end
+
+local SMOKE
+local function smokeEmitter(parent)
+	local e = Instance.new("ParticleEmitter")
+	e.Name = "TireSmoke"
+	e.Texture = "rbxassetid://10307541196"
+	e.Lifetime = NumberRange.new(5, 10)
+	e.Speed = NumberRange.new(0, 4)
+	e.Drag = 0.3
+	e.Acceleration = Vector3.new(0, 0.135, 0)
+	e.RotSpeed = NumberRange.new(-100, 100)
+	e.Rotation = NumberRange.new(-180, 180)
+	e.SpreadAngle = Vector2.new(360, 360)
+	e.LightInfluence = 1
+	e.VelocityInheritance = 0.1
+	e.Rate = 0
+	e.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1),
+		NumberSequenceKeypoint.new(0.05, 0.92),
+		NumberSequenceKeypoint.new(0.55, 0.98),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	e.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0),
+		NumberSequenceKeypoint.new(0.03, 2, 0.6),
+		NumberSequenceKeypoint.new(1, 6.7),
+	})
+	e.Parent = parent
+	return e
+end
+SMOKE = smokeEmitter
+
+local function buildAudio(car, desc, parent)
+	local Spec, Tuning = deps.Spec, deps.Tuning
+	local soundsFolder = ReplicatedStorage:FindFirstChild("CarSounds")
+	local function resolve(name)
+		if not soundsFolder or type(name) ~= "string" or name == "" then
+			return nil
+		end
+		if name:match("^rbxassetid://%d+$") then
+			return name
+		end
+		local s = soundsFolder:FindFirstChild(name, true) or soundsFolder:FindFirstChild((name:gsub("%.%w+$", "")), true)
+		return s and s:IsA("Sound") and s.SoundId or nil
+	end
+	local packs = Tuning.packs()
+	local function packFor(key, role)
+		for _, p in ipairs(packs) do
+			if p.key == key then
+				return p
+			end
+		end
+		return Spec.pickPack(packs, role, "auto")
+	end
+	local layers = {
+		on = Spec.buildLayers(packFor(desc.packOn, "on"), desc.volume * 0.75, desc.volume),
+		off = Spec.buildLayers(packFor(desc.packOff, "off"), desc.volume * 0.58, desc.volume * 0.775),
+	}
+	car.audio = { layers = layers, chans = {}, load = 0 }
+	local function chan(key, id)
+		id = resolve(id)
+		if not id then
+			return
+		end
+		local s = Instance.new("Sound")
+		s.Name = key
+		s.SoundId = id
+		s.Looped = true
+		s.Volume = 0
+		s.RollOffMode = Enum.RollOffMode.InverseTapered
+		s.RollOffMinDistance = 12
+		s.RollOffMaxDistance = 300
+		s.Parent = parent
+		car.audio.chans[key] = s
+	end
+	for set, list in pairs(layers) do
+		for i, l in ipairs(list) do
+			chan(set .. i, l.id)
+		end
+	end
+	chan("idle", Spec.DEFAULT_SOUNDS.engine.idle.id)
+	chan("squeal", Tuning.get("sound.squeal"))
+end
+
+function Replica.onStructure(sid, uid, desc)
+	Replica.remove(sid)
+	local player = Players:GetPlayerByUserId(uid)
+	if not player or player == Players.LocalPlayer and sid ~= "lpb" then
+		return
+	end
+	folder = folder or workspace:FindFirstChild("CarHubRemote")
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = "CarHubRemote"
+		folder.Parent = workspace
+	end
+	refreshAllowList(true)
+
+	local L = desc.layout
+	local layout = {
+		frontZ = L[1], rearZ = L[2], trackFront = L[3], trackRear = L[4], wheelY = L[5],
+		radiusFront = L[6], radiusRear = L[7], widthFront = L[8], widthRear = L[9],
+	}
+	local model = Instance.new("Model")
+	model.Name = "Car_" .. sid
+	local car = {
+		sid = sid,
+		uid = uid,
+		player = player,
+		model = model,
+		layout = layout,
+		bodyOffset = deps.Chassis.bodyOffset(layout),
+		details = {},
+		wheels = {},
+		snapshots = {},
+		offset = nil,
+		jitter = 0.03,
+		spin = { FL = 0, FR = 0, RL = 0, RR = 0 },
+		parts = {},
+		cframes = {},
+	}
+
+	for _, name in ipairs(CORNERS) do
+		local front = name == "FL" or name == "FR"
+		local side = (name == "FL" or name == "RL") and -1 or 1
+		local half = (front and layout.trackFront or layout.trackRear) / 2
+		local wb = layout.rearZ - layout.frontZ
+		local contact = Instance.new("Part")
+		contact.Name = name .. "Contact"
+		contact.Anchored = true
+		contact.CanCollide = false
+		contact.CanQuery = false
+		contact.CanTouch = false
+		contact.Transparency = 1
+		contact.Size = Vector3.one * 0.2
+		contact.Parent = model
+		car.wheels[name] = {
+			design = Vector3.new(side * half, 0, front and -wb / 2 or wb / 2),
+			radius = front and layout.radiusFront or layout.radiusRear,
+			pieces = {},
+			contact = contact,
+			smoke = SMOKE(contact),
+		}
+	end
+
+	for _, spec in ipairs(desc.parts) do
+		local part = makePart(spec, model)
+		if spec.role == 0 then
+			car.body = part
+		elseif spec.role == 1 then
+			table.insert(car.details, { part = part, rel = spec.rel })
+		elseif spec.corner and car.wheels[spec.corner] then
+			table.insert(car.wheels[spec.corner].pieces, part)
+		else
+			part:Destroy()
+		end
+	end
+	if not car.body then
+		model:Destroy()
+		return
+	end
+	buildAudio(car, desc, car.body)
+	car.idle, car.redline = desc.idle, desc.redline
+	model.PrimaryPart = car.body
+	model.Parent = folder
+	cars[sid] = car
+end
+
+function Replica.remove(sid)
+	local car = cars[sid]
+	if car then
+		cars[sid] = nil
+		car.model:Destroy()
+	end
+end
+
+function Replica.clear()
+	for sid in pairs(cars) do
+		Replica.remove(sid)
+	end
+end
+
+function Replica.hasCar(sid)
+	return cars[sid] ~= nil
+end
+
+function Replica.count()
+	local n = 0
+	for _ in pairs(cars) do
+		n += 1
+	end
+	return n
+end
+
+------------------------------------------------------------------------------------------
+-- Snapshots
+------------------------------------------------------------------------------------------
+
+function Replica.onState(sid, s)
+	local car = cars[sid]
+	if not car then
+		return
+	end
+	local now = os.clock()
+	local sent = s.t / 1000
+	local list = car.snapshots
+	-- sender clock wraps every ~49 days; treat big jumps as a fresh timeline
+	local last = list[#list]
+	if last and (sent <= last.time or sent - last.time > 10) then
+		if sent <= last.time and last.time - sent < 1 then
+			return -- stale or duplicated packet
+		end
+		table.clear(list)
+		car.offset = nil
+	end
+	local offset = now - sent
+	if not car.offset then
+		car.offset = offset
+	else
+		-- track the fastest delivery, letting it drift up slowly for clock skew
+		local deviation = offset - car.offset
+		car.jitter += (math.abs(deviation) - car.jitter) * 0.1
+		car.offset = math.min(car.offset + 0.002, offset)
+	end
+	s.time = sent
+	table.insert(list, s)
+	if #list > BUFFER_SIZE then
+		table.remove(list, 1)
+	end
+end
+
+------------------------------------------------------------------------------------------
+-- Playback
+------------------------------------------------------------------------------------------
+
+local function hermite(p0, v0, p1, v1, t, span)
+	local t2, t3 = t * t, t * t * t
+	return p0 * (2 * t3 - 3 * t2 + 1) + v0 * (span * (t3 - 2 * t2 + t)) + p1 * (-2 * t3 + 3 * t2) + v1 * (span * (t3 - t2))
+end
+
+local function lerp(a, b, t)
+	return a + (b - a) * t
+end
+
+local function sample(car)
+	local list = car.snapshots
+	local n = #list
+	if n == 0 then
+		return nil
+	end
+	local delay = math.clamp(0.06 + car.jitter * 2.5, 0.06, 0.35)
+	local target = os.clock() - car.offset - delay
+	local a, b
+	for i = n, 1, -1 do
+		if list[i].time <= target then
+			a, b = list[i], list[i + 1]
+			break
+		end
+	end
+	if not a then
+		return list[1], nil, 0, 0
+	end
+	if not b then
+		-- late: extrapolate briefly from the newest snapshot
+		local ahead = math.min(target - a.time, 0.3)
+		return a, nil, 0, ahead
+	end
+	local span = math.max(b.time - a.time, 1e-3)
+	return a, b, math.clamp((target - a.time) / span, 0, 1), 0, span
+end
+
+local function rotate(cf, w, dt)
+	local m = w.Magnitude
+	if m < 1e-4 then
+		return cf
+	end
+	return CFrame.fromAxisAngle(w / m, m * dt) * cf.Rotation + cf.Position
+end
+
+local function smooth(rate, dt)
+	return 1 - math.exp(-rate * dt)
+end
+
+local function updateAudio(car, s, dt)
+	local audio = car.audio
+	if not audio then
+		return
+	end
+	local chans = audio.chans
+	local running = bit32.band(s.flags, 1) ~= 0 and bit32.band(s.flags, 4) == 0
+	local rpm = s.rpm
+	local target = math.clamp(s.throttle * 1.5, 0, 1)
+	audio.load += (target - audio.load) * smooth(8, dt)
+	local idleFade = chans.idle and math.clamp(1 - (rpm - car.idle) / 700, 0, 1) or 0
+	local function set(sound, volume, pitch)
+		if not sound then
+			return
+		end
+		sound.Volume += (volume - sound.Volume) * smooth(20, dt)
+		sound.PlaybackSpeed += (pitch - sound.PlaybackSpeed) * smooth(40, dt)
+		if volume < 0.003 and sound.Volume < 0.003 then
+			if sound.Playing then
+				sound:Pause()
+			end
+		elseif not sound.Playing then
+			sound:Play()
+		end
+	end
+	for setName, list in pairs(audio.layers) do
+		for i, l in ipairs(list) do
+			local fin, fout = 1, 1
+			if l.fadeInEnd > l.fadeInStart then
+				fin = math.sin(math.clamp((rpm - l.fadeInStart) / (l.fadeInEnd - l.fadeInStart), 0, 1) * math.pi / 2)
+			end
+			if l.fadeOutEnd > l.fadeOutStart then
+				fout = math.cos(math.clamp((rpm - l.fadeOutStart) / (l.fadeOutEnd - l.fadeOutStart), 0, 1) * math.pi / 2)
+			end
+			local load = setName == "on" and audio.load or (1 - audio.load)
+			set(chans[setName .. i], running and l.volume * fin * fout * load * math.sqrt(1 - idleFade) or 0, math.clamp(rpm / l.refRPM, 0.6, 2.2))
+		end
+	end
+	set(chans.idle, running and math.sqrt(idleFade) or 0, math.clamp(rpm / car.idle, 0.95, 1.05))
+	local slip = 0
+	for _, name in ipairs(CORNERS) do
+		slip = math.max(slip, s.wheels[name].slip)
+	end
+	set(chans.squeal, math.clamp((slip - 0.4) / 0.5, 0, 1) * 0.8, 0.9 + 0.4 * math.clamp(s.vel.Magnitude * 0.28 / 40, 0, 1))
+end
+
+local function step(dt)
+	for sid, car in pairs(cars) do
+		if not car.player.Parent then
+			Replica.remove(sid)
+			continue
+		end
+		local a, b, alpha, ahead, span = sample(car)
+		if not a then
+			continue
+		end
+		local cf, vel, s
+		if b then
+			local pos = hermite(a.cf.Position, a.vel, b.cf.Position, b.vel, alpha, span)
+			cf = a.cf.Rotation:Lerp(b.cf.Rotation, alpha) + pos
+			vel = a.vel:Lerp(b.vel, alpha)
+			s = { flags = alpha < 0.5 and a.flags or b.flags, rpm = lerp(a.rpm, b.rpm, alpha), throttle = lerp(a.throttle, b.throttle, alpha), vel = vel, wheels = {} }
+			for _, name in ipairs(CORNERS) do
+				local wa, wb = a.wheels[name], b.wheels[name]
+				s.wheels[name] = {
+					dy = lerp(wa.dy, wb.dy, alpha),
+					dx = lerp(wa.dx, wb.dx, alpha),
+					dz = lerp(wa.dz, wb.dz, alpha),
+					yaw = lerp(wa.yaw, wb.yaw, alpha),
+					camber = lerp(wa.camber, wb.camber, alpha),
+					omega = lerp(wa.omega, wb.omega, alpha),
+					slip = lerp(wa.slip, wb.slip, alpha),
+				}
+			end
+		else
+			cf = rotate(a.cf, a.ang, ahead) + a.vel * ahead
+			s = a
+		end
+
+		local parts, cframes = car.parts, car.cframes
+		table.clear(parts)
+		table.clear(cframes)
+		local bodyCf = cf * car.bodyOffset
+		parts[1], cframes[1] = car.body, bodyCf
+		for _, d in ipairs(car.details) do
+			table.insert(parts, d.part)
+			table.insert(cframes, bodyCf * d.rel)
+		end
+		for _, name in ipairs(CORNERS) do
+			local wheel = car.wheels[name]
+			local w = s.wheels[name]
+			car.spin[name] = (car.spin[name] + w.omega * dt) % (math.pi * 2)
+			local hub = cf * CFrame.new(wheel.design + Vector3.new(w.dx, w.dy, w.dz)) * CFrame.Angles(0, math.rad(w.yaw), 0) * CFrame.Angles(0, 0, math.rad(w.camber))
+			local spun = hub * CFrame.Angles(-car.spin[name], 0, 0)
+			for _, piece in ipairs(wheel.pieces) do
+				table.insert(parts, piece)
+				table.insert(cframes, spun)
+			end
+			table.insert(parts, wheel.contact)
+			table.insert(cframes, hub * CFrame.new(0, -wheel.radius, 0))
+			local slip = w.slip
+			wheel.smoke.Rate = slip > 0.6 and 50 * math.min(slip, 2) or 0
+		end
+		workspace:BulkMoveTo(parts, cframes, Enum.BulkMoveMode.FireCFrameChanged)
+
+		-- keep the remote driver seated (their own client anchors them in place)
+		local char = car.player ~= Players.LocalPlayer and car.player.Character
+		if char and bit32.band(s.flags, 1) ~= 0 then
+			pcall(char.PivotTo, char, cf)
+		end
+		updateAudio(car, s, dt)
+	end
+end
+
+function Replica.setup(modules)
+	deps = modules
+	if heartbeat then
+		heartbeat:Disconnect()
+	end
+	heartbeat = RunService.RenderStepped:Connect(function(dt)
+		debug.profilebegin("CarHub.replica")
+		local ok, err = pcall(step, dt)
+		debug.profileend()
+		if not ok then
+			warn("Replica: " .. tostring(err))
+		end
+	end)
+	local old = workspace:FindFirstChild("CarHubRemote")
+	if old then
+		old:Destroy()
+	end
+end
+
+function Replica.shutdown()
+	if heartbeat then
+		heartbeat:Disconnect()
+		heartbeat = nil
+	end
+	Replica.clear()
+	if folder then
+		folder:Destroy()
+		folder = nil
+	end
+end
+
+return Replica
