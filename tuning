@@ -693,6 +693,8 @@ function Tuning.setup(spec)
 			local param = Spec.byId[id]
 			if param then
 				param.default = value
+				-- a car definition that pins a derived value wins over the derivation
+				param.auto = nil
 			end
 		end
 	end
