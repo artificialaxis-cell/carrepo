@@ -1,0 +1,18 @@
+-- Relay connection status shared between Net (writer) and the UI (reader).
+local Connection = {}
+
+Connection.status = "DISCONNECTED" -- DISCONNECTED | CONNECTING | CONNECTED
+Connection.detail = "Not connected"
+Connection.players = {} -- { name, uid, sid, present, hasCar }
+Connection.latency = nil -- seconds
+Connection.relay = nil
+Connection.changed = Instance.new("BindableEvent")
+
+function Connection.update(status, detail, players)
+	Connection.status = status
+	Connection.detail = detail
+	Connection.players = players or {}
+	Connection.changed:Fire(status)
+end
+
+return Connection
