@@ -27,6 +27,11 @@ local SOURCES = {
 }
 
 local function grab(url)
+	-- the entry script provides a session cache so respawns do not refetch modules
+	local genv = (getgenv and getgenv()) or _G
+	if type(genv.CarHubGrab) == "function" then
+		return genv.CarHubGrab(url)
+	end
 	local ok, src = pcall(game.HttpGet, game, url)
 	if not ok then
 		error("couldn't fetch " .. url .. ": " .. tostring(src))
@@ -71,7 +76,59 @@ Hub.modules = {
 	UI = UI,
 }
 
+-- Long frames get logged with whatever blocking hub work was in flight, so freezes can
+-- be told apart from the game's own.
+local function hitchLogger()
+	local last = 0
+	return RunService.Heartbeat:Connect(function(dt)
+		if dt < 0.25 then
+			return
+		end
+		local now = os.clock()
+		local causes = {}
+		for _, m in ipairs(Net.marks or {}) do
+			if m.at >= now - dt - 0.1 then
+				table.insert(causes, m.name)
+			end
+		end
+		for name in pairs(Net.active or {}) do
+			table.insert(causes, name)
+		end
+		if now - last < 2 and #causes == 0 then
+			return
+		end
+		last = now
+		local message = ("Frame froze for %.2f s"):format(dt)
+			.. (#causes > 0 and (" during: " .. table.concat(causes, ", ")) or " (no hub work was running - the game or executor)")
+		warn("CarHub: " .. message)
+		if CarInit.note then
+			CarInit.note(message)
+		end
+	end)
+end
+
+function Hub.stop()
+	for _, c in ipairs(Hub.connections or {}) do
+		c:Disconnect()
+	end
+	Hub.connections = {}
+	pcall(Net.shutdown)
+	pcall(Replica.shutdown)
+	pcall(UI.destroy)
+end
+
 function Hub.start()
+	-- one hub per session: running the script again replaces the previous instance
+	-- instead of stacking a second set of loops, sockets and renderers on top of it
+	local genv = (getgenv and getgenv()) or _G
+	if genv.CarHubInstance and genv.CarHubInstance ~= Hub and genv.CarHubInstance.stop then
+		pcall(genv.CarHubInstance.stop)
+	end
+	genv.CarHubInstance = Hub
+	Hub.connections = {}
+	local started = os.clock()
+	Net.mark("hub start")
+
 	Chassis.setup({ Spec = Spec })
 	Tuning.setup(Spec)
 	CarInit.setup({ Chassis = Chassis, Physics = Physics, Tuning = Tuning })
@@ -100,13 +157,16 @@ function Hub.start()
 		end
 	end)
 
+	table.insert(Hub.connections, input)
+	table.insert(Hub.connections, hitchLogger())
+	-- multi-frame work counts as "in flight" for hitch attribution
+	table.insert(Hub.connections, CarInit.changed.Event:Connect(function(state)
+		Net.busy("car build", state == "INITIALIZING")
+	end))
+	CarInit.note(("Hub started in %d ms"):format((os.clock() - started) * 1000))
+
 	if typeof(script) == "Instance" then
-		script.Destroying:Connect(function()
-			input:Disconnect()
-			Net.shutdown()
-			Replica.shutdown()
-			UI.destroy()
-		end)
+		script.Destroying:Connect(Hub.stop)
 	end
 
 	_G.CarHub = Hub.modules
