@@ -258,7 +258,7 @@ local function buildAudio(car, desc, parent)
 	car.audio = { layers = layers, chans = {}, load = 0 }
 	local function chan(key, id)
 		id = resolve(id)
-		if not id then
+		if not id or (genv.CarHubFailedSounds and genv.CarHubFailedSounds[id]) then
 			return
 		end
 		local s = Instance.new("Sound")
@@ -519,8 +519,11 @@ local function updateAudio(car, s, dt)
 	local target = math.clamp(s.throttle * 1.5, 0, 1)
 	audio.load += (target - audio.load) * smooth(8, dt)
 	local idleFade = chans.idle and math.clamp(1 - (rpm - car.idle) / 700, 0, 1) or 0
+	local failed = genv.CarHubFailedSounds or {}
+	genv.CarHubFailedSounds = failed
+	local now = os.clock()
 	local function set(sound, volume, pitch)
-		if not sound then
+		if not sound or not sound.Parent then
 			return
 		end
 		sound.Volume += (volume - sound.Volume) * smooth(20, dt)
@@ -530,7 +533,18 @@ local function updateAudio(car, s, dt)
 				sound:Pause()
 			end
 		elseif not sound.Playing then
-			sound:Play()
+			-- never re-request an unloadable asset every frame (see Physics audio)
+			local tries = sound:GetAttribute("Tries") or 0
+			if failed[sound.SoundId] or tries >= 4 then
+				failed[sound.SoundId] = true
+				sound:Destroy()
+			elseif now >= (sound:GetAttribute("RetryAt") or 0) then
+				sound:Play()
+				if not sound.IsLoaded then
+					sound:SetAttribute("Tries", tries + 1)
+					sound:SetAttribute("RetryAt", now + 2)
+				end
+			end
 		end
 	end
 	for setName, list in pairs(audio.layers) do
