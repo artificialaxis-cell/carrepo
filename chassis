@@ -1,0 +1,962 @@
+--[[
+	Chassis
+	-------
+	Procedural chassis generation.
+
+	Input is a *layout*: where the four wheels sit relative to the body mesh and how big they
+	are. From that the generator derives every dependent point - strut towers, wishbone and
+	link pickups, steering rack and tie rods, collision hull, mass and driver placement - as
+	proportions of the wheel radius and track, so any body/wheel combination gets a chassis
+	that fits it. Spring, damper and tire rates are applied separately (`applyTuning`) so they
+	can be changed live without rebuilding.
+
+	Coordinate frame used throughout ("chassis space"):
+	  origin  = midpoint between the axles at wheel-centre height
+	  +X      = right, +Y = up, -Z = forward (Roblox LookVector)
+
+	The stock car's geometry was measured from the original hand-built rig and expressed in
+	these proportions, so the default body reproduces the original suspension layout.
+]]
+
+local AssetService = game:GetService("AssetService")
+
+local Chassis = {}
+
+local Spec
+
+function Chassis.setup(deps)
+	Spec = deps.Spec
+end
+
+------------------------------------------------------------------------------------------
+-- Measuring meshes
+------------------------------------------------------------------------------------------
+
+-- survives respawns: asset bounds never change
+local meshSizes = _G.CarHubMeshSizes or {}
+_G.CarHubMeshSizes = meshSizes
+
+-- Measure many meshes at once (each lookup is a network round trip).
+function Chassis.prefetch(meshIds)
+	local pending = 0
+	local done = Instance.new("BindableEvent")
+	for _, id in ipairs(meshIds) do
+		if meshSizes[id] == nil then
+			pending += 1
+			task.spawn(function()
+				Chassis.meshSize(id)
+				pending -= 1
+				if pending == 0 then
+					done:Fire()
+				end
+			end)
+		end
+	end
+	if pending > 0 then
+		done.Event:Wait()
+	end
+	done:Destroy()
+end
+
+-- Native size of a mesh asset. Yields the first time an id is seen.
+function Chassis.meshSize(meshId)
+	if not meshId or meshId == "" then
+		return nil
+	end
+	local cached = meshSizes[meshId]
+	if cached ~= nil then
+		return cached or nil
+	end
+	local ok, part = pcall(AssetService.CreateMeshPartAsync, AssetService, meshId)
+	if ok and part then
+		meshSizes[meshId] = part.MeshSize
+		part:Destroy()
+	else
+		meshSizes[meshId] = false
+	end
+	return meshSizes[meshId] or nil
+end
+
+-- Rendered size of a part, accounting for SpecialMesh scale.
+function Chassis.visualSize(part)
+	local mesh = part:FindFirstChildOfClass("SpecialMesh")
+	if not mesh then
+		return part.Size
+	end
+	if mesh.MeshType == Enum.MeshType.FileMesh then
+		local native = Chassis.meshSize(mesh.MeshId)
+		if native then
+			return native * mesh.Scale
+		end
+		return nil
+	end
+	return part.Size * mesh.Scale
+end
+
+------------------------------------------------------------------------------------------
+-- Layouts
+------------------------------------------------------------------------------------------
+
+-- Measured from the original rig (body space, studs).
+Chassis.KNOWN = {
+	["rbxassetid://106343343162810"] = {
+		frontZ = -7.612,
+		rearZ = 6.562,
+		trackFront = 7.591,
+		trackRear = 7.230,
+		wheelY = -2.336,
+	},
+}
+
+-- Proportions of the stock car, used to estimate a layout from the body bounds alone.
+local EST = {
+	wheelbase = 0.6052,
+	center = -0.0224,
+	trackFront = 0.7472,
+	trackRear = 0.7116,
+	wheelY = -0.3673,
+	radius = 0.0699,
+	width = 0.80,
+}
+
+local FIELDS = { "frontZ", "rearZ", "trackFront", "trackRear", "wheelY", "radiusFront", "radiusRear", "widthFront", "widthRear" }
+Chassis.FIELDS = FIELDS
+
+local function copyLayout(t)
+	local out = {}
+	for key, value in pairs(t) do
+		out[key] = value
+	end
+	return out
+end
+Chassis.copyLayout = copyLayout
+
+function Chassis.estimate(bodySize, tireSize)
+	bodySize = bodySize or Vector3.new(10.16, 6.36, 23.42)
+	local L, W, H = bodySize.Z, bodySize.X, bodySize.Y
+	local wb = EST.wheelbase * L
+	local center = EST.center * L
+	local radius, width
+	if tireSize then
+		local dims = { tireSize.X, tireSize.Y, tireSize.Z }
+		table.sort(dims)
+		width = dims[1]
+		radius = (dims[2] + dims[3]) / 4
+	else
+		radius = EST.radius * L
+		width = EST.width * radius
+	end
+	return {
+		frontZ = center - wb / 2,
+		rearZ = center + wb / 2,
+		trackFront = EST.trackFront * W,
+		trackRear = EST.trackRear * W,
+		wheelY = EST.wheelY * H,
+		radiusFront = radius,
+		radiusRear = radius,
+		widthFront = width,
+		widthRear = width,
+	}
+end
+
+-- Try to read the layout straight from where the wheel meshes sit. Accepts it only if
+-- the pieces form a plausible rectangle of four wheels around the body.
+function Chassis.detect(bodyFrame, wheelPieces, radius)
+	radius = radius or 1.6
+	local clusters = {}
+	for _, piece in ipairs(wheelPieces) do
+		local p = bodyFrame:PointToObjectSpace(piece.Position)
+		local home
+		for _, c in ipairs(clusters) do
+			if (c.center - p).Magnitude < radius * 0.6 then
+				home = c
+				break
+			end
+		end
+		if home then
+			home.sum += p
+			home.n += 1
+			home.center = home.sum / home.n
+		else
+			table.insert(clusters, { sum = p, n = 1, center = p })
+		end
+	end
+	if #clusters ~= 4 then
+		return nil
+	end
+	local left, right = {}, {}
+	for _, c in ipairs(clusters) do
+		if c.center.X < -radius * 0.5 then
+			table.insert(left, c.center)
+		elseif c.center.X > radius * 0.5 then
+			table.insert(right, c.center)
+		end
+	end
+	if #left ~= 2 or #right ~= 2 then
+		return nil
+	end
+	local function byZ(a, b)
+		return a.Z < b.Z
+	end
+	table.sort(left, byZ)
+	table.sort(right, byZ)
+	local fl, rl, fr, rr = left[1], left[2], right[1], right[2]
+	if (rl.Z - fl.Z) < radius * 2.2 or (rr.Z - fr.Z) < radius * 2.2 then
+		return nil
+	end
+	if math.abs(fl.Z - fr.Z) > radius or math.abs(rl.Z - rr.Z) > radius then
+		return nil
+	end
+	return {
+		frontZ = (fl.Z + fr.Z) / 2,
+		rearZ = (rl.Z + rr.Z) / 2,
+		trackFront = fr.X - fl.X,
+		trackRear = rr.X - rl.X,
+		wheelY = (fl.Y + fr.Y + rl.Y + rr.Y) / 4,
+	}
+end
+
+--[[
+	Resolve a layout. Priority: saved profile > detected from wheel meshes > known body >
+	estimate from body bounds. Radii come from the measured tire mesh unless the source
+	specifies them.
+	input = { bodyMeshId, bodySize, bodyFrame, wheelPieces, tireSize, profiles }
+]]
+function Chassis.resolve(input)
+	local base = Chassis.estimate(input.bodySize, input.tireSize)
+	local layout, source
+
+	local profile = input.profiles and input.bodyMeshId and input.profiles[input.bodyMeshId]
+	if profile then
+		layout, source = profile, "profile"
+	end
+	if not layout and input.bodyFrame and input.wheelPieces and #input.wheelPieces > 0 then
+		layout = Chassis.detect(input.bodyFrame, input.wheelPieces, base.radiusFront)
+		source = layout and "detected" or nil
+	end
+	if not layout and input.bodyMeshId and Chassis.KNOWN[input.bodyMeshId] then
+		layout, source = Chassis.KNOWN[input.bodyMeshId], "known"
+	end
+	if not layout then
+		layout, source = base, "estimated"
+	end
+
+	local out = copyLayout(base)
+	for _, key in ipairs(FIELDS) do
+		if layout[key] ~= nil then
+			out[key] = layout[key]
+		end
+	end
+	out.source = source
+	return out
+end
+
+------------------------------------------------------------------------------------------
+-- Geometry
+------------------------------------------------------------------------------------------
+
+local CORNERS = {
+	FL = { front = true, side = -1 },
+	FR = { front = true, side = 1 },
+	RL = { front = false, side = -1 },
+	RR = { front = false, side = 1 },
+}
+Chassis.CORNERS = CORNERS
+Chassis.ORDER = { "FL", "FR", "RL", "RR" }
+
+local function v3(x, y, z)
+	return Vector3.new(x, y, z)
+end
+
+------------------------------------------------------------------------------------------
+-- Front kinematics solver
+--
+-- Solves the knuckle pose for a given vertical wheel travel with the steering held
+-- straight, from the actual constraints the chassis uses (two wishbone rods to the ball
+-- joint, strut line through the tower). Used to place the inner tie-rod pivot so the
+-- steering arm's path is a circle around it, i.e. no bump steer.
+------------------------------------------------------------------------------------------
+
+local function solveLinear(A, b)
+	local n = #b
+	for col = 1, n do
+		local pivot, best = col, math.abs(A[col][col])
+		for row = col + 1, n do
+			if math.abs(A[row][col]) > best then
+				pivot, best = row, math.abs(A[row][col])
+			end
+		end
+		if best < 1e-12 then
+			return nil
+		end
+		A[col], A[pivot] = A[pivot], A[col]
+		b[col], b[pivot] = b[pivot], b[col]
+		for row = col + 1, n do
+			local f = A[row][col] / A[col][col]
+			for k = col, n do
+				A[row][k] -= f * A[col][k]
+			end
+			b[row] -= f * b[col]
+		end
+	end
+	local x = {}
+	for row = n, 1, -1 do
+		local s = b[row]
+		for k = row + 1, n do
+			s -= A[row][k] * x[k]
+		end
+		x[row] = s / A[row][row]
+	end
+	return x
+end
+
+-- pts: corner points at design pose. Returns world-space (chassis) position of `point`
+-- (a design-pose point on the knuckle) after vertical travel `delta`.
+local function knucklePath(pts, delta, point)
+	local C = pts.center
+	local bj = pts.links[1].hub - C
+	local hs = pts.hubStrut - C
+	local arm = point - C
+	local pickA, pickB = pts.links[1].body, pts.links[2].body
+	local lenA, lenB = (pts.links[1].hub - pickA).Magnitude, (pts.links[2].hub - pickB).Magnitude
+	local dir = pts.strutDir
+	local ref = math.abs(dir.Z) < 0.95 and Vector3.zAxis or Vector3.xAxis
+	local n1 = (ref - dir * ref:Dot(dir)).Unit
+	local n2 = dir:Cross(n1).Unit
+	local tower = pts.strutTop
+
+	local function pose(x)
+		return CFrame.new(C + Vector3.new(x[1], x[2], x[3])) * CFrame.Angles(x[4], x[5], x[6])
+	end
+	local function residual(x)
+		local cf = pose(x)
+		local p = cf.Position
+		local hsW = cf:PointToWorldSpace(hs)
+		local look = cf.LookVector
+		return {
+			(cf:PointToWorldSpace(bj) - pickA).Magnitude - lenA,
+			(cf:PointToWorldSpace(bj) - pickB).Magnitude - lenB,
+			(tower - hsW):Dot(cf:VectorToWorldSpace(n1)),
+			(tower - hsW):Dot(cf:VectorToWorldSpace(n2)),
+			p.Y - (C.Y + delta),
+			look.X,
+		}
+	end
+
+	local x = { 0, delta, 0, 0, 0, 0 }
+	for _ = 1, 25 do
+		local f = residual(x)
+		local err = 0
+		for i = 1, 6 do
+			err += f[i] * f[i]
+		end
+		if err < 1e-14 then
+			break
+		end
+		local J = {}
+		for i = 1, 6 do
+			J[i] = {}
+		end
+		for j = 1, 6 do
+			local h = 1e-5
+			local xp = table.clone(x)
+			xp[j] += h
+			local fp = residual(xp)
+			for i = 1, 6 do
+				J[i][j] = (fp[i] - f[i]) / h
+			end
+		end
+		local rhs = {}
+		for i = 1, 6 do
+			rhs[i] = -f[i]
+		end
+		local step = solveLinear(J, rhs)
+		if not step then
+			return nil
+		end
+		for j = 1, 6 do
+			x[j] += step[j]
+		end
+	end
+	return pose(x):PointToWorldSpace(arm)
+end
+
+-- Pivot that keeps |pivot - path(delta)| constant through droop, ride and bump.
+local function tieRodPivot(pts, nominal, droop, bump)
+	local a0 = knucklePath(pts, 0, pts.steerArm)
+	local a1 = knucklePath(pts, -droop, pts.steerArm)
+	local a2 = knucklePath(pts, bump, pts.steerArm)
+	if not (a0 and a1 and a2) then
+		return nil
+	end
+	local u, v = a1 - a0, a2 - a0
+	local normal = u:Cross(v)
+	if normal.Magnitude < 1e-6 then
+		-- straight path: any point in the plane normal to it works
+		local d = (a2 - a1).Unit
+		local tie = nominal - a0
+		return a0 + (tie - d * tie:Dot(d)).Unit * tie.Magnitude
+	end
+	-- circumcentre of the three arm positions; pivots on the circle's axis are equidistant
+	local uu, vv, uv = u:Dot(u), v:Dot(v), u:Dot(v)
+	local denom = 2 * (uu * vv - uv * uv)
+	local s = vv * (uu - uv) / denom
+	local t = uu * (vv - uv) / denom
+	local center = a0 + u * s + v * t
+	local axis = normal.Unit
+	local pivot = center + axis * (nominal - center):Dot(axis)
+	local length = (pivot - a0).Magnitude
+	local nominalLength = (nominal - a0).Magnitude
+	if length > nominalLength * 2.5 or length < nominalLength * 0.4 then
+		-- nearly straight path: an exact pivot would need an absurd tie rod, so settle
+		-- for zero first-order bump steer at the nominal length
+		local d = (a2 - a1).Unit
+		local tie = nominal - a0
+		return a0 + (tie - d * tie:Dot(d)).Unit * nominalLength
+	end
+	return pivot
+end
+
+-- All suspension points for one corner in chassis space.
+function Chassis.corner(layout, name)
+	local info = CORNERS[name]
+	local wb = layout.rearZ - layout.frontZ
+	local front = info.front
+	local half = (front and layout.trackFront or layout.trackRear) / 2
+	local r = front and layout.radiusFront or layout.radiusRear
+	local inb = -info.side -- +1 points toward the centreline
+	local C = v3(info.side * half, 0, front and -wb / 2 or wb / 2)
+
+	-- keep inboard pickups on their own side of the car for narrow tracks
+	local reach = math.max(half - 0.25, 0.2)
+	local function inward(fraction)
+		return inb * math.min(fraction * r, reach)
+	end
+
+	local pts = { center = C, radius = r, front = front, side = info.side }
+	pts.hubStrut = C + v3(inward(0.3865), 0.2548 * r, 0)
+	if front then
+		pts.strutTop = C + v3(inward(0.5045), 1.154 * r, 0.217 * r)
+		pts.links = {
+			{ hub = C + v3(inward(0.152), -0.215 * r, 0), body = C + v3(inward(0.890), -0.067 * r, -0.147 * r) },
+			{ hub = C + v3(inward(0.152), -0.215 * r, 0), body = C + v3(inward(0.819), -0.067 * r, 0.550 * r) },
+		}
+		pts.steerArm = C + v3(inward(0.103), 0.009 * r, 0.289 * r)
+		pts.rackNominal = C + v3(inward(0.870), -0.009 * r, 0.366 * r)
+		local axis = pts.strutTop - pts.links[1].hub
+		local arm = pts.steerArm - pts.links[1].hub
+		local along = axis.Unit * arm:Dot(axis.Unit)
+		pts.steerArmLength = (arm - along).Magnitude
+	else
+		pts.strutTop = C + v3(inward(0.478), 1.221 * r, 0)
+		pts.links = {
+			{ hub = C + v3(inward(0.365), -0.031 * r, 0.303 * r), body = C + v3(inward(1.562), -0.016 * r, 0.291 * r) },
+			{ hub = C + v3(inward(0.365), -0.031 * r, -0.303 * r), body = C + v3(inward(1.562), -0.016 * r, -0.306 * r) },
+			{ hub = C + v3(inward(0.365), -0.210 * r, -0.303 * r), body = C + v3(inward(0.800), -0.144 * r, -1.238 * r) },
+		}
+	end
+	local strut = pts.strutTop - pts.hubStrut
+	pts.strutLength = strut.Magnitude
+	pts.strutDir = strut.Unit
+	pts.strutCos = math.abs(pts.strutDir.Y)
+	if front then
+		-- inner tie-rod pivot from the solved knuckle path (zero bump steer); fall back
+		-- to the nominal point if the solver does not converge
+		pts.rackEnd = tieRodPivot(pts, pts.rackNominal, 0.40 * r, 0.35 * r) or pts.rackNominal
+	end
+	return pts
+end
+
+-- Geometry summary handed to Spec.build.
+function Chassis.geometry(layout)
+	local fl = Chassis.corner(layout, "FL")
+	local rl = Chassis.corner(layout, "RL")
+	return {
+		wheelbase = layout.rearZ - layout.frontZ,
+		trackFront = layout.trackFront,
+		trackRear = layout.trackRear,
+		radiusFront = layout.radiusFront,
+		radiusRear = layout.radiusRear,
+		widthFront = layout.widthFront,
+		widthRear = layout.widthRear,
+		strutCosFront = fl.strutCos,
+		strutCosRear = rl.strutCos,
+		steerArm = fl.steerArmLength,
+	}
+end
+
+-- Body frame relative to the chassis frame.
+function Chassis.bodyOffset(layout)
+	return CFrame.new(0, -layout.wheelY, -(layout.frontZ + layout.rearZ) / 2)
+end
+
+------------------------------------------------------------------------------------------
+-- Instance helpers
+------------------------------------------------------------------------------------------
+
+local function new(class, props, parent)
+	local inst = Instance.new(class)
+	for key, value in pairs(props) do
+		inst[key] = value
+	end
+	if parent then
+		inst.Parent = parent
+	end
+	return inst
+end
+
+local function invisiblePart(name, size, cf, parent, extra)
+	local part = new("Part", {
+		Name = name,
+		Size = size,
+		CFrame = cf,
+		Transparency = 1,
+		CanCollide = false,
+		CanQuery = false,
+		CanTouch = false,
+		Anchored = false,
+		CastShadow = false,
+		Material = Enum.Material.SmoothPlastic,
+		TopSurface = Enum.SurfaceType.Smooth,
+		BottomSurface = Enum.SurfaceType.Smooth,
+	})
+	if extra then
+		for key, value in pairs(extra) do
+			part[key] = value
+		end
+	end
+	part.Parent = parent
+	return part
+end
+
+local function attachment(name, parent, worldCf)
+	return new("Attachment", { Name = name, CFrame = parent.CFrame:ToObjectSpace(worldCf) }, parent)
+end
+
+local function weld(a, b, parent)
+	return new("WeldConstraint", { Part0 = a, Part1 = b }, parent or a)
+end
+
+local SMOKE = {
+	Color = ColorSequence.new(Color3.new(1, 1, 1)),
+	Drag = 0.3,
+	LightInfluence = 1,
+	Lifetime = NumberRange.new(5, 10),
+	Speed = NumberRange.new(0, 4.05),
+	Texture = "rbxassetid://10307541196",
+	Acceleration = Vector3.new(0, 0.135, 0),
+	RotSpeed = NumberRange.new(-100, 100),
+	Rate = 0,
+	Rotation = NumberRange.new(-180, 180),
+	Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1),
+		NumberSequenceKeypoint.new(0.0505, 0.92),
+		NumberSequenceKeypoint.new(0.109, 0.95),
+		NumberSequenceKeypoint.new(0.546, 0.979),
+		NumberSequenceKeypoint.new(1, 1),
+	}),
+	SpreadAngle = Vector2.new(360, 360),
+	LightEmission = 0,
+	Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0),
+		NumberSequenceKeypoint.new(0.0276, 2.02, 0.607),
+		NumberSequenceKeypoint.new(1, 6.66),
+	}),
+	EmissionDirection = Enum.NormalId.Top,
+	VelocityInheritance = 0.1,
+	Enabled = true,
+}
+
+local ROD_COLOR = BrickColor.new("Black")
+
+------------------------------------------------------------------------------------------
+-- Build
+------------------------------------------------------------------------------------------
+
+--[[
+	Build a drivable chassis.
+	  layout  - resolved layout (body space)
+	  stats   - output of Spec.build for this geometry
+	  origin  - world CFrame of the chassis frame
+	  body    - optional { size = Vector3 } for collision hull sizing
+	Returns the car Model (unparented).
+]]
+function Chassis.build(layout, stats, origin, body)
+	local car = new("Model", { Name = "SuspensionGroup" })
+	local wb = layout.rearZ - layout.frontZ
+	local rAvg = (layout.radiusFront + layout.radiusRear) / 2
+	local trackAvg = (layout.trackFront + layout.trackRear) / 2
+
+	local primary = invisiblePart("Primary", Vector3.new(trackAvg * 0.7, rAvg * 0.4, wb * 1.2), origin, car, {
+		Massless = true,
+		CustomPhysicalProperties = PhysicalProperties.new(0.01, 0.3, 0.5, 1, 1),
+	})
+	car.PrimaryPart = primary
+
+	new("Folder", { Name = "Aerodynamics" }, car)
+	local suspension = new("Folder", { Name = "Suspension" }, car)
+	local wheels = new("Folder", { Name = "Wheels" }, car)
+	local colliders = new("Folder", { Name = "Colliders" }, car)
+	for _, name in ipairs({ "Throttle", "Brake", "Clutch", "Steer" }) do
+		new("NumberValue", { Name = name }, car)
+	end
+
+	-- sprung masses ------------------------------------------------------------------
+	local massPart = invisiblePart("Mass", Vector3.new(trackAvg * 1.29, rAvg * 3.02, wb * 1.255), origin, car)
+	weld(massPart, primary)
+	local massAtt = new("Attachment", { Name = "Attachment" }, massPart)
+	new("VectorForce", {
+		Name = "Drag",
+		Attachment0 = massAtt,
+		RelativeTo = Enum.ActuatorRelativeTo.World,
+		ApplyAtCenterOfMass = true,
+		Force = Vector3.zero,
+		Visible = false,
+	}, massPart)
+	new("VectorForce", {
+		Name = "GravityComp",
+		Attachment0 = massAtt,
+		RelativeTo = Enum.ActuatorRelativeTo.World,
+		ApplyAtCenterOfMass = true,
+		Force = Vector3.zero,
+		Visible = false,
+	}, massPart)
+
+	local driver = invisiblePart("DriverMass", Vector3.new(1.386, 2.74, 2.736) * rAvg, origin, car, {
+		CustomPhysicalProperties = PhysicalProperties.new(4, 0.3, 0.5, 1, 1),
+	})
+	weld(driver, primary)
+
+	-- downforce application points (one per axle)
+	for _, axle in ipairs({ { "DownforceFront", -wb / 2 }, { "DownforceRear", wb / 2 } }) do
+		local att = new("Attachment", { Name = axle[1] .. "Att", Position = Vector3.new(0, 0, axle[2]) }, primary)
+		new("VectorForce", {
+			Name = axle[1],
+			Attachment0 = att,
+			RelativeTo = Enum.ActuatorRelativeTo.World,
+			Force = Vector3.zero,
+			Visible = false,
+		}, primary)
+	end
+
+	-- steering rack ------------------------------------------------------------------
+	local fl = Chassis.corner(layout, "FL")
+	local fr = Chassis.corner(layout, "FR")
+	local rackCenter = (fl.rackEnd + fr.rackEnd) / 2
+	local rackSpan = math.max(fr.rackEnd.X - fl.rackEnd.X, 0.4)
+	local rack = invisiblePart("SteeringRack", Vector3.new(rackSpan, 0.38 * rAvg, 0.38 * rAvg), origin * CFrame.new(rackCenter), suspension)
+	local slide = attachment("SteerSlide", primary, origin * CFrame.new(rackCenter))
+	local slideRack = attachment("SteerSlide_2", rack, origin * CFrame.new(rackCenter))
+	new("RigidConstraint", { Name = "Rack", Attachment0 = slide, Attachment1 = slideRack, Visible = false }, rack)
+	local rackEnds = {
+		FL = attachment("SteerFL", rack, origin * CFrame.new(fl.rackEnd)),
+		FR = attachment("SteerFR", rack, origin * CFrame.new(fr.rackEnd)),
+	}
+	car:SetAttribute("SteerArm", fl.steerArmLength)
+
+	-- corners --------------------------------------------------------------------------
+	local rims = {}
+	for _, name in ipairs(Chassis.ORDER) do
+		local pts = Chassis.corner(layout, name)
+		local r = pts.radius
+		local width = pts.front and layout.widthFront or layout.widthRear
+		local centerCf = origin * CFrame.new(pts.center)
+
+		local model = new("Model", { Name = name }, wheels)
+		local bounds = invisiblePart("Bounds", Vector3.new(width, r * 2, r * 2), centerCf, model, {
+			Shape = Enum.PartType.Cylinder,
+			CustomPhysicalProperties = PhysicalProperties.new(Spec.WHEEL_DENSITY, 0.7, 0, 100, 100),
+		})
+		model.PrimaryPart = bounds
+		local rim = invisiblePart("Rim", Vector3.new(width * 1.05, r * 1.36, r * 1.36), centerCf, model, {
+			Shape = Enum.PartType.Cylinder,
+			CanCollide = true,
+			Massless = true,
+		})
+		weld(rim, bounds)
+		table.insert(rims, rim)
+		new("NumberValue", { Name = "Roll" }, model)
+		new("Folder", { Name = "Rotating" }, model)
+		new("Folder", { Name = "Static" }, model)
+
+		local forceAtt = new("Attachment", { Name = "ForceAtt", Position = Vector3.new(0, -r, 0) }, bounds)
+		local smoke = new("ParticleEmitter", { Name = "TireSmoke" }, forceAtt)
+		for key, value in pairs(SMOKE) do
+			smoke[key] = value
+		end
+		new("Attachment", { Name = "SpinAtt" }, bounds)
+		new("Attachment", { Name = "TIRESTART" }, bounds)
+		new("Attachment", { Name = "TIREEND" }, bounds)
+		local center = new("Attachment", { Name = "CenterAtt" }, bounds)
+		for _, forceName in ipairs({ "TireForce", "FrictionForce" }) do
+			new("VectorForce", {
+				Name = forceName,
+				Attachment0 = forceAtt,
+				RelativeTo = Enum.ActuatorRelativeTo.World,
+				Force = Vector3.zero,
+				Visible = false,
+			}, bounds)
+		end
+		new("VectorForce", {
+			Name = "GravityComp",
+			Attachment0 = center,
+			RelativeTo = Enum.ActuatorRelativeTo.World,
+			ApplyAtCenterOfMass = true,
+			Force = Vector3.zero,
+			Visible = false,
+		}, bounds)
+
+		model:SetAttribute("Radius", r)
+		model:SetAttribute("Width", width)
+		model:SetAttribute("Front", pts.front)
+
+		-- hub (steering knuckle / upright)
+		local hub = invisiblePart(name .. "Hub", Vector3.one * 0.38 * r, centerCf, suspension, { Massless = true })
+		weld(bounds, hub, bounds)
+
+		local dir = pts.strutDir
+		local ref = math.abs(dir.Z) < 0.95 and Vector3.zAxis or Vector3.xAxis
+		local n1 = (ref - dir * ref:Dot(dir)).Unit
+		local n2 = dir:Cross(n1).Unit
+		local strutA = attachment("StrutA", hub, origin * CFrame.fromMatrix(pts.hubStrut, n1, dir))
+		local strutB = attachment("StrutB", hub, origin * CFrame.fromMatrix(pts.hubStrut, n2, dir))
+		local tower = attachment(name .. "Tower", primary, origin * CFrame.new(pts.strutTop))
+
+		-- the two planes intersect along the strut axis: the tower slides on that line
+		new("PlaneConstraint", { Attachment0 = strutA, Attachment1 = tower, Visible = false }, hub)
+		new("PlaneConstraint", { Attachment0 = strutB, Attachment1 = tower, Visible = false }, hub)
+		local spring = new("SpringConstraint", {
+			Name = "Spring",
+			Attachment0 = strutA,
+			Attachment1 = tower,
+			LimitsEnabled = true,
+			Coils = 5,
+			Radius = 0.15 * r,
+			Thickness = 0.075 * r,
+			Color = ROD_COLOR,
+			Visible = true,
+			MaxForce = 1e7,
+		}, hub)
+		spring:SetAttribute("DesignLength", pts.strutLength)
+		spring:SetAttribute("Front", pts.front)
+
+		for i, link in ipairs(pts.links) do
+			local a = attachment("LinkHub" .. i, hub, origin * CFrame.new(link.hub))
+			local b = attachment(name .. "Link" .. i, primary, origin * CFrame.new(link.body))
+			new("RodConstraint", {
+				Attachment0 = a,
+				Attachment1 = b,
+				Length = (link.hub - link.body).Magnitude,
+				Thickness = 0.075 * r,
+				Color = ROD_COLOR,
+				Visible = true,
+			}, hub)
+		end
+
+		if pts.front then
+			local arm = attachment("SteerArm", hub, origin * CFrame.new(pts.steerArm))
+			local length = (pts.steerArm - pts.rackEnd).Magnitude
+			new("SpringConstraint", {
+				Name = "FlexibleSteerStrut",
+				Attachment0 = rackEnds[name],
+				Attachment1 = arm,
+				LimitsEnabled = true,
+				FreeLength = length,
+				MinLength = length * 0.98,
+				MaxLength = length * 1.02,
+				Coils = 0,
+				Radius = 0,
+				Thickness = 0.075 * r,
+				Color = BrickColor.new("Lemon metalic"),
+				Visible = true,
+				MaxForce = 1e7,
+			}, hub)
+		end
+	end
+
+	-- collision hull -----------------------------------------------------------------
+	local bodyOffset = Chassis.bodyOffset(layout)
+	local bodySize = body and body.size or Vector3.new(trackAvg * 1.34, rAvg * 3.9, wb * 1.65)
+	local bodyCf = origin * bodyOffset
+	local bottom = -bodySize.Y / 2
+	local hulls = {
+		{ "LowerHull", Vector3.new(bodySize.X * 0.94, bodySize.Y * 0.45, bodySize.Z * 0.96), CFrame.new(0, bottom + bodySize.Y * 0.375, 0) },
+		{ "Cabin", Vector3.new(bodySize.X * 0.78, bodySize.Y * 0.32, bodySize.Z * 0.5), CFrame.new(0, bottom + bodySize.Y * 0.76, bodySize.Z * 0.05) },
+	}
+	for _, hull in ipairs(hulls) do
+		local part = invisiblePart(hull[1], hull[2], bodyCf * hull[3], colliders, {
+			CanCollide = true,
+			Massless = true,
+			CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.35, 0.1, 1, 1),
+		})
+		weld(part, primary)
+		for _, rim in ipairs(rims) do
+			new("NoCollisionConstraint", { Part0 = part, Part1 = rim }, part)
+		end
+	end
+
+	-- record the design so tuning can be applied later
+	car:SetAttribute("Wheelbase", wb)
+	car:SetAttribute("TrackFront", layout.trackFront)
+	car:SetAttribute("TrackRear", layout.trackRear)
+	car:SetAttribute("RadiusFront", layout.radiusFront)
+	car:SetAttribute("RadiusRear", layout.radiusRear)
+	car:SetAttribute("WidthFront", layout.widthFront)
+	car:SetAttribute("WidthRear", layout.widthRear)
+	car:SetAttribute("StrutCosFront", fl.strutCos)
+	car:SetAttribute("StrutCosRear", Chassis.corner(layout, "RL").strutCos)
+	car:SetAttribute("WheelY", layout.wheelY)
+	car:SetAttribute("AxleCenter", (layout.frontZ + layout.rearZ) / 2)
+
+	Chassis.applyTuning(car, stats)
+	return car
+end
+
+-- Geometry of a built car (same shape as Chassis.geometry).
+function Chassis.geometryOf(car)
+	local wb = car:GetAttribute("Wheelbase")
+	if not wb then
+		return nil
+	end
+	return {
+		wheelbase = wb,
+		trackFront = car:GetAttribute("TrackFront"),
+		trackRear = car:GetAttribute("TrackRear"),
+		radiusFront = car:GetAttribute("RadiusFront"),
+		radiusRear = car:GetAttribute("RadiusRear"),
+		widthFront = car:GetAttribute("WidthFront"),
+		widthRear = car:GetAttribute("WidthRear"),
+		strutCosFront = car:GetAttribute("StrutCosFront"),
+		strutCosRear = car:GetAttribute("StrutCosRear"),
+		steerArm = car:GetAttribute("SteerArm"),
+	}
+end
+
+------------------------------------------------------------------------------------------
+-- Live tuning: springs, tires, mass placement, collision
+------------------------------------------------------------------------------------------
+
+local function placeMasses(car, stats)
+	local primary = car:FindFirstChild("Primary")
+	local massPart = car:FindFirstChild("Mass")
+	local driver = car:FindFirstChild("DriverMass")
+	if not (primary and massPart) then
+		return
+	end
+	local wb = car:GetAttribute("Wheelbase")
+	local rAvg = (car:GetAttribute("RadiusFront") + car:GetAttribute("RadiusRear")) / 2
+	local trackAvg = (car:GetAttribute("TrackFront") + car:GetAttribute("TrackRear")) / 2
+	local frame = primary.CFrame
+
+	local target = stats.massKg * Spec.KG_TO_RMU
+	local others, moment = 0, Vector3.zero
+	local function add(part, localPos)
+		if part then
+			local m = part:GetMass()
+			others += m
+			moment += localPos * m
+		end
+	end
+
+	if driver then
+		local side = stats.chassis.driverSide == "Left" and -1 or 1
+		local localPos = Vector3.new(side * 0.231 * trackAvg, 1.59 * rAvg, -0.072 * wb)
+		local w = driver:FindFirstChildOfClass("WeldConstraint")
+		if w then
+			w.Enabled = false
+		end
+		driver.CFrame = frame * CFrame.new(localPos)
+		if w then
+			w.Enabled = true
+		end
+		add(driver, localPos)
+	end
+	local rack = car:FindFirstChild("Suspension") and car.Suspension:FindFirstChild("SteeringRack")
+	if rack then
+		add(rack, frame:PointToObjectSpace(rack.Position))
+	end
+
+	local own = math.max(target - others, target * 0.2)
+	local volume = massPart.Size.X * massPart.Size.Y * massPart.Size.Z
+	local density = math.clamp(own / volume, 0.01, 100)
+	massPart.CustomPhysicalProperties = PhysicalProperties.new(density, 0.3, 0.5, 1, 1)
+	own = massPart:GetMass()
+
+	local total = own + others
+	local cgZ = wb / 2 - stats.weightFront * wb
+	local cgY = -rAvg + stats.cgHeightMeters / Spec.STUD
+	local cg = Vector3.new(0, cgY, cgZ)
+	local localPos = (cg * total - moment) / own
+
+	local w = massPart:FindFirstChildOfClass("WeldConstraint")
+	if w then
+		w.Enabled = false
+	end
+	massPart.CFrame = frame * CFrame.new(localPos)
+	if w then
+		w.Enabled = true
+	end
+end
+
+function Chassis.applyTuning(car, stats)
+	local susp = stats.suspension
+	local rideHeight = stats.chassis.rideHeight or 0
+
+	local suspension = car:FindFirstChild("Suspension")
+	if suspension then
+		for _, inst in ipairs(suspension:GetDescendants()) do
+			if inst:IsA("SpringConstraint") and inst.Name == "Spring" then
+				local axle = inst:GetAttribute("Front") and susp.front or susp.rear
+				local design = inst:GetAttribute("DesignLength")
+				local cos = axle.strutCos
+				local preload = axle.staticForce / axle.spring
+				inst.Stiffness = axle.spring
+				inst.Damping = axle.damper
+				inst.FreeLength = design + rideHeight * cos + preload
+				inst.MinLength = math.max(design + (rideHeight - axle.bump) * cos, 0.05)
+				inst.MaxLength = design + (rideHeight + axle.droop) * cos
+			end
+		end
+	end
+
+	local wheels = car:FindFirstChild("Wheels")
+	if wheels then
+		for _, model in ipairs(wheels:GetChildren()) do
+			local axle = model:GetAttribute("Front") and susp.front or susp.rear
+			local r = model:GetAttribute("Radius")
+			if r then
+				local start = 0.674 * r
+				model:SetAttribute("RayStart", start)
+				model:SetAttribute("RayLength", r + axle.tireDeflection - start)
+				model:SetAttribute("TireRate", axle.tireRate)
+				model:SetAttribute("TireDamper", axle.tireDamper)
+			end
+			local bounds = model:FindFirstChild("Bounds")
+			local hub = suspension and suspension:FindFirstChild(model.Name .. "Hub")
+			local tie = hub and hub:FindFirstChild("FlexibleSteerStrut")
+			if tie and bounds then
+				local scale = bounds:GetMass() / 747
+				tie.Stiffness = 1.457e6 * scale
+				tie.Damping = 42336 * scale
+			end
+		end
+	end
+
+	-- moving the mass re-welds the body; only do it when something it depends on changed
+	local massKey = ("%.3f|%.4f|%.4f|%s"):format(stats.massKg, stats.weightFront, stats.cgHeightMeters, tostring(stats.chassis.driverSide))
+	if car:GetAttribute("MassKey") ~= massKey then
+		car:SetAttribute("MassKey", massKey)
+		placeMasses(car, stats)
+	end
+
+	local colliders = car:FindFirstChild("Colliders")
+	if colliders then
+		for _, part in ipairs(colliders:GetChildren()) do
+			if part:IsA("BasePart") then
+				part.CanCollide = stats.chassis.bodyCollision ~= false
+			end
+		end
+	end
+end
+
+return Chassis
