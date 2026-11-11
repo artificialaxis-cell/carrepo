@@ -56,12 +56,16 @@ local function setState(state, message)
 	CarInit.changed:Fire(state)
 end
 
+-- Log-only entries. These must not fire `changed`: listeners treat that as a state
+-- transition (Net resends the car on ACTIVE, the UI shows a toast), so a log line
+-- written from the hitch logger would cause more work and more hitches.
+CarInit.logged = Instance.new("BindableEvent")
 local function note(message)
 	table.insert(CarInit.log, { t = os.clock() - origin, state = "INFO", message = message })
 	if #CarInit.log > 40 then
 		table.remove(CarInit.log, 1)
 	end
-	CarInit.changed:Fire(CarInit.state)
+	CarInit.logged:Fire()
 end
 CarInit.note = note
 
