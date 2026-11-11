@@ -1,0 +1,792 @@
+--[[
+	CarInit
+	-------
+	Turns the VFX car in workspace.Thrown into a drivable car:
+
+	  scan meshes -> assign roles -> resolve wheel layout -> Chassis.build -> mount visuals
+	  -> Physics:HandleCar
+
+	The layout can be edited (Build tab) and the chassis rebuilt in place around the same
+	visual parts without respawning.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local CarInit = {}
+
+CarInit.state = "IDLE"
+CarInit.message = "Ready to build"
+CarInit.car = nil
+CarInit.carName = nil
+CarInit.carBuilt = false
+CarInit.attempts = 0
+CarInit.buildMs = nil
+CarInit.loader = RunService:IsStudio() and "Studio modules" or "Remote source"
+CarInit.log = {}
+CarInit.changed = Instance.new("BindableEvent")
+CarInit.roles = {}
+CarInit.rolesChanged = Instance.new("BindableEvent")
+CarInit.layout = nil
+CarInit.layoutDirty = false
+CarInit.layoutChanged = Instance.new("BindableEvent")
+CarInit.scan = nil
+CarInit.scanChanged = Instance.new("BindableEvent")
+
+local Chassis, Physics, Tuning
+local visuals = nil -- parts mounted on the current car
+local rebuilding = false
+
+function CarInit.setup(deps)
+	Chassis = deps.Chassis
+	Physics = deps.Physics
+	Tuning = deps.Tuning
+	Tuning.onApply(CarInit.applyTuning)
+end
+
+local origin = os.clock()
+
+local function setState(state, message)
+	CarInit.state = state
+	CarInit.message = message
+	table.insert(CarInit.log, { t = os.clock() - origin, state = state, message = message })
+	if #CarInit.log > 40 then
+		table.remove(CarInit.log, 1)
+	end
+	CarInit.changed:Fire(state)
+end
+
+local function note(message)
+	table.insert(CarInit.log, { t = os.clock() - origin, state = "INFO", message = message })
+	if #CarInit.log > 40 then
+		table.remove(CarInit.log, 1)
+	end
+	CarInit.changed:Fire(CarInit.state)
+end
+CarInit.note = note
+
+function CarInit.canInitialize()
+	return CarInit.state == "IDLE" or (CarInit.state == "FAILED" and not CarInit.carBuilt)
+end
+
+function CarInit.canRebuild()
+	return CarInit.state == "ACTIVE" and visuals ~= nil and CarInit.car ~= nil and CarInit.car.Parent ~= nil
+end
+
+------------------------------------------------------------------------------------------
+-- Roles
+------------------------------------------------------------------------------------------
+
+local function meshIdOf(part)
+	local m = part:FindFirstChildOfClass("SpecialMesh")
+	if m then
+		return m.MeshId
+	end
+	if part:IsA("MeshPart") then
+		return part.MeshId
+	end
+	return nil
+end
+CarInit.meshIdOf = meshIdOf
+
+local DEFAULT_ROLES = {
+	["rbxassetid://106343343162810"] = { "BODY" },
+	["rbxassetid://119053245327360"] = { "RIM", "L" },
+	["rbxassetid://92888021068167"] = { "TIRE", "L" },
+	["rbxassetid://96974934664830"] = { "RIM", "R" },
+	["rbxassetid://92689262045313"] = { "TIRE", "R" },
+}
+
+function CarInit.hasCustom()
+	for _, role in pairs(CarInit.roles) do
+		if role == "BODY" then
+			return true
+		end
+	end
+	return false
+end
+
+function CarInit.setRole(meshId, role)
+	if role == "BODY" then
+		for id, current in pairs(CarInit.roles) do
+			if current == "BODY" then
+				CarInit.roles[id] = nil
+			end
+		end
+	end
+	CarInit.roles[meshId] = role
+	CarInit.layout = nil
+	CarInit.rolesChanged:Fire()
+end
+
+function CarInit.clearRoles()
+	table.clear(CarInit.roles)
+	CarInit.layout = nil
+	CarInit.rolesChanged:Fire()
+end
+
+-- role, side for a mesh id under the current definition
+function CarInit.roleOf(id)
+	if CarInit.hasCustom() then
+		return CarInit.roles[id]
+	end
+	local entry = DEFAULT_ROLES[id]
+	if entry then
+		return entry[1], entry[2]
+	end
+	return "DETAIL"
+end
+
+function CarInit.findVfxFolder()
+	local thrown = workspace:FindFirstChild("Thrown")
+	local char = Players.LocalPlayer.Character
+	local bind = char and char:FindFirstChild("__CMVFXMoveBind")
+	local token = bind and bind:GetAttribute("RunToken")
+	if not thrown or token == nil then
+		return nil
+	end
+	local needle = tostring(token)
+	for _, inst in ipairs(thrown:GetChildren()) do
+		if inst:IsA("Folder") and inst.Name:find(needle, 1, true) then
+			return inst
+		end
+	end
+	return nil
+end
+
+------------------------------------------------------------------------------------------
+-- Scanning
+------------------------------------------------------------------------------------------
+
+-- Groups the folder's mesh parts by mesh id and measures them. Yields.
+function CarInit.scanFolder(folder)
+	folder = folder or CarInit.findVfxFolder()
+	local result = { folder = folder, groups = {}, order = {} }
+	if folder then
+		for _, inst in ipairs(folder:GetDescendants()) do
+			if inst:IsA("BasePart") then
+				local id = meshIdOf(inst)
+				if id then
+					local group = result.groups[id]
+					if not group then
+						group = { id = id, parts = {} }
+						result.groups[id] = group
+						table.insert(result.order, id)
+					end
+					table.insert(group.parts, inst)
+				end
+			end
+		end
+		Chassis.prefetch(result.order)
+		for _, id in ipairs(result.order) do
+			local group = result.groups[id]
+			group.size = Chassis.visualSize(group.parts[1])
+			local s = group.size or group.parts[1].Size
+			group.volume = s.X * s.Y * s.Z
+		end
+		table.sort(result.order, function(a, b)
+			local va, vb = result.groups[a].volume, result.groups[b].volume
+			if va ~= vb then
+				return va > vb
+			end
+			return a < b
+		end)
+	end
+	CarInit.scan = result
+	CarInit.scanChanged:Fire()
+	return result
+end
+
+local function roundish(size)
+	if not size then
+		return false, 0
+	end
+	local d = { size.X, size.Y, size.Z }
+	table.sort(d)
+	local round = math.abs(d[2] - d[3]) / math.max(d[3], 1e-3) < 0.15 and d[1] < d[3] * 0.8
+	return round, d[3] / 2
+end
+
+-- Heuristic role assignment: biggest mesh is the body, repeated round thin meshes are
+-- wheels (larger = tire, smaller = rim), everything else is detail.
+function CarInit.autoAssign()
+	local scan = CarInit.scan
+	if not scan or #scan.order == 0 then
+		return false
+	end
+	table.clear(CarInit.roles)
+	local wheelish = {}
+	for _, id in ipairs(scan.order) do
+		local group = scan.groups[id]
+		local round, radius = roundish(group.size)
+		local n = #group.parts
+		if round and (n == 2 or n == 4) then
+			table.insert(wheelish, { id = id, radius = radius })
+		end
+	end
+	local body
+	for _, id in ipairs(scan.order) do
+		local isWheel = false
+		for _, w in ipairs(wheelish) do
+			if w.id == id then
+				isWheel = true
+			end
+		end
+		if not isWheel then
+			body = id
+			break
+		end
+	end
+	if not body then
+		return false
+	end
+	CarInit.roles[body] = "BODY"
+	if #wheelish > 0 then
+		table.sort(wheelish, function(a, b)
+			return a.radius > b.radius
+		end)
+		local biggest = wheelish[1].radius
+		local distinct = false
+		for _, w in ipairs(wheelish) do
+			if w.radius < biggest * 0.9 then
+				distinct = true
+			end
+		end
+		for _, w in ipairs(wheelish) do
+			if not distinct then
+				CarInit.roles[w.id] = "WHEEL"
+			else
+				CarInit.roles[w.id] = w.radius >= biggest * 0.9 and "TIRE" or "RIM"
+			end
+		end
+	end
+	for _, id in ipairs(scan.order) do
+		if CarInit.roles[id] == nil then
+			CarInit.roles[id] = "DETAIL"
+		end
+	end
+	CarInit.layout = nil
+	CarInit.rolesChanged:Fire()
+	return true
+end
+
+------------------------------------------------------------------------------------------
+-- Layout
+------------------------------------------------------------------------------------------
+
+local function gather(folder)
+	local body
+	local wheelParts, extras = {}, {}
+	for _, inst in ipairs(folder:GetDescendants()) do
+		if inst:IsA("BasePart") and meshIdOf(inst) then
+			local role, side = CarInit.roleOf(meshIdOf(inst))
+			if role == "BODY" then
+				body = inst
+			elseif role == "DETAIL" then
+				table.insert(extras, inst)
+			elseif role == "TIRE" or role == "RIM" or role == "WHEEL" then
+				table.insert(wheelParts, { part = inst, kind = role, side = side })
+			end
+		end
+	end
+	return body, wheelParts, extras
+end
+
+-- Resolves (or returns the current) layout for what is in the VFX folder. Yields.
+function CarInit.resolveLayout(force)
+	if CarInit.layout and not force then
+		return CarInit.layout
+	end
+	local folder = CarInit.findVfxFolder()
+	if not folder then
+		return nil, "No VFX folder for the run token"
+	end
+	local body, wheelParts = gather(folder)
+	if not body then
+		return nil, "No body mesh assigned"
+	end
+	local tireSize
+	for _, kind in ipairs({ "TIRE", "WHEEL", "RIM" }) do
+		for _, w in ipairs(wheelParts) do
+			if not tireSize and w.kind == kind then
+				tireSize = Chassis.visualSize(w.part)
+			end
+		end
+	end
+	local pieces = {}
+	for _, w in ipairs(wheelParts) do
+		table.insert(pieces, w.part)
+	end
+	local layout = Chassis.resolve({
+		bodyMeshId = meshIdOf(body),
+		bodySize = Chassis.visualSize(body),
+		bodyFrame = body.CFrame,
+		wheelPieces = pieces,
+		tireSize = tireSize,
+		profiles = Tuning.profiles(),
+	})
+	layout.bodyMeshId = meshIdOf(body)
+	layout.bodySize = Chassis.visualSize(body)
+	CarInit.layout = layout
+	CarInit.layoutDirty = false
+	if not CarInit.car then
+		Tuning.setGeometry(Chassis.geometry(layout))
+	end
+	CarInit.layoutChanged:Fire()
+	return layout
+end
+
+function CarInit.setLayoutField(field, value)
+	local layout = CarInit.layout
+	if not layout or type(value) ~= "number" then
+		return
+	end
+	layout[field] = value
+	layout.source = "custom"
+	CarInit.layoutDirty = CarInit.car ~= nil
+	if not CarInit.car then
+		Tuning.setGeometry(Chassis.geometry(layout))
+	end
+	CarInit.layoutChanged:Fire(field)
+end
+
+function CarInit.saveProfile()
+	local layout = CarInit.layout
+	if not layout or not layout.bodyMeshId then
+		return false
+	end
+	local stored = {}
+	for _, key in ipairs(Chassis.FIELDS) do
+		stored[key] = layout[key]
+	end
+	Tuning.saveProfile(layout.bodyMeshId, stored)
+	layout.source = "profile"
+	CarInit.layoutChanged:Fire()
+	return true
+end
+
+function CarInit.forgetProfile()
+	local layout = CarInit.layout
+	if layout and layout.bodyMeshId then
+		Tuning.clearProfile(layout.bodyMeshId)
+	end
+	return CarInit.resolveLayout(true)
+end
+
+------------------------------------------------------------------------------------------
+-- Build
+------------------------------------------------------------------------------------------
+
+local function stripAndAnchor(part)
+	for _, c in ipairs(part:GetChildren()) do
+		if c:IsA("Weld") or c:IsA("WeldConstraint") or c:IsA("Motor6D") then
+			c:Destroy()
+		end
+	end
+	part.Anchored = true
+	part.Massless = true
+	part.CanCollide = false
+	part.CanQuery = false
+end
+
+local function takeNearest(pool, pos, frame)
+	local idx, dist
+	for i, p in ipairs(pool) do
+		local d = (frame:PointToObjectSpace(p.Position) - pos).Magnitude
+		if not dist or d < dist then
+			dist, idx = d, i
+		end
+	end
+	return idx and table.remove(pool, idx) or nil
+end
+
+local function spawnFrame(layout)
+	local char = Players.LocalPlayer.Character
+	local root = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso"))
+	if not root then
+		error("no character to spawn the car at")
+	end
+	local look = root.CFrame.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	flat = flat.Magnitude > 0.01 and flat.Unit or -Vector3.zAxis
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local ignore = { char }
+	if workspace:FindFirstChild("Thrown") then
+		table.insert(ignore, workspace.Thrown)
+	end
+	params.FilterDescendantsInstances = ignore
+	local hit = workspace:Raycast(root.Position + Vector3.new(0, 2, 0), Vector3.new(0, -80, 0), params)
+	local ground = hit and hit.Position.Y or (root.Position.Y - 3)
+	local radius = math.max(layout.radiusFront, layout.radiusRear)
+	-- wheel centres sit one radius above the road at static load: spawn resting on the
+	-- tires so the linkages never swing through full droop on the way down
+	local pos = Vector3.new(root.Position.X, ground + radius + 0.05, root.Position.Z)
+	return CFrame.lookAt(pos, pos + flat)
+end
+
+local function mountVisuals(car, layout, mounted)
+	local primary = car.Primary
+	local wheels = car.Wheels
+
+	for _, name in ipairs(Chassis.ORDER) do
+		local list = mounted.wheels[name]
+		local model = wheels:FindFirstChild(name)
+		local bounds = model and model:FindFirstChild("Bounds")
+		local spin = bounds and bounds:FindFirstChild("SpinAtt")
+		if spin and list then
+			for _, part in ipairs(list) do
+				part.Parent = model.Rotating
+				part.Anchored = false
+				part.Massless = true
+				local att = part:FindFirstChild("MountAtt") or Instance.new("Attachment")
+				att.Name = "MountAtt"
+				att.CFrame = CFrame.identity
+				att.Parent = part
+				local rigid = Instance.new("RigidConstraint")
+				rigid.Name = "VisualRigid"
+				rigid.Attachment0 = spin
+				rigid.Attachment1 = att
+				rigid.Parent = bounds
+			end
+		end
+	end
+
+	for _, extra in ipairs(mounted.extras) do
+		extra.Anchored = false
+		extra.Massless = true
+		if not extra:FindFirstChild("DetailWeld") then
+			local weld = Instance.new("WeldConstraint")
+			weld.Name = "DetailWeld"
+			weld.Part0 = mounted.body
+			weld.Part1 = extra
+			weld.Parent = extra
+		end
+	end
+
+	local att0 = Instance.new("Attachment")
+	att0.Name = "VisualBodyAtt"
+	att0.CFrame = Chassis.bodyOffset(layout)
+	att0.Parent = primary
+	local body = mounted.body
+	local att1 = body:FindFirstChild("VisualBodyMountAtt") or Instance.new("Attachment")
+	att1.Name = "VisualBodyMountAtt"
+	att1.CFrame = CFrame.identity
+	att1.Parent = body
+	local rigid = Instance.new("RigidConstraint")
+	rigid.Name = "VisualBodyRigid"
+	rigid.Attachment0 = att0
+	rigid.Attachment1 = att1
+	rigid.Parent = primary
+	body.Anchored = false
+end
+
+-- detach visuals from a car so it can be destroyed and rebuilt
+local function unmountVisuals(mounted)
+	for _, list in pairs(mounted.wheels) do
+		for _, part in ipairs(list) do
+			part.Anchored = true
+			part.Parent = mounted.folder
+		end
+	end
+	for _, extra in ipairs(mounted.extras) do
+		extra.Anchored = true
+	end
+	mounted.body.Anchored = true
+end
+
+local function assemble(layout, originCf)
+	local geometry = Chassis.geometry(layout)
+	local stats = Tuning.build(geometry)
+	if not stats then
+		error("tuning could not build stats")
+	end
+	local car = Chassis.build(layout, stats, originCf, { size = layout.bodySize })
+	return car, stats
+end
+
+local function build()
+	local folder = CarInit.findVfxFolder()
+	if not folder then
+		return nil, "No VFX folder matches the run token"
+	end
+
+	-- keep a scan of exactly what gets mounted; the Build preview keeps using it after
+	-- the run token leaves the character
+	if not CarInit.scan or CarInit.scan.folder ~= folder then
+		CarInit.scanFolder(folder)
+	end
+
+	local body, wheelParts, extras = gather(folder)
+	if not body then
+		return nil, folder.Name .. " has no body mesh"
+	end
+	if CarInit.hasCustom() and #wheelParts == 0 then
+		return nil, folder.Name .. " has no wheel meshes assigned"
+	end
+
+	local layout = CarInit.layout
+	if not layout or layout.bodyMeshId ~= meshIdOf(body) then
+		layout = CarInit.resolveLayout(true)
+	end
+	if not layout then
+		return nil, "Could not resolve a wheel layout"
+	end
+	note(("Layout %s · wheelbase %.1f · track %.1f/%.1f"):format(layout.source or "?", layout.rearZ - layout.frontZ, layout.trackFront, layout.trackRear))
+
+	-- sort wheel pieces into corners (nearest to each corner in body space, per side)
+	local bodyFrame = body.CFrame
+	local pools = { L = { RIM = {}, TIRE = {}, WHEEL = {} }, R = { RIM = {}, TIRE = {}, WHEEL = {} } }
+	for _, wheel in ipairs(wheelParts) do
+		local side = wheel.side or (bodyFrame:PointToObjectSpace(wheel.part.Position).X < 0 and "L" or "R")
+		table.insert(pools[side][wheel.kind], wheel.part)
+		stripAndAnchor(wheel.part)
+	end
+	stripAndAnchor(body)
+	for _, p in ipairs(extras) do
+		stripAndAnchor(p)
+	end
+	for _, kind in ipairs({ "RIM", "TIRE", "WHEEL" }) do
+		local l, r = #pools.L[kind], #pools.R[kind]
+		if (l > 0 or r > 0) and (l < 2 or r < 2) then
+			note(("Wheel count looks off: %s L%d R%d"):format(kind, l, r))
+		end
+	end
+
+	local mounted = { body = body, extras = extras, wheels = {}, folder = folder }
+	for _, name in ipairs(Chassis.ORDER) do
+		local info = Chassis.CORNERS[name]
+		local side = info.side < 0 and "L" or "R"
+		local half = (info.front and layout.trackFront or layout.trackRear) / 2
+		local expected = Vector3.new(info.side * half, layout.wheelY, info.front and layout.frontZ or layout.rearZ)
+		local list = {}
+		for _, kind in ipairs({ "RIM", "TIRE", "WHEEL" }) do
+			local piece = takeNearest(pools[side][kind], expected, bodyFrame)
+			if piece then
+				table.insert(list, piece)
+			end
+		end
+		mounted.wheels[name] = list
+	end
+
+	local car, stats = assemble(layout, spawnFrame(layout))
+	car.Parent = workspace
+	CarInit.carBuilt = true
+	mountVisuals(car, layout, mounted)
+	visuals = mounted
+
+	CarInit.car = car
+	CarInit.carName = car.Name
+	local char = Players.LocalPlayer.Character
+	local bind = char and char:FindFirstChild("__CMVFXMoveBind")
+	if bind and workspace:FindFirstChild("Thrown") then
+		bind.Parent = workspace.Thrown
+	end
+
+	Tuning.geometry = Chassis.geometryOf(car)
+	Physics:HandleCar(car, stats)
+	if car:GetAttribute("GearboxMode") == nil then
+		return car, "Car controller rejected the car - see output"
+	end
+	return car
+end
+
+local function watch(car)
+	car.Destroying:Connect(function()
+		if rebuilding then
+			return
+		end
+		if CarInit.car == car then
+			CarInit.car = nil
+			visuals = nil
+			setState("ENDED", "Car removed - respawn to build again")
+		end
+	end)
+end
+
+function CarInit.request()
+	if CarInit.state == "INITIALIZING" then
+		return false, "Already building"
+	elseif CarInit.state == "ACTIVE" then
+		return false, "Car is already built"
+	elseif CarInit.state == "ENDED" then
+		return false, "Car removed - respawn to build again"
+	elseif not CarInit.canInitialize() then
+		return false, "Car already built - respawn to retry"
+	end
+
+	CarInit.attempts += 1
+	setState("INITIALIZING", "Building chassis")
+
+	task.spawn(function()
+		local started = os.clock()
+		local ok, car, failure = pcall(build)
+		CarInit.buildMs = math.floor((os.clock() - started) * 1000 + 0.5)
+		if not ok then
+			setState("FAILED", tostring(car))
+		elseif failure then
+			setState("FAILED", failure)
+		elseif not car then
+			setState("FAILED", "Build aborted - see output")
+		else
+			watch(car)
+			setState("ACTIVE", "Car ready")
+		end
+	end)
+	return true
+end
+
+-- Rebuild the chassis around the mounted visuals (layout changes need this).
+function CarInit.rebuild()
+	if not CarInit.canRebuild() then
+		return false, "Nothing to rebuild"
+	end
+	local old = CarInit.car
+	local layout = CarInit.layout
+	if not layout then
+		return false, "No layout"
+	end
+	setState("INITIALIZING", "Rebuilding chassis")
+	task.spawn(function()
+		local started = os.clock()
+		local ok, err = pcall(function()
+			local ctl = Physics:Get(old)
+			local wasDriving = ctl and ctl.isDriving and ctl.isDriving()
+			if wasDriving and ctl.leave then
+				ctl.leave()
+			end
+			local frame = old.Primary.CFrame
+			local flat = Vector3.new(frame.LookVector.X, 0, frame.LookVector.Z)
+			flat = flat.Magnitude > 0.01 and flat.Unit or -Vector3.zAxis
+			-- the old chassis frame sits at wheel-centre height already; barely lift it
+			local pos = frame.Position + Vector3.new(0, 0.3, 0)
+
+			rebuilding = true
+			unmountVisuals(visuals)
+			Physics:Release(old)
+			old:Destroy()
+			rebuilding = false
+
+			local car, stats = assemble(layout, CFrame.lookAt(pos, pos + flat))
+			car.Parent = workspace
+			mountVisuals(car, layout, visuals)
+			CarInit.car = car
+			CarInit.carName = car.Name
+			CarInit.layoutDirty = false
+			Tuning.geometry = Chassis.geometryOf(car)
+			watch(car)
+			Physics:HandleCar(car, stats)
+		end)
+		rebuilding = false
+		CarInit.buildMs = math.floor((os.clock() - started) * 1000 + 0.5)
+		if ok then
+			setState("ACTIVE", "Chassis rebuilt")
+			CarInit.layoutChanged:Fire()
+		else
+			setState("FAILED", "Rebuild failed: " .. tostring(err))
+		end
+	end)
+	return true
+end
+
+-- Push the current tune into the running car.
+function CarInit.applyTuning()
+	local car = CarInit.car
+	if not (car and car.Parent) then
+		return
+	end
+	local geometry = Chassis.geometryOf(car)
+	local stats = Tuning.build(geometry)
+	if not stats then
+		return
+	end
+	Chassis.applyTuning(car, stats)
+	Physics:Retune(car, stats)
+end
+
+-- Everything another client needs to rebuild this car's look (see Net/Replica).
+local ROLE_CODES = { BODY = 0, DETAIL = 1, TIRE = 2, RIM = 3, WHEEL = 4 }
+local CORNER_CODES = { FL = 0, FR = 1, RL = 2, RR = 3 }
+
+local function describePart(part, role, corner, bodyCf)
+	local mesh = part:FindFirstChildOfClass("SpecialMesh")
+	local meshId, textureId = 0, 0
+	local meshType = Enum.MeshType.Brick
+	local scale, offset, vertex = Vector3.one, Vector3.zero, Vector3.one
+	if mesh then
+		meshType = mesh.MeshType
+		scale, offset, vertex = mesh.Scale, mesh.Offset, mesh.VertexColor
+		local function number(id)
+			if id == "" then
+				return 0
+			end
+			return tonumber(id:match("(%d+)%s*$"))
+		end
+		meshId = number(mesh.MeshId)
+		textureId = number(mesh.TextureId)
+		if not (meshId and textureId) then
+			return nil
+		end
+	end
+	return {
+		role = ROLE_CODES[role],
+		corner = corner and CORNER_CODES[corner] or 255,
+		meshType = meshType.Value,
+		meshId = meshId,
+		textureId = textureId,
+		scale = scale,
+		offset = offset,
+		size = part.Size,
+		color = part.Color,
+		vertexColor = vertex,
+		material = part.Material.Value,
+		transparency = part.Transparency,
+		rel = bodyCf and bodyCf:ToObjectSpace(part.CFrame) or CFrame.identity,
+	}
+end
+
+function CarInit.describe()
+	if not (visuals and CarInit.layout and CarInit.car and CarInit.car.Parent) then
+		return nil
+	end
+	local L = CarInit.layout
+	local desc = {
+		flags = 0,
+		layout = { L.frontZ, L.rearZ, L.trackFront, L.trackRear, L.wheelY, L.radiusFront, L.radiusRear, L.widthFront, L.widthRear },
+		parts = {},
+	}
+	local body = visuals.body
+	local entry = describePart(body, "BODY")
+	if not entry then
+		return nil
+	end
+	table.insert(desc.parts, entry)
+	for _, name in ipairs(Chassis.ORDER) do
+		for _, piece in ipairs(visuals.wheels[name] or {}) do
+			local role = CarInit.roleOf(meshIdOf(piece))
+			role = (role == "TIRE" or role == "RIM" or role == "WHEEL") and role or "WHEEL"
+			local p = describePart(piece, role, name)
+			if p then
+				table.insert(desc.parts, p)
+			end
+		end
+	end
+	for _, extra in ipairs(visuals.extras) do
+		local p = describePart(extra, "DETAIL", nil, body.CFrame)
+		if p and p.rel.Position.Magnitude < 60 then
+			table.insert(desc.parts, p)
+		end
+	end
+	return desc
+end
+
+function CarInit.telemetry()
+	local car = CarInit.car
+	if car and car.Parent and Physics then
+		return Physics:Telemetry(car)
+	end
+	return nil
+end
+
+return CarInit
