@@ -1,0 +1,116 @@
+--[[
+	Hub
+	---
+	Loads the car modules (Studio: local ModuleScripts, live: remote sources), wires their
+	dependencies together and binds the global keys.
+
+	  P  toggle the hub panel
+	  N  build the car
+]]
+
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local Hub = {}
+
+local REMOTE = "https://raw.githubusercontent.com/artificialaxis-cell/carrepo/refs/heads/main/"
+local SOURCES = {
+	Connection = "serverconnection",
+	Spec = "spec",
+	Chassis = "chassis",
+	Physics = "carphysics",
+	Tuning = "tuning",
+	CarInit = "creation",
+	Replica = "replica",
+	Net = "net",
+	UI = "ui",
+}
+
+local function grab(url)
+	local ok, src = pcall(game.HttpGet, game, url)
+	if not ok then
+		error("couldn't fetch " .. url .. ": " .. tostring(src))
+	end
+	local chunk, err = loadstring(src)
+	if not chunk then
+		error("bad chunk from " .. url .. ": " .. tostring(err))
+	end
+	local ok2, mod = pcall(chunk)
+	if not ok2 then
+		error("module blew up (" .. url .. "): " .. tostring(mod))
+	end
+	return mod
+end
+
+local function load(name)
+	if RunService:IsStudio() then
+		return require(script:WaitForChild(name))
+	end
+	return grab(REMOTE .. SOURCES[name])
+end
+
+local Connection = load("Connection")
+local Spec = load("Spec")
+local Chassis = load("Chassis")
+local Physics = load("Physics")
+local Tuning = load("Tuning")
+local CarInit = load("CarInit")
+local Replica = load("Replica")
+local Net = load("Net")
+local UI = load("UI")
+
+Hub.modules = {
+	Connection = Connection,
+	Spec = Spec,
+	Chassis = Chassis,
+	Physics = Physics,
+	Tuning = Tuning,
+	CarInit = CarInit,
+	Replica = Replica,
+	Net = Net,
+	UI = UI,
+}
+
+function Hub.start()
+	Chassis.setup({ Spec = Spec })
+	Tuning.setup(Spec)
+	CarInit.setup({ Chassis = Chassis, Physics = Physics, Tuning = Tuning })
+	Replica.setup({ Net = Net, Spec = Spec, Tuning = Tuning, Chassis = Chassis })
+	UI.build({
+		Connection = Connection,
+		CarInit = CarInit,
+		Tuning = Tuning,
+		Spec = Spec,
+		Chassis = Chassis,
+		Net = Net,
+	})
+	Net.setup({ Connection = Connection, CarInit = CarInit, Tuning = Tuning, Spec = Spec, Replica = Replica })
+
+	local input = UserInputService.InputBegan:Connect(function(key, processed)
+		if processed then
+			return
+		end
+		if key.KeyCode == Enum.KeyCode.P then
+			UI.toggle()
+		elseif key.KeyCode == Enum.KeyCode.N and CarInit.canInitialize() then
+			local ok, reason = CarInit.request()
+			if not ok then
+				UI.notify("info", reason)
+			end
+		end
+	end)
+
+	if typeof(script) == "Instance" then
+		script.Destroying:Connect(function()
+			input:Disconnect()
+			Net.shutdown()
+			Replica.shutdown()
+			UI.destroy()
+		end)
+	end
+
+	_G.CarHub = Hub.modules
+	UI.notify("info", "Press P to open the hub")
+end
+
+return Hub
