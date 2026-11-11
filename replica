@@ -24,9 +24,12 @@ local Replica = {}
 local deps
 local cars = {} -- sid -> car
 local folder
-local allow = {} -- numeric asset id -> true
-local allowScanned = 0
+local genv = (getgenv and getgenv()) or _G
+-- numeric asset id -> true; survives respawns (asset presence never changes meaning)
+local allow = genv.CarHubAssetAllow or {}
+genv.CarHubAssetAllow = allow
 local heartbeat
+local watchers = {}
 
 local ROLE_NAMES = { [0] = "Body", "Detail", "Tire", "Rim", "Wheel" }
 -- stock car wheel meshes (the body id comes from Chassis.KNOWN)
@@ -50,35 +53,78 @@ local function addAsset(id)
 	end
 end
 
-local function scanAssets(root)
-	for _, d in ipairs(root:GetDescendants()) do
-		if d:IsA("SpecialMesh") then
-			addAsset(d.MeshId)
-			addAsset(d.TextureId)
-		elseif d:IsA("MeshPart") then
-			addAsset(d.MeshId)
-			addAsset(d.TextureID)
-		end
+local function indexInstance(d)
+	if d:IsA("SpecialMesh") then
+		addAsset(d.MeshId)
+		addAsset(d.TextureId)
+	elseif d:IsA("MeshPart") then
+		addAsset(d.MeshId)
+		addAsset(d.TextureID)
 	end
 end
 
-local function refreshAllowList(force)
-	local now = os.clock()
-	if not force and now - allowScanned < 5 then
+--[[
+	Anything this game already shows is fair to show again. The index is built once per
+	session in the background, a few thousand instances per frame, so even huge maps
+	never stall a frame. After that, new VFX/replicated parts are picked up from
+	DescendantAdded on the two places car meshes come from.
+]]
+local BUDGET = 0.002 -- seconds of indexing per frame
+local indexing = false
+local unknownSince = nil -- an unseen id arrived; a background rescan is due
+
+local function indexRoots(roots)
+	deps.Net.busy("asset index", true)
+	-- walk the tree child by child with a per-frame time budget: GetDescendants() on a
+	-- big map would build one huge array inside a single frame
+	local seen = 0
+	local stack = table.clone(roots)
+	local frameStart = os.clock()
+	while #stack > 0 do
+		local inst = table.remove(stack)
+		local ok, children = pcall(inst.GetChildren, inst)
+		if ok then
+			for _, child in ipairs(children) do
+				indexInstance(child)
+				table.insert(stack, child)
+			end
+			seen += #children
+		end
+		if os.clock() - frameStart > BUDGET then
+			task.wait()
+			frameStart = os.clock()
+		end
+	end
+	deps.Net.busy("asset index", false)
+	return seen
+end
+
+local function buildIndex()
+	if indexing then
 		return
 	end
-	allowScanned = now
-	-- anything this game already shows is fair to show again (only runs when an unknown
-	-- id arrives, at most every 5 s)
-	for _, root in ipairs({ ReplicatedStorage, workspace }) do
-		pcall(scanAssets, root)
+	indexing = true
+	task.spawn(function()
+		for id in pairs(deps.Chassis.KNOWN) do
+			addAsset(id)
+		end
+		for _, id in ipairs(STOCK_MESHES) do
+			addAsset(id)
+		end
+		if not genv.CarHubAssetIndexed then
+			indexRoots({ ReplicatedStorage, workspace })
+			genv.CarHubAssetIndexed = true
+		end
+		indexing = false
+		Replica.retryPlaceholders()
+	end)
+end
+
+local function watch(root)
+	if not root then
+		return
 	end
-	for id in pairs(deps.Chassis.KNOWN) do
-		addAsset(id)
-	end
-	for _, id in ipairs(STOCK_MESHES) do
-		addAsset(id)
-	end
+	table.insert(watchers, root.DescendantAdded:Connect(indexInstance))
 end
 
 local function allowed(id)
@@ -88,8 +134,24 @@ local function allowed(id)
 	if allow[id] then
 		return true
 	end
-	refreshAllowList(false)
-	return allow[id] == true
+	unknownSince = unknownSince or os.clock()
+	return false
+end
+
+-- Unknown ids are re-checked by a background rescan at most once a minute.
+local lastRescan = 0
+local function maybeRescan()
+	if not unknownSince or indexing or os.clock() - lastRescan < 60 then
+		return
+	end
+	lastRescan = os.clock()
+	unknownSince = nil
+	indexing = true
+	task.spawn(function()
+		indexRoots({ workspace })
+		indexing = false
+		Replica.retryPlaceholders()
+	end)
 end
 
 ------------------------------------------------------------------------------------------
@@ -111,6 +173,7 @@ local function makePart(spec, parent)
 	part.TopSurface = Enum.SurfaceType.Smooth
 	part.BottomSurface = Enum.SurfaceType.Smooth
 	local meshOk = spec.meshType ~= Enum.MeshType.FileMesh or (allowed(spec.meshId) and allowed(spec.textureId))
+	part:SetAttribute("Placeholder", not meshOk)
 	if meshOk then
 		local mesh = Instance.new("SpecialMesh")
 		mesh.MeshType = spec.meshType
@@ -230,7 +293,6 @@ function Replica.onStructure(sid, uid, desc)
 		folder.Name = "CarHubRemote"
 		folder.Parent = workspace
 	end
-	refreshAllowList(true)
 
 	local L = desc.layout
 	local layout = {
@@ -254,6 +316,10 @@ function Replica.onStructure(sid, uid, desc)
 		spin = { FL = 0, FR = 0, RL = 0, RR = 0 },
 		parts = {},
 		cframes = {},
+		desc = desc,
+		placeholders = 0,
+		-- reused every frame for the interpolated state (no per-frame garbage)
+		mix = { wheels = { FL = {}, FR = {}, RL = {}, RR = {} } },
 	}
 
 	for _, name in ipairs(CORNERS) do
@@ -281,6 +347,9 @@ function Replica.onStructure(sid, uid, desc)
 
 	for _, spec in ipairs(desc.parts) do
 		local part = makePart(spec, model)
+		if part:GetAttribute("Placeholder") then
+			car.placeholders += 1
+		end
 		if spec.role == 0 then
 			car.body = part
 		elseif spec.role == 1 then
@@ -313,6 +382,28 @@ end
 function Replica.clear()
 	for sid in pairs(cars) do
 		Replica.remove(sid)
+	end
+end
+
+-- Rebuild cars that were shown with placeholder blocks once their assets are indexed.
+function Replica.retryPlaceholders()
+	for sid, car in pairs(cars) do
+		if car.placeholders > 0 then
+			local ready = true
+			for _, spec in ipairs(car.desc.parts) do
+				if spec.meshType == Enum.MeshType.FileMesh and (not (allow[spec.meshId] or spec.meshId == 0) or (spec.textureId > 0 and not allow[spec.textureId])) then
+					ready = false
+				end
+			end
+			if ready then
+				local snapshots, offset, jitter = car.snapshots, car.offset, car.jitter
+				Replica.onStructure(sid, car.uid, car.desc)
+				local fresh = cars[sid]
+				if fresh then
+					fresh.snapshots, fresh.offset, fresh.jitter = snapshots, offset, jitter
+				end
+			end
+		end
 	end
 end
 
@@ -464,6 +555,7 @@ local function updateAudio(car, s, dt)
 end
 
 local function step(dt)
+	maybeRescan()
 	for sid, car in pairs(cars) do
 		if not car.player.Parent then
 			Replica.remove(sid)
@@ -478,18 +570,20 @@ local function step(dt)
 			local pos = hermite(a.cf.Position, a.vel, b.cf.Position, b.vel, alpha, span)
 			cf = a.cf.Rotation:Lerp(b.cf.Rotation, alpha) + pos
 			vel = a.vel:Lerp(b.vel, alpha)
-			s = { flags = alpha < 0.5 and a.flags or b.flags, rpm = lerp(a.rpm, b.rpm, alpha), throttle = lerp(a.throttle, b.throttle, alpha), vel = vel, wheels = {} }
+			s = car.mix
+			s.flags = alpha < 0.5 and a.flags or b.flags
+			s.rpm = lerp(a.rpm, b.rpm, alpha)
+			s.throttle = lerp(a.throttle, b.throttle, alpha)
+			s.vel = vel
 			for _, name in ipairs(CORNERS) do
-				local wa, wb = a.wheels[name], b.wheels[name]
-				s.wheels[name] = {
-					dy = lerp(wa.dy, wb.dy, alpha),
-					dx = lerp(wa.dx, wb.dx, alpha),
-					dz = lerp(wa.dz, wb.dz, alpha),
-					yaw = lerp(wa.yaw, wb.yaw, alpha),
-					camber = lerp(wa.camber, wb.camber, alpha),
-					omega = lerp(wa.omega, wb.omega, alpha),
-					slip = lerp(wa.slip, wb.slip, alpha),
-				}
+				local wa, wb, w = a.wheels[name], b.wheels[name], s.wheels[name]
+				w.dy = lerp(wa.dy, wb.dy, alpha)
+				w.dx = lerp(wa.dx, wb.dx, alpha)
+				w.dz = lerp(wa.dz, wb.dz, alpha)
+				w.yaw = lerp(wa.yaw, wb.yaw, alpha)
+				w.camber = lerp(wa.camber, wb.camber, alpha)
+				w.omega = lerp(wa.omega, wb.omega, alpha)
+				w.slip = lerp(wa.slip, wb.slip, alpha)
 			end
 		else
 			cf = rotate(a.cf, a.ang, ahead) + a.vel * ahead
@@ -548,6 +642,18 @@ function Replica.setup(modules)
 	if old then
 		old:Destroy()
 	end
+	watch(ReplicatedStorage)
+	local thrown = workspace:FindFirstChild("Thrown")
+	if thrown then
+		watch(thrown)
+	else
+		table.insert(watchers, workspace.ChildAdded:Connect(function(child)
+			if child.Name == "Thrown" then
+				watch(child)
+			end
+		end))
+	end
+	buildIndex()
 end
 
 function Replica.shutdown()
@@ -555,6 +661,10 @@ function Replica.shutdown()
 		heartbeat:Disconnect()
 		heartbeat = nil
 	end
+	for _, c in ipairs(watchers) do
+		c:Disconnect()
+	end
+	table.clear(watchers)
 	Replica.clear()
 	if folder then
 		folder:Destroy()
