@@ -1,0 +1,973 @@
+--[[
+	Net
+	---
+	Replicates cars between hub users through the relay (relay/server.js).
+
+	  * On build/rebuild the car's *structure* is sent once: wheel layout, every visual
+	    piece (role, wheel corner, mesh, texture, scale, size, colour, material, offset
+	    from the body) and the engine sound pack.
+	  * While it exists the car streams an 81-byte *state*: chassis CFrame, velocities,
+	    pedals, gear, rpm and per-wheel suspension offset, steer, camber, spin and slip.
+	    20 Hz while anything moves, slower at rest.
+	  * Incoming data is decoded defensively (sizes, ranges, NaN, asset allow-list) and
+	    handed to Replica, which rebuilds and interpolates the other cars locally.
+
+	Binary layouts are documented in relay/server.js and must stay in sync with it.
+	Transport: the executor's WebSocket API. In Studio, Net.loopback() mirrors your own
+	car back as a fake peer for testing.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+
+local Net = {}
+
+Net.url = _G.CarHubRelayUrl or "wss://YOUR-SERVICE.onrender.com/ws"
+Net.connected = false
+
+local deps
+local socket
+local mySid
+local peers = {} -- sid -> uid
+local lastSent = { t = 0, rpm = 0, moving = false }
+local rtt
+local loopbackOn = false
+
+------------------------------------------------------------------------------------------
+-- Base64 (strict)
+------------------------------------------------------------------------------------------
+
+local ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local ENC, DEC = {}, {}
+for i = 1, 64 do
+	local c = ALPHABET:byte(i)
+	ENC[i - 1] = c
+	DEC[c] = i - 1
+end
+
+local function b64encode(buf)
+	local n = buffer.len(buf)
+	local out = table.create(math.ceil(n / 3) * 4)
+	local o = 0
+	for i = 0, n - 1, 3 do
+		local a = buffer.readu8(buf, i)
+		local b = i + 1 < n and buffer.readu8(buf, i + 1) or 0
+		local c = i + 2 < n and buffer.readu8(buf, i + 2) or 0
+		local v = a * 65536 + b * 256 + c
+		out[o + 1] = ENC[v // 262144]
+		out[o + 2] = ENC[(v // 4096) % 64]
+		out[o + 3] = i + 1 < n and ENC[(v // 64) % 64] or 61
+		out[o + 4] = i + 2 < n and ENC[v % 64] or 61
+		o += 4
+	end
+	local parts = {}
+	for i = 1, #out, 4096 do
+		parts[#parts + 1] = string.char(table.unpack(out, i, math.min(i + 4095, #out)))
+	end
+	return table.concat(parts)
+end
+
+local function b64decode(text)
+	local len = #text
+	if len == 0 or len % 4 ~= 0 then
+		return nil
+	end
+	local pad = 0
+	if text:byte(len) == 61 then
+		pad += 1
+		if text:byte(len - 1) == 61 then
+			pad += 1
+		end
+	end
+	local size = len // 4 * 3 - pad
+	local buf = buffer.create(size)
+	local o = 0
+	for i = 1, len, 4 do
+		local a, b, c, d = DEC[text:byte(i)], DEC[text:byte(i + 1)], text:byte(i + 2), text:byte(i + 3)
+		local last = i + 3 == len
+		c = (last and c == 61 and pad >= 2) and 0 or DEC[c]
+		d = (last and d == 61 and pad >= 1) and 0 or DEC[d]
+		if not (a and b and c and d) then
+			return nil
+		end
+		local v = a * 262144 + b * 4096 + c * 64 + d
+		if o < size then
+			buffer.writeu8(buf, o, v // 65536)
+		end
+		if o + 1 < size then
+			buffer.writeu8(buf, o + 1, (v // 256) % 256)
+		end
+		if o + 2 < size then
+			buffer.writeu8(buf, o + 2, v % 256)
+		end
+		o += 3
+	end
+	return buf
+end
+Net.b64encode, Net.b64decode = b64encode, b64decode
+
+------------------------------------------------------------------------------------------
+-- Quaternion (smallest three, 3 x u16)
+------------------------------------------------------------------------------------------
+
+local ROOT2 = math.sqrt(2)
+
+local function toQuat(cf)
+	local _, _, _, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cf:GetComponents()
+	local trace = r00 + r11 + r22
+	local x, y, z, w
+	if trace > 0 then
+		local s = math.sqrt(trace + 1) * 2
+		w, x, y, z = 0.25 * s, (r21 - r12) / s, (r02 - r20) / s, (r10 - r01) / s
+	elseif r00 > r11 and r00 > r22 then
+		local s = math.sqrt(1 + r00 - r11 - r22) * 2
+		w, x, y, z = (r21 - r12) / s, 0.25 * s, (r01 + r10) / s, (r02 + r20) / s
+	elseif r11 > r22 then
+		local s = math.sqrt(1 + r11 - r00 - r22) * 2
+		w, x, y, z = (r02 - r20) / s, (r01 + r10) / s, 0.25 * s, (r12 + r21) / s
+	else
+		local s = math.sqrt(1 + r22 - r00 - r11) * 2
+		w, x, y, z = (r10 - r01) / s, (r02 + r20) / s, (r12 + r21) / s, 0.25 * s
+	end
+	return x, y, z, w
+end
+
+local function writeQuat(buf, o, cf)
+	local q = { toQuat(cf) }
+	local big, bigAbs = 1, -1
+	for i = 1, 4 do
+		if math.abs(q[i]) > bigAbs then
+			big, bigAbs = i, math.abs(q[i])
+		end
+	end
+	local sign = q[big] < 0 and -1 or 1
+	local packed = {}
+	for i = 1, 4 do
+		if i ~= big then
+			local v = math.clamp(q[i] * sign * ROOT2, -1, 1)
+			table.insert(packed, math.floor((v + 1) * 0.5 * 32767 + 0.5))
+		end
+	end
+	local index = big - 1
+	buffer.writeu16(buf, o, packed[1] + (index % 2) * 32768)
+	buffer.writeu16(buf, o + 2, packed[2] + (index // 2) * 32768)
+	buffer.writeu16(buf, o + 4, packed[3])
+end
+
+local function readQuat(buf, o)
+	local a, b, c = buffer.readu16(buf, o), buffer.readu16(buf, o + 2), buffer.readu16(buf, o + 4)
+	local index = (a // 32768) + (b // 32768) * 2 + 1
+	local function unpack(v)
+		return ((v % 32768) / 32767 * 2 - 1) / ROOT2
+	end
+	local parts = { unpack(a), unpack(b), unpack(c) }
+	local sum = parts[1] ^ 2 + parts[2] ^ 2 + parts[3] ^ 2
+	local q, j = {}, 1
+	for i = 1, 4 do
+		if i == index then
+			q[i] = math.sqrt(math.max(0, 1 - sum))
+		else
+			q[i] = parts[j]
+			j += 1
+		end
+	end
+	return q[1], q[2], q[3], q[4]
+end
+
+------------------------------------------------------------------------------------------
+-- State codec (81 bytes)
+------------------------------------------------------------------------------------------
+
+local STATE_BYTES = 81
+local CORNERS = { "FL", "FR", "RL", "RR" }
+
+local function clampInt(v, lo, hi)
+	if v ~= v then
+		return 0
+	end
+	return math.clamp(math.floor(v + 0.5), lo, hi)
+end
+
+function Net.encodeState(s)
+	local buf = buffer.create(STATE_BYTES)
+	buffer.writeu32(buf, 0, s.t % 4294967296)
+	local p = s.cf.Position
+	buffer.writef32(buf, 4, p.X)
+	buffer.writef32(buf, 8, p.Y)
+	buffer.writef32(buf, 12, p.Z)
+	writeQuat(buf, 16, s.cf)
+	buffer.writei16(buf, 22, clampInt(s.vel.X * 50, -32767, 32767))
+	buffer.writei16(buf, 24, clampInt(s.vel.Y * 50, -32767, 32767))
+	buffer.writei16(buf, 26, clampInt(s.vel.Z * 50, -32767, 32767))
+	buffer.writei16(buf, 28, clampInt(s.ang.X * 1000, -32767, 32767))
+	buffer.writei16(buf, 30, clampInt(s.ang.Y * 1000, -32767, 32767))
+	buffer.writei16(buf, 32, clampInt(s.ang.Z * 1000, -32767, 32767))
+	buffer.writei8(buf, 34, clampInt(s.steer * 127, -127, 127))
+	buffer.writeu8(buf, 35, clampInt(s.throttle * 255, 0, 255))
+	buffer.writeu8(buf, 36, clampInt(s.brake * 255, 0, 255))
+	buffer.writeu8(buf, 37, s.flags % 64)
+	buffer.writei8(buf, 38, math.clamp(s.gear, -1, 12))
+	buffer.writeu16(buf, 39, clampInt(s.rpm, 0, 30000))
+	for i, name in ipairs(CORNERS) do
+		local w = s.wheels[name]
+		local o = 41 + (i - 1) * 10
+		buffer.writei16(buf, o, clampInt(w.dy * 1000, -32767, 32767))
+		buffer.writei8(buf, o + 2, clampInt(w.dx * 200, -127, 127))
+		buffer.writei8(buf, o + 3, clampInt(w.dz * 200, -127, 127))
+		buffer.writei16(buf, o + 4, clampInt(w.yaw * 100, -32767, 32767))
+		buffer.writei8(buf, o + 6, clampInt(w.camber * 4, -127, 127))
+		buffer.writei16(buf, o + 7, clampInt(w.omega * 10, -32767, 32767))
+		buffer.writeu8(buf, o + 9, clampInt(w.slip * 100, 0, 255))
+	end
+	return buf
+end
+
+local function finite(x, limit)
+	return x == x and math.abs(x) <= limit
+end
+
+function Net.decodeState(buf)
+	if buffer.len(buf) ~= STATE_BYTES then
+		return nil
+	end
+	local px, py, pz = buffer.readf32(buf, 4), buffer.readf32(buf, 8), buffer.readf32(buf, 12)
+	if not (finite(px, 1e6) and finite(py, 1e6) and finite(pz, 1e6)) then
+		return nil
+	end
+	local qx, qy, qz, qw = readQuat(buf, 16)
+	local s = {
+		t = buffer.readu32(buf, 0),
+		cf = CFrame.new(px, py, pz, qx, qy, qz, qw),
+		vel = Vector3.new(buffer.readi16(buf, 22), buffer.readi16(buf, 24), buffer.readi16(buf, 26)) / 50,
+		ang = Vector3.new(buffer.readi16(buf, 28), buffer.readi16(buf, 30), buffer.readi16(buf, 32)) / 1000,
+		steer = buffer.readi8(buf, 34) / 127,
+		throttle = buffer.readu8(buf, 35) / 255,
+		brake = buffer.readu8(buf, 36) / 255,
+		flags = buffer.readu8(buf, 37),
+		gear = buffer.readi8(buf, 38),
+		rpm = buffer.readu16(buf, 39),
+		wheels = {},
+	}
+	if s.gear < -1 or s.gear > 12 or s.rpm > 30000 or s.flags > 63 then
+		return nil
+	end
+	for i, name in ipairs(CORNERS) do
+		local o = 41 + (i - 1) * 10
+		s.wheels[name] = {
+			dy = buffer.readi16(buf, o) / 1000,
+			dx = buffer.readi8(buf, o + 2) / 200,
+			dz = buffer.readi8(buf, o + 3) / 200,
+			yaw = buffer.readi16(buf, o + 4) / 100,
+			camber = buffer.readi8(buf, o + 6) / 4,
+			omega = buffer.readi16(buf, o + 7) / 10,
+			slip = buffer.readu8(buf, o + 9) / 100,
+		}
+	end
+	return s
+end
+
+Net.FLAG = { driving = 1, handbrake = 2, stalled = 4, shifting = 8, braking = 16, reverse = 32 }
+
+------------------------------------------------------------------------------------------
+-- Structure codec
+------------------------------------------------------------------------------------------
+
+local PART_BYTES = 82
+local MAX_PARTS = 48
+local PACK_CHARS = "^[%w_#%.%- ]*$"
+
+local function assetNumber(id)
+	if type(id) ~= "string" or id == "" then
+		return 0
+	end
+	local digits = id:match("^rbxassetid://(%d+)$") or id:match("[?&]id=(%d+)") or id:match("^(%d+)$")
+	return tonumber(digits) or nil
+end
+Net.assetNumber = assetNumber
+
+function Net.encodeStructure(desc)
+	local packOn = (desc.packOn or ""):sub(1, 48)
+	local packOff = (desc.packOff or ""):sub(1, 48)
+	if not packOn:match(PACK_CHARS) then
+		packOn = ""
+	end
+	if not packOff:match(PACK_CHARS) then
+		packOff = ""
+	end
+	local parts = {}
+	for _, p in ipairs(desc.parts) do
+		if #parts < MAX_PARTS then
+			table.insert(parts, p)
+		end
+	end
+	local size = 2 + 36 + 1 + #packOn + 1 + #packOff + 6 + #parts * PART_BYTES
+	local buf = buffer.create(size)
+	buffer.writeu8(buf, 0, 1)
+	buffer.writeu8(buf, 1, desc.flags or 0)
+	local o = 2
+	for _, v in ipairs(desc.layout) do
+		buffer.writef32(buf, o, v)
+		o += 4
+	end
+	for _, name in ipairs({ packOn, packOff }) do
+		buffer.writeu8(buf, o, #name)
+		buffer.writestring(buf, o + 1, name)
+		o += 1 + #name
+	end
+	buffer.writeu8(buf, o, clampInt((desc.volume or 1) * 100, 0, 200))
+	buffer.writeu16(buf, o + 1, clampInt(desc.idle or 800, 100, 29999))
+	buffer.writeu16(buf, o + 3, clampInt(desc.redline or 7000, 101, 30000))
+	buffer.writeu8(buf, o + 5, #parts)
+	o += 6
+	for _, p in ipairs(parts) do
+		buffer.writeu8(buf, o, p.role)
+		buffer.writeu8(buf, o + 1, p.corner or 255)
+		buffer.writeu8(buf, o + 2, p.meshType)
+		buffer.writef64(buf, o + 3, p.meshId)
+		buffer.writef64(buf, o + 11, p.textureId)
+		for j, axis in ipairs({ "X", "Y", "Z" }) do
+			buffer.writef32(buf, o + 19 + (j - 1) * 4, math.clamp(p.scale[axis], -64, 64))
+			buffer.writef32(buf, o + 31 + (j - 1) * 4, math.clamp(p.offset[axis], -64, 64))
+			buffer.writef32(buf, o + 43 + (j - 1) * 4, math.clamp(p.size[axis], 0.001, 64))
+			buffer.writef32(buf, o + 64 + (j - 1) * 4, math.clamp(p.rel.Position[axis], -64, 64))
+		end
+		buffer.writeu8(buf, o + 55, clampInt(p.color.R * 255, 0, 255))
+		buffer.writeu8(buf, o + 56, clampInt(p.color.G * 255, 0, 255))
+		buffer.writeu8(buf, o + 57, clampInt(p.color.B * 255, 0, 255))
+		buffer.writeu8(buf, o + 58, clampInt(p.vertexColor.X * 100, 0, 255))
+		buffer.writeu8(buf, o + 59, clampInt(p.vertexColor.Y * 100, 0, 255))
+		buffer.writeu8(buf, o + 60, clampInt(p.vertexColor.Z * 100, 0, 255))
+		buffer.writeu16(buf, o + 61, p.material)
+		buffer.writeu8(buf, o + 63, clampInt(p.transparency * 255, 0, 255))
+		writeQuat(buf, o + 76, p.rel)
+		o += PART_BYTES
+	end
+	return buf
+end
+
+local MATERIALS, MESHTYPES = {}, {}
+for _, item in ipairs(Enum.Material:GetEnumItems()) do
+	MATERIALS[item.Value] = item
+end
+for _, item in ipairs(Enum.MeshType:GetEnumItems()) do
+	MESHTYPES[item.Value] = item
+end
+
+function Net.decodeStructure(buf)
+	local len = buffer.len(buf)
+	if len < 47 or len > 47 + 96 + MAX_PARTS * PART_BYTES or buffer.readu8(buf, 0) ~= 1 then
+		return nil
+	end
+	local desc = { flags = buffer.readu8(buf, 1), layout = {}, parts = {} }
+	local o = 2
+	for i = 1, 9 do
+		local v = buffer.readf32(buf, o)
+		if not finite(v, 200) then
+			return nil
+		end
+		desc.layout[i] = v
+		o += 4
+	end
+	local L = desc.layout
+	for i = 6, 9 do
+		if L[i] <= 0.05 or L[i] > 20 then
+			return nil
+		end
+	end
+	if L[3] <= 0 or L[4] <= 0 or L[2] - L[1] <= 0.5 then
+		return nil
+	end
+	for _, key in ipairs({ "packOn", "packOff" }) do
+		local n = buffer.readu8(buf, o)
+		if n > 48 or o + 1 + n > len then
+			return nil
+		end
+		local name = buffer.readstring(buf, o + 1, n)
+		if not name:match(PACK_CHARS) then
+			return nil
+		end
+		desc[key] = name
+		o += 1 + n
+	end
+	if o + 6 > len then
+		return nil
+	end
+	desc.volume = buffer.readu8(buf, o) / 100
+	desc.idle = buffer.readu16(buf, o + 1)
+	desc.redline = buffer.readu16(buf, o + 3)
+	local count = buffer.readu8(buf, o + 5)
+	o += 6
+	if desc.idle < 100 or desc.redline <= desc.idle or count < 1 or count > MAX_PARTS or len ~= o + count * PART_BYTES then
+		return nil
+	end
+	local bodies = 0
+	for _ = 1, count do
+		local role, corner, meshType = buffer.readu8(buf, o), buffer.readu8(buf, o + 1), buffer.readu8(buf, o + 2)
+		local meshId, textureId = buffer.readf64(buf, o + 3), buffer.readf64(buf, o + 11)
+		if role > 4 or not MESHTYPES[meshType] then
+			return nil
+		end
+		if (role >= 2 and corner > 3) or (role < 2 and corner ~= 255) then
+			return nil
+		end
+		if meshId ~= meshId or meshId < 0 or meshId % 1 ~= 0 or meshId > 2 ^ 53 or textureId ~= textureId or textureId < 0 or textureId % 1 ~= 0 or textureId > 2 ^ 53 then
+			return nil
+		end
+		local function vec(at, limit, minimum)
+			local x, y, z = buffer.readf32(buf, at), buffer.readf32(buf, at + 4), buffer.readf32(buf, at + 8)
+			if not (finite(x, limit) and finite(y, limit) and finite(z, limit)) then
+				return nil
+			end
+			if minimum and (x < minimum or y < minimum or z < minimum) then
+				return nil
+			end
+			return Vector3.new(x, y, z)
+		end
+		local scale, offset, size, pos = vec(o + 19, 64), vec(o + 31, 64), vec(o + 43, 64, 0.001), vec(o + 64, 64)
+		if not (scale and offset and size and pos) then
+			return nil
+		end
+		local material = MATERIALS[buffer.readu16(buf, o + 61)]
+		if not material then
+			return nil
+		end
+		local qx, qy, qz, qw = readQuat(buf, o + 76)
+		if role == 0 then
+			bodies += 1
+		end
+		table.insert(desc.parts, {
+			role = role,
+			corner = corner ~= 255 and CORNERS[corner + 1] or nil,
+			meshType = MESHTYPES[meshType],
+			meshId = meshId,
+			textureId = textureId,
+			scale = scale,
+			offset = offset,
+			size = size,
+			color = Color3.fromRGB(buffer.readu8(buf, o + 55), buffer.readu8(buf, o + 56), buffer.readu8(buf, o + 57)),
+			vertexColor = Vector3.new(buffer.readu8(buf, o + 58), buffer.readu8(buf, o + 59), buffer.readu8(buf, o + 60)) / 100,
+			material = material,
+			transparency = buffer.readu8(buf, o + 63) / 255,
+			rel = CFrame.new(pos.X, pos.Y, pos.Z, qx, qy, qz, qw),
+		})
+		o += PART_BYTES
+	end
+	if bodies ~= 1 then
+		return nil
+	end
+	return desc
+end
+
+------------------------------------------------------------------------------------------
+-- Capturing the local car
+------------------------------------------------------------------------------------------
+
+local function designCenter(car, name)
+	local wb = car:GetAttribute("Wheelbase")
+	local tf, tr = car:GetAttribute("TrackFront"), car:GetAttribute("TrackRear")
+	if not (wb and tf and tr) then
+		return nil
+	end
+	local front = name == "FL" or name == "FR"
+	local side = (name == "FL" or name == "RL") and -1 or 1
+	return Vector3.new(side * (front and tf or tr) / 2, 0, front and -wb / 2 or wb / 2)
+end
+
+local function captureState(car, tel)
+	local primary = car:FindFirstChild("Primary")
+	if not primary then
+		return nil
+	end
+	local cf = primary.CFrame
+	local flags = 0
+	local F = Net.FLAG
+	if tel.driving then
+		flags += F.driving
+	end
+	if tel.handbrake then
+		flags += F.handbrake
+	end
+	if tel.stalled then
+		flags += F.stalled
+	end
+	if tel.shifting then
+		flags += F.shifting
+	end
+	if tel.brake > 0.05 then
+		flags += F.braking
+	end
+	if tel.gear < 0 then
+		flags += F.reverse
+	end
+	local wheels = {}
+	for _, name in ipairs(CORNERS) do
+		local model = car.Wheels:FindFirstChild(name)
+		local bounds = model and model:FindFirstChild("Bounds")
+		local design = designCenter(car, name)
+		local w = { dy = 0, dx = 0, dz = 0, yaw = 0, camber = 0, omega = 0, slip = 0 }
+		if bounds and design then
+			local rel = cf:ToObjectSpace(bounds.CFrame)
+			local delta = rel.Position - design
+			local look, up = rel.LookVector, rel.UpVector
+			local yaw = math.atan2(-look.X, -look.Z)
+			local unyawed = CFrame.Angles(0, -yaw, 0):VectorToWorldSpace(up)
+			w.dx, w.dy, w.dz = delta.X, delta.Y, delta.Z
+			w.yaw = math.deg(yaw)
+			w.camber = math.deg(math.atan2(-unyawed.X, unyawed.Y))
+		end
+		local wt = tel.wheels and tel.wheels[name]
+		if wt then
+			w.omega = wt.omega
+			w.slip = wt.slip
+		end
+		wheels[name] = w
+	end
+	return {
+		t = math.floor(os.clock() * 1000),
+		cf = cf,
+		vel = primary.AssemblyLinearVelocity,
+		ang = primary.AssemblyAngularVelocity,
+		steer = tel.steer,
+		throttle = tel.throttle,
+		brake = tel.brake,
+		flags = flags,
+		gear = tel.gear,
+		rpm = tel.rpm,
+		wheels = wheels,
+	}
+end
+
+------------------------------------------------------------------------------------------
+-- Transport
+------------------------------------------------------------------------------------------
+
+local function findConnector()
+	local env = (getgenv and getgenv()) or _G
+	local candidates = {
+		rawget(env, "WebSocket"),
+		WebSocket,
+		syn and syn.websocket,
+		Krnl and Krnl.WebSocket,
+	}
+	for _, lib in ipairs(candidates) do
+		if type(lib) == "table" and type(lib.connect) == "function" then
+			return lib.connect
+		end
+	end
+	return nil
+end
+
+local function wrapSocket(raw)
+	local api = {}
+	-- executor socket objects are often userdata whose __index throws on unknown keys
+	local function member(name)
+		local ok, value = pcall(function()
+			return raw[name]
+		end)
+		if ok and value ~= nil then
+			return value
+		end
+		ok, value = pcall(function()
+			return raw[name:sub(1, 1):lower() .. name:sub(2)]
+		end)
+		return ok and value or nil
+	end
+	local function call(name, ...)
+		local fn = member(name)
+		if type(fn) == "function" then
+			return fn(raw, ...)
+		end
+	end
+	function api.send(text)
+		return pcall(call, "Send", text)
+	end
+	function api.close()
+		pcall(call, "Close")
+	end
+	function api.onMessage(fn)
+		local signal = member("OnMessage")
+		return signal and signal:Connect(fn)
+	end
+	function api.onClose(fn)
+		local signal = member("OnClose")
+		return signal and signal:Connect(fn)
+	end
+	return api
+end
+
+-- In-process fake relay: echoes your own car back as peer "lpb", offset to the side.
+local function loopbackSocket()
+	local handlers, closers = {}, {}
+	local api = {}
+	local OFFSET = Vector3.new(14, 0, 0)
+	local function deliver(text, delay)
+		task.delay(delay, function()
+			for _, fn in ipairs(handlers) do
+				fn(text)
+			end
+		end)
+	end
+	function api.send(text)
+		local kind = text:sub(1, 1)
+		local jitter = 0.08 + math.random() * 0.06
+		if kind == "J" then
+			deliver("W" .. HttpService:JSONEncode({ v = 1, s = "loc", p = { { "lpb", Players.LocalPlayer.UserId } } }), 0.05)
+		elseif kind == "S" or kind == "X" then
+			deliver(kind .. "lpb" .. text:sub(2), jitter)
+		elseif kind == "T" then
+			local buf = b64decode(text:sub(2))
+			local s = buf and Net.decodeState(buf)
+			if s then
+				s.cf = s.cf + s.cf:VectorToWorldSpace(OFFSET)
+				deliver("Tlpb" .. b64encode(Net.encodeState(s)), jitter)
+			end
+		elseif kind == "P" then
+			deliver("Q" .. text:sub(2), 0.04)
+		end
+		return true
+	end
+	function api.close()
+		for _, fn in ipairs(closers) do
+			fn()
+		end
+	end
+	function api.onMessage(fn)
+		table.insert(handlers, fn)
+	end
+	function api.onClose(fn)
+		table.insert(closers, fn)
+	end
+	return api
+end
+
+------------------------------------------------------------------------------------------
+-- Session
+------------------------------------------------------------------------------------------
+
+local function setStatus(status, detail)
+	local Connection = deps.Connection
+	local list = {}
+	for sid, uid in pairs(peers) do
+		local player = Players:GetPlayerByUserId(uid)
+		table.insert(list, {
+			sid = sid,
+			uid = uid,
+			name = player and player.DisplayName or ("User " .. uid),
+			present = player ~= nil,
+			hasCar = deps.Replica.hasCar(sid),
+		})
+	end
+	table.sort(list, function(a, b)
+		return a.name < b.name
+	end)
+	Connection.latency = rtt
+	Connection.relay = loopbackOn and "Loopback (Studio)" or Net.url
+	Connection.update(status, detail, list)
+end
+
+local function send(text)
+	if socket and Net.connected then
+		socket.send(text)
+	end
+end
+
+function Net.describeCar()
+	local CarInit = deps.CarInit
+	local desc = CarInit.describe and CarInit.describe()
+	if not desc then
+		return nil
+	end
+	local Tuning, Spec = deps.Tuning, deps.Spec
+	local packs = Tuning.packs()
+	local on = Spec.pickPack(packs, "on", Tuning.get("sound.packOn"))
+	local off = Spec.pickPack(packs, "off", Tuning.get("sound.packOff")) or on
+	desc.packOn = on and on.key or ""
+	desc.packOff = off and off.key or ""
+	desc.volume = Tuning.get("sound.volume")
+	desc.idle = Tuning.get("engine.idle")
+	desc.redline = Tuning.get("engine.redline")
+	return desc
+end
+
+function Net.sendStructure()
+	local desc = Net.describeCar()
+	if not desc then
+		return false
+	end
+	local ok, buf = pcall(Net.encodeStructure, desc)
+	if not ok then
+		warn("Net: could not encode car - " .. tostring(buf))
+		return false
+	end
+	send("S" .. b64encode(buf))
+	lastSent.t = 0
+	return true
+end
+
+local function handle(text)
+	if type(text) ~= "string" or #text == 0 or #text > 9000 then
+		return
+	end
+	local kind = text:sub(1, 1)
+	local Replica = deps.Replica
+	if kind == "T" or kind == "S" then
+		local sid = text:sub(2, 4)
+		if not peers[sid] then
+			return
+		end
+		local buf = b64decode(text:sub(5))
+		if not buf then
+			return
+		end
+		if kind == "T" then
+			local s = Net.decodeState(buf)
+			if s then
+				Replica.onState(sid, s)
+			end
+		else
+			local desc = Net.decodeStructure(buf)
+			if desc then
+				Replica.onStructure(sid, peers[sid], desc)
+				setStatus("CONNECTED", Net.detail())
+			end
+		end
+	elseif kind == "X" then
+		local sid = text:sub(2, 4)
+		Replica.remove(sid)
+		setStatus("CONNECTED", Net.detail())
+	elseif kind == "A" then
+		local sid, uid = text:sub(2, 4), tonumber(text:sub(5))
+		if uid and uid >= 1 and uid % 1 == 0 then
+			peers[sid] = uid
+			setStatus("CONNECTED", Net.detail())
+		end
+	elseif kind == "L" then
+		local sid = text:sub(2, 4)
+		peers[sid] = nil
+		Replica.remove(sid)
+		setStatus("CONNECTED", Net.detail())
+	elseif kind == "W" then
+		local ok, msg = pcall(HttpService.JSONDecode, HttpService, text:sub(2))
+		if ok and type(msg) == "table" and msg.v == 1 and type(msg.s) == "string" then
+			mySid = msg.s
+			table.clear(peers)
+			for _, entry in ipairs(type(msg.p) == "table" and msg.p or {}) do
+				if type(entry) == "table" and type(entry[1]) == "string" and #entry[1] == 3 and type(entry[2]) == "number" then
+					peers[entry[1]] = entry[2]
+				end
+			end
+			Net.connected = true
+			setStatus("CONNECTED", Net.detail())
+			if deps.CarInit.state == "ACTIVE" then
+				Net.sendStructure()
+			end
+		end
+	elseif kind == "Q" then
+		local sent = tonumber(text:sub(2))
+		if sent then
+			rtt = (math.floor(os.clock() * 1000) % 1e9 - sent) / 1000
+			if rtt >= 0 then
+				setStatus("CONNECTED", Net.detail())
+			end
+		end
+	elseif kind == "E" then
+		local code = text:sub(2, 12)
+		local messages = { uid = "Already connected from another session", full = "Relay room is full", busy = "Relay is busy", join = "Relay rejected the join" }
+		Net.lastError = messages[code] or ("Relay error: " .. code)
+	end
+end
+
+function Net.detail()
+	local n = 0
+	for _ in pairs(peers) do
+		n += 1
+	end
+	return n == 0 and "No other hub users here" or (n .. (n == 1 and " other user" or " other users"))
+end
+
+local connecting = false
+local function connect()
+	if connecting or loopbackOn then
+		return
+	end
+	connecting = true
+	task.spawn(function()
+		local backoff = 2
+		while not loopbackOn do
+			local connector = findConnector()
+			if not connector then
+				setStatus("DISCONNECTED", RunService:IsStudio() and "No WebSocket API in Studio - use the loopback test" or "This environment has no WebSocket API")
+				break
+			end
+			if Net.url:find("YOUR%-SERVICE") then
+				setStatus("DISCONNECTED", "Set _G.CarHubRelayUrl to your relay address")
+				break
+			end
+			setStatus("CONNECTING", "Contacting relay (a sleeping free instance takes ~30 s)")
+			local ok, raw = pcall(connector, Net.url)
+			if ok and raw then
+				socket = wrapSocket(raw)
+				local closed = false
+				socket.onMessage(function(msg)
+					local fine, err = pcall(handle, msg)
+					if not fine then
+						warn("Net: " .. tostring(err))
+					end
+				end)
+				socket.onClose(function()
+					closed = true
+				end)
+				Net.lastError = nil
+				local job = game.JobId ~= "" and game.JobId or ("studio-" .. game.PlaceId)
+				socket.send("J" .. HttpService:JSONEncode({ v = 1, u = Players.LocalPlayer.UserId, j = job }))
+				backoff = 2
+				while not closed and not loopbackOn and Net.alive do
+					task.wait(0.5)
+				end
+				Net.connected = false
+				socket = nil
+				table.clear(peers)
+				deps.Replica.clear()
+				if not Net.alive then
+					break
+				end
+				setStatus("DISCONNECTED", Net.lastError or "Connection lost - retrying")
+			else
+				setStatus("DISCONNECTED", "Relay unreachable - retrying in " .. backoff .. " s")
+			end
+			if Net.lastError == "Already connected from another session" then
+				break
+			end
+			task.wait(backoff)
+			backoff = math.min(backoff * 2, 30)
+		end
+		connecting = false
+	end)
+end
+
+-- Studio test: mirror your own car back as a peer.
+function Net.loopback(enabled)
+	if enabled == loopbackOn then
+		return
+	end
+	loopbackOn = enabled
+	if socket then
+		socket.close()
+		socket = nil
+	end
+	Net.connected = false
+	table.clear(peers)
+	deps.Replica.clear()
+	if enabled then
+		socket = loopbackSocket()
+		socket.onMessage(function(msg)
+			local fine, err = pcall(handle, msg)
+			if not fine then
+				warn("Net loopback: " .. tostring(err))
+			end
+		end)
+		socket.send("J{}")
+	else
+		setStatus("DISCONNECTED", "Loopback off")
+		connect()
+	end
+end
+
+function Net.isLoopback()
+	return loopbackOn
+end
+
+function Net.reconnect()
+	if loopbackOn then
+		return
+	end
+	if socket then
+		socket.close()
+	else
+		connect()
+	end
+end
+
+------------------------------------------------------------------------------------------
+-- Streaming
+------------------------------------------------------------------------------------------
+
+local function stream()
+	local CarInit = deps.CarInit
+	local accumulator = 0
+	local pingClock = 0
+	return RunService.Heartbeat:Connect(function(dt)
+		if not Net.connected then
+			return
+		end
+		pingClock += dt
+		if pingClock > 5 then
+			pingClock = 0
+			send("P" .. tostring(math.floor(os.clock() * 1000) % 1e9))
+		end
+		local car = CarInit.car
+		if not (car and car.Parent and CarInit.state == "ACTIVE") then
+			return
+		end
+		accumulator += dt
+		if accumulator < 1 / 20 then
+			return
+		end
+		accumulator = 0
+		local tel = CarInit.telemetry()
+		if not tel then
+			return
+		end
+		local s = captureState(car, tel)
+		if not s then
+			return
+		end
+		-- 20 Hz while anything moves, 2 Hz at rest, plus rpm changes for audio
+		local moving = s.vel.Magnitude > 0.3 or s.ang.Magnitude > 0.05 or math.abs(s.steer) > 0.01 or math.abs(tel.rpm - lastSent.rpm) > 60
+		local now = os.clock()
+		if not moving and not lastSent.moving and now - lastSent.t < 0.5 then
+			return
+		end
+		lastSent.t = now
+		lastSent.rpm = tel.rpm
+		lastSent.moving = moving
+		send("T" .. b64encode(Net.encodeState(s)))
+	end)
+end
+
+function Net.setup(modules)
+	deps = modules
+	Net.alive = true
+	local links = {}
+	table.insert(links, deps.CarInit.changed.Event:Connect(function(state)
+		if state == "ACTIVE" then
+			Net.sendStructure()
+		elseif state == "ENDED" then
+			send("X")
+		end
+	end))
+	table.insert(links, stream())
+	table.insert(links, Players.PlayerRemoving:Connect(function()
+		setStatus(Net.connected and "CONNECTED" or deps.Connection.status, Net.connected and Net.detail() or deps.Connection.detail)
+	end))
+	Net.links = links
+	setStatus("DISCONNECTED", "Starting")
+	connect()
+end
+
+function Net.shutdown()
+	Net.alive = false
+	if Net.connected then
+		send("X")
+	end
+	for _, link in ipairs(Net.links or {}) do
+		link:Disconnect()
+	end
+	if socket then
+		socket.close()
+	end
+	deps.Replica.clear()
+end
+
+return Net
