@@ -786,6 +786,42 @@ function Net.detail()
 	return n == 0 and "No other hub users here" or (n .. (n == 1 and " other user" or " other users"))
 end
 
+-- Yielding HTTP request from the executor, if it has one.
+local function findRequest()
+	local env = (getgenv and getgenv()) or _G
+	local candidates = {
+		rawget(env, "request"),
+		rawget(env, "http_request"),
+		syn and syn.request,
+		http and http.request,
+		fluxus and fluxus.request,
+	}
+	for _, fn in ipairs(candidates) do
+		if type(fn) == "function" then
+			return fn
+		end
+	end
+	return nil
+end
+
+local function healthUrl()
+	return (Net.url:gsub("^wss://", "https://"):gsub("^ws://", "http://"):gsub("/ws/?$", "/health"))
+end
+
+-- Most executors' WebSocket.connect blocks the whole game until it opens or times out.
+-- Wake the relay with a yielding HTTP request first so connect is only ever called on a
+-- relay that is up and answers immediately.
+local function relayAwake(request)
+	local ok, res = pcall(request, { Url = healthUrl(), Method = "GET" })
+	if not ok or type(res) ~= "table" then
+		return false
+	end
+	local code = res.StatusCode or res.Status or res.status_code
+	return res.Success == true or code == 200
+end
+
+local MAX_BLIND_ATTEMPTS = 2 -- without a probe, never freeze the game more than this
+
 local connecting = false
 local function connect()
 	if connecting or loopbackOn then
@@ -793,8 +829,9 @@ local function connect()
 	end
 	connecting = true
 	task.spawn(function()
-		local backoff = 2
-		while not loopbackOn do
+		local backoff = 5
+		local blind = 0
+		while not loopbackOn and Net.alive do
 			local connector = findConnector()
 			if not connector then
 				setStatus("DISCONNECTED", RunService:IsStudio() and "No WebSocket API in Studio - use the loopback test" or "This environment has no WebSocket API")
@@ -804,8 +841,29 @@ local function connect()
 				setStatus("DISCONNECTED", "Set _G.CarHubRelayUrl to your relay address")
 				break
 			end
-			setStatus("CONNECTING", "Contacting relay (a sleeping free instance takes ~30 s)")
-			local ok, raw = pcall(connector, Net.url)
+			local request = findRequest()
+			local awake = true
+			if request then
+				setStatus("CONNECTING", "Waking relay (a sleeping free instance takes ~30 s)")
+				awake = relayAwake(request)
+			else
+				blind += 1
+				if blind > MAX_BLIND_ATTEMPTS then
+					setStatus("DISCONNECTED", "Relay unreachable - press Reconnect to try again")
+					break
+				end
+				setStatus("CONNECTING", "Contacting relay")
+			end
+			if not Net.alive then
+				break
+			end
+			local ok, raw = false, nil
+			if awake then
+				local started = os.clock()
+				Net.mark("relay connect")
+				ok, raw = pcall(connector, Net.url)
+				Net.blockedFor = os.clock() - started
+			end
 			if ok and raw then
 				socket = wrapSocket(raw)
 				local closed = false
@@ -821,7 +879,8 @@ local function connect()
 				Net.lastError = nil
 				local job = game.JobId ~= "" and game.JobId or ("studio-" .. game.PlaceId)
 				socket.send("J" .. HttpService:JSONEncode({ v = 1, u = Players.LocalPlayer.UserId, j = job }))
-				backoff = 2
+				backoff = 5
+				blind = 0
 				while not closed and not loopbackOn and Net.alive do
 					task.wait(0.5)
 				end
@@ -836,14 +895,27 @@ local function connect()
 			else
 				setStatus("DISCONNECTED", "Relay unreachable - retrying in " .. backoff .. " s")
 			end
-			if Net.lastError == "Already connected from another session" then
+			if Net.lastError == "Already connected from another session" or not Net.alive then
 				break
 			end
 			task.wait(backoff)
-			backoff = math.min(backoff * 2, 30)
+			backoff = math.min(backoff * 2, 60)
 		end
 		connecting = false
 	end)
+end
+
+-- Hitch attribution: blocking work records a mark so a frozen frame can name its cause.
+Net.marks = {}
+Net.active = {}
+function Net.busy(name, on)
+	Net.active[name] = on and true or nil
+end
+function Net.mark(name)
+	table.insert(Net.marks, { name = name, at = os.clock() })
+	if #Net.marks > 16 then
+		table.remove(Net.marks, 1)
+	end
 end
 
 -- Studio test: mirror your own car back as a peer.
