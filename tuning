@@ -242,7 +242,9 @@ local function queueApply()
 	end)
 end
 
+local version = 0
 local function changed(id)
+	version += 1
 	Tuning.changed:Fire(id)
 	queueApply()
 end
@@ -402,12 +404,19 @@ function Tuning.build(geometry)
 	return stats
 end
 
+-- Read-outs are requested by several panels per change; compute them once per change.
+local readoutCache = { version = -1 }
 function Tuning.readouts()
+	if readoutCache.version == version and readoutCache.geometry == Tuning.geometry then
+		return readoutCache.readouts, readoutCache.stats
+	end
 	local stats = Tuning.build()
 	if not stats then
 		return nil
 	end
-	return Spec.readouts(Tuning.get, stats), stats
+	local readouts = Spec.readouts(Tuning.get, stats)
+	readoutCache = { version = version, geometry = Tuning.geometry, readouts = readouts, stats = stats }
+	return readouts, stats
 end
 
 function Tuning.setGeometry(geometry)
