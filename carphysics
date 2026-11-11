@@ -49,6 +49,10 @@ local WHEELS = { "FL", "FR", "RL", "RR" }
 local SPEED_ATTR = { FR = "frontRws", FL = "frontLws", RR = "rearRws", RL = "rearLws" }
 
 local function grab(url)
+	local genv = (getgenv and getgenv()) or _G
+	if type(genv.CarHubGrab) == "function" then
+		return genv.CarHubGrab(url)
+	end
 	local ok, src = pcall(game.HttpGet, game, url)
 	if not ok then
 		error("couldn't fetch " .. url .. ": " .. tostring(src))
