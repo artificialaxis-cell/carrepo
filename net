@@ -666,9 +666,25 @@ local function setStatus(status, detail)
 	Connection.update(status, detail, list)
 end
 
+-- Some executors write to the socket synchronously. If a send ever blocks, slow the
+-- state stream down instead of stalling the game 20 times a second.
+Net.sendInterval = 1 / 20
+local slowUntil = 0
 local function send(text)
-	if socket and Net.connected then
-		socket.send(text)
+	if not (socket and Net.connected) then
+		return
+	end
+	local started = os.clock()
+	socket.send(text)
+	local took = os.clock() - started
+	if took > 0.03 then
+		if Net.mark then
+			Net.mark(("relay send blocked %d ms"):format(took * 1000))
+		end
+		Net.sendInterval = math.min(Net.sendInterval * 2, 1)
+		slowUntil = os.clock() + 10
+	elseif os.clock() > slowUntil and Net.sendInterval > 1 / 20 then
+		Net.sendInterval = math.max(Net.sendInterval / 2, 1 / 20)
 	end
 end
 
@@ -983,7 +999,7 @@ local function stream()
 			return
 		end
 		accumulator += dt
-		if accumulator < 1 / 20 then
+		if accumulator < Net.sendInterval then
 			return
 		end
 		accumulator = 0
